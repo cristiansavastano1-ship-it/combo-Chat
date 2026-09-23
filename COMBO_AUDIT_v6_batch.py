@@ -1697,10 +1697,10 @@ def _v6_run_batch(rho, ewma_span, emivita, soglia_v5=0.10, warmup=100):
 
             # V5: RAW vs CALIBRATO OOS applicato realmente alla selezione EV
             v5 = _v5_run_economic(dati_b, rho, ewma_span, emivita, soglia_v5, warmup)
-            v5raw12=_v5_stats_df(v5['raw12']) if v5 else _v6_stats_df(None)
-            v5cal12=_v5_stats_df(v5['cal12']) if v5 else _v6_stats_df(None)
-            v5rawou=_v5_stats_df(v5['rawou']) if v5 else _v6_stats_df(None)
-            v5calou=_v5_stats_df(v5['calou']) if v5 else _v6_stats_df(None)
+            v5raw12=_v6_stats_df(v5['raw12']) if v5 else _v6_stats_df(None)
+            v5cal12=_v6_stats_df(v5['cal12']) if v5 else _v6_stats_df(None)
+            v5rawou=_v6_stats_df(v5['rawou']) if v5 else _v6_stats_df(None)
+            v5calou=_v6_stats_df(v5['calou']) if v5 else _v6_stats_df(None)
 
             # V3: economico RAW a tutte le soglie, storico OOS
             v3=[]
