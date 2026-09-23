@@ -2503,53 +2503,137 @@ def _v7_make_row(campionato, mercato, versione, df, ev_col='ev', seed=42):
             'quota_media': s.get('avg_odds'), 'max_dd_u': s.get('max_dd')}
 
 
-def mostra_v7_statistical_validation():
+
+def mostra_v7_1_statistical_validation():
     st.divider()
-    st.markdown('## 🔬 V7 — VALIDAZIONE STATISTICA / OOS')
-    st.caption('Estensione V6: confronto RAW vs CALIBRATO OOS con bootstrap percentile al 95% su ROI e profitto. Il bootstrap misura l’incertezza campionaria; non trasforma il risultato in una garanzia di rendimento futuro.')
-    st.info('⚠️ Gli intervalli sono intervalli di bootstrap del campione di scommesse selezionato. Non correggono eventuali bias strutturali, selezione dei mercati o qualità delle quote storiche.')
-    if st.button('🔬 ESEGUI V7 — VALIDAZIONE STATISTICA', key='v7_run'):
-        try:
-            # Riutilizza esattamente il batch V6; non altera il modello.
-            with st.spinner('Esecuzione V7 sui 5 campionati...'):
-                res, err = _v6_run_batch(rho_val, ewma_span_val, emivita_val, 0.10, 100)
-            rows = []
-            for item in res:
-                camp = item.get('campionato')
-                for key, merc, ver in [
-                    ('_v3', None, None),
-                ]:
-                    pass
-                # V5 è il confronto economico OOS principale della V7.
-                # V6 esponeva solo le statistiche aggregate, quindi ricalcoliamo
-                # i quattro DataFrame V5 per ottenere il bootstrap a livello bet.
-                info = CAMPIONATI_DOMESTICI.get(camp)
-                if info:
-                    dati_b = carica_dati_campionato(info['id_fd'])
-                    v5 = _v5_run_economic(dati_b, rho_val, ewma_span_val, emivita_val, 0.10, 100)
-                    pairs = [
-                        ('1X2', 'RAW', v5.get('raw12')),
-                        ('1X2', 'CALIBRATO OOS', v5.get('cal12')),
-                        ('O/U 2.5', 'RAW', v5.get('rawou')),
-                        ('O/U 2.5', 'CALIBRATO OOS', v5.get('calou')),
-                    ]
-                    for merc, ver, d in pairs:
-                        rows.append(_v7_make_row(camp, merc, ver, d, 'ev'))
-            if rows:
-                out = pd.DataFrame(rows)
-                st.dataframe(out, use_container_width=True, hide_index=True)
-                st.download_button('⬇️ Scarica V7 CSV', data=out.to_csv(index=False).encode('utf-8'), file_name='V7_statistical_validation.csv', mime='text/csv', key='v7_dl')
-            else:
-                st.warning('La V6 non ha restituito i dettagli V5 necessari per il bootstrap. Nessun dato V7 generato.')
-            if err:
-                st.error('Alcuni campionati non sono stati completati:')
-                for nome, msg in err:
-                    st.write(f'- **{nome}**: {msg}')
-        except Exception as e:
-            st.error(f'Errore V7: {type(e).__name__}: {e}')
+    st.markdown('## 🔬 V7.1 — VALIDAZIONE OOS LEGGERA E STABILE')
+    st.caption('Versione alleggerita: un campionato alla volta, avanzamento visibile, salvataggio dopo ogni campionato e bootstrap eseguito solo sui risultati già calcolati.')
+
+    if 'v71_rows' not in st.session_state:
+        st.session_state['v71_rows'] = []
+    if 'v71_done' not in st.session_state:
+        st.session_state['v71_done'] = []
+
+    c1, c2 = st.columns(2)
+    with c1:
+        warmup_v71 = st.number_input('Warm-up OOS', min_value=50, max_value=300, value=100, step=10, key='v71_warmup')
+    with c2:
+        bootstrap_v71 = st.number_input('Bootstrap ROI', min_value=0, max_value=5000, value=500, step=500, key='v71_bootstrap')
+
+    skip_boot = bootstrap_v71 == 0
+    if skip_boot:
+        st.caption('Bootstrap disattivato: il test è più rapido.')
+    else:
+        st.caption(f'Bootstrap percentile 95%: {int(bootstrap_v71):,} ricampionamenti per serie. Viene eseguito solo dopo il calcolo OOS.')
+
+    camp_names = list(CAMPIONATI_DOMESTICI.keys())
+    selected = st.selectbox('Campionato da eseguire', camp_names, key='v71_campionato')
+
+    col_run, col_clear = st.columns(2)
+    run = col_run.button('▶️ ESEGUI / RIPRENDI CAMPIONATO', key='v71_run')
+    clear = col_clear.button('🗑️ AZZERA RISULTATI V7.1', key='v71_clear')
+
+    if clear:
+        st.session_state['v71_rows'] = []
+        st.session_state['v71_done'] = []
+        st.rerun()
+
+    if run:
+        if selected in st.session_state['v71_done']:
+            st.info(f'{selected} è già stato completato in questa sessione. Usa "AZZERA RISULTATI" per ricalcolarlo.')
+        else:
+            try:
+                prog = st.progress(0.0, text=f'Avvio {selected}...')
+                status = st.empty()
+                info = CAMPIONATI_DOMESTICI[selected]
+
+                status.info(f'📥 Caricamento dati: {selected}')
+                prog.progress(0.10, text=f'{selected}: caricamento dati')
+                dati = carica_dati_campionato(info['id_fd'])
+                if dati is None or dati.empty:
+                    raise ValueError('Nessun dato disponibile per il campionato.')
+
+                status.info(f'⚙️ Calcolo OOS RAW + CALIBRATO: {selected}')
+                prog.progress(0.20, text=f'{selected}: calcolo OOS')
+
+                # Un solo campionato per volta. Niente V3/V4/V6 e nessuna
+                # seconda esecuzione dello stesso walk-forward.
+                v5 = _v5_run_economic(
+                    dati, rho_val, ewma_span_val, emivita_val,
+                    0.10, int(warmup_v71)
+                )
+
+                prog.progress(0.82, text=f'{selected}: statistiche economiche')
+                pairs = [
+                    ('1X2', 'RAW', v5.get('raw12')),
+                    ('1X2', 'CALIBRATO OOS', v5.get('cal12')),
+                    ('O/U 2.5', 'RAW', v5.get('rawou')),
+                    ('O/U 2.5', 'CALIBRATO OOS', v5.get('calou')),
+                ]
+
+                new_rows = []
+                for i, (merc, ver, d) in enumerate(pairs, 1):
+                    if d is None:
+                        d = pd.DataFrame()
+                    if d is None or d.empty:
+                        row = _v7_make_row(selected, merc, ver, pd.DataFrame(), 'ev', seed=42+i)
+                    elif skip_boot:
+                        ss = _v6_stats_df(d)
+                        evv = float(d['ev'].astype(float).mean()*100.0) if 'ev' in d.columns else None
+                        row = {
+                            'campionato': selected, 'mercato': merc, 'versione': ver,
+                            'bet': int(ss.get('bet', len(d))), 'strike_%': ss.get('strike'),
+                            'brier': None, 'logloss': None, 'EV_%': evv,
+                            'ROI_%': ss.get('roi'), 'ROI_IC95_low_%': None,
+                            'ROI_IC95_high_%': None, 'profit_u': ss.get('profit'),
+                            'profit_IC95_low_u': None, 'profit_IC95_high_u': None,
+                            'quota_media': ss.get('avg_odds'), 'max_dd_u': ss.get('max_dd')
+                        }
+                    else:
+                        row = _v7_make_row(selected, merc, ver, d, 'ev', seed=42+i)
+                    new_rows.append(row)
+                    prog.progress(0.82 + 0.04*i, text=f'{selected}: serie {i}/4')
+
+                # Salvataggio immediato dopo il singolo campionato.
+                st.session_state['v71_rows'].extend(new_rows)
+                st.session_state['v71_done'].append(selected)
+                prog.progress(1.0, text=f'✅ {selected} completato e salvato')
+                status.success(f'Completato {selected}. Puoi eseguire il prossimo campionato senza ripetere questo.')
+
+            except Exception as e:
+                st.error(f'Errore V7.1 su {selected}: {type(e).__name__}: {e}')
+
+    rows = st.session_state.get('v71_rows', [])
+    done = st.session_state.get('v71_done', [])
+
+    if done:
+        st.markdown('### Stato batch')
+        st.write(f"Campionati completati: **{len(done)}/{len(camp_names)}** — {', '.join(done)}")
+
+    if rows:
+        out = pd.DataFrame(rows)
+        st.markdown('### Risultati V7.1')
+        st.dataframe(out, use_container_width=True, hide_index=True)
+        st.download_button(
+            '⬇️ Scarica V7.1 CSV',
+            data=out.to_csv(index=False).encode('utf-8'),
+            file_name='V7_1_statistical_validation.csv',
+            mime='text/csv',
+            key='v71_dl'
+        )
+
+        if len(done) == len(camp_names):
+            st.success('🎯 Tutti i 5 campionati sono stati completati.')
+        else:
+            st.info('Il risultato è già salvato in sessione: puoi continuare con un altro campionato.')
+    else:
+        st.info('Nessun campionato ancora completato.')
+
+# Manteniamo una compatibilità minima con eventuali riferimenti esterni.
+mostra_v7_statistical_validation = mostra_v7_1_statistical_validation
 
 # Il blocco viene mostrato in fondo all'app senza modificare le sezioni precedenti.
 try:
-    mostra_v7_statistical_validation()
+    mostra_v7_1_statistical_validation()
 except Exception as _v7_err:
     st.error(f'V7 non disponibile: {type(_v7_err).__name__}: {_v7_err}')
