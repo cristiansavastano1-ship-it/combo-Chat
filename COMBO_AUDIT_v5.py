@@ -1550,7 +1550,7 @@ def _v5_run_economic(dati_completi, rho, ewma_span, emivita, soglia_ev=0.10, war
             prior_ou_p.append(r.po); prior_ou_y.append(1 if r.esito_ou=='Over' else 0)
             continue
 
-        cal12 = {s: _v5_fit_iso_binary(prior12_p[s], prior12_y[s]) for s in ['1','X','2']}
+        cal12_models = {s: _v5_fit_iso_binary(prior12_p[s], prior12_y[s]) for s in ['1','X','2']}
         cal_ou = _v5_fit_iso_binary(prior_ou_p, prior_ou_y)
 
         raw_probs={'1':r.p1,'X':r.px,'2':r.p2}
@@ -1564,8 +1564,8 @@ def _v5_run_economic(dati_completi, rho, ewma_span, emivita, soglia_ev=0.10, war
                           'prob_modello':raw_probs[raw_choice],'p_mercato_fair':fair[raw_choice],
                           'quota':raw_q,'ev':raw_ev,'vinta':raw_choice==r.esito12})
 
-        if all(cal12[s] is not None for s in ['1','X','2']):
-            cv={s:float(cal12[s].predict([raw_probs[s]])[0]) for s in ['1','X','2']}
+        if all(cal12_models[s] is not None for s in ['1','X','2']):
+            cv={s:float(cal12_models[s].predict([raw_probs[s]])[0]) for s in ['1','X','2']}
             tot=sum(cv.values())
             if tot>0: cv={s:v/tot for s,v in cv.items()}
         else:
