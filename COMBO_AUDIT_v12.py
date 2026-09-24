@@ -3553,129 +3553,136 @@ def mostra_v12_validation():
 
 
 # ================================================================
-# V13 — VALIDAZIONE PAIRED + BOOTSTRAP (senza modificare V12)
+# V13.1 — VERIFICA FINALE PLATT O/U 2.5
 # ================================================================
-V13_BOOTSTRAP = 5000
-V13_METHODS = ['ISOTONIC', 'PLATT', 'BETA', 'SHRINK50']
+V13_1_BOOTSTRAP = 10000
 
 @st.cache_data(ttl=3600, max_entries=10, show_spinner=False)
-def _v13_build_all(warmup=100):
+def _v13_1_build_all(warmup=100):
     out = []
     errors = []
     for camp, info in CAMPIONATI_DOMESTICI.items():
         try:
             dati = carica_dati_campionato(info['id_fd'])
             paired = _v12_build_paired(dati, rho_val, ewma_span_val, emivita_val, 0.10, int(warmup))
-            if paired is None:
-                raise ValueError('dati OOS vuoti')
-            for merc, df in paired.items():
-                if df is None or df.empty:
-                    continue
-                out.append((camp, merc, df))
+            if paired is None or 'O/U 2.5' not in paired:
+                raise ValueError('dati O/U 2.5 OOS vuoti')
+            df = paired['O/U 2.5']
+            if df is not None and not df.empty:
+                out.append((camp, df))
         except Exception as e:
             errors.append((camp, f'{type(e).__name__}: {e}'))
     return out, errors
 
 
-def _v13_pair_metrics(df, merc, method):
-    # Predictive comparison uses the SAME OOS observations for RAW and method.
-    if merc == '1X2':
-        y = df['esito'].astype(str).to_numpy()
-        raw_cols = ['raw_p1','raw_px','raw_p2']
-        cal_cols = [f'{method.lower()}_p1', f'{method.lower()}_px', f'{method.lower()}_p2']
-        raw = df[raw_cols].to_numpy(float)
-        cal = df[cal_cols].to_numpy(float)
-        raw_choice = raw.argmax(axis=1)
-        cal_choice = cal.argmax(axis=1)
-        labels = np.array(['1','X','2'])
-        raw_acc = np.mean(labels[raw_choice] == y)
-        cal_acc = np.mean(labels[cal_choice] == y)
-        ymat = np.column_stack([(y=='1'),(y=='X'),(y=='2')]).astype(float)
-        raw_b = np.mean(np.sum((raw-ymat)**2, axis=1))
-        cal_b = np.mean(np.sum((cal-ymat)**2, axis=1))
-        eps=1e-12
-        raw_ll = -np.mean(np.log(np.clip(raw[np.arange(len(y)), raw_choice], eps, 1)))
-        cal_ll = -np.mean(np.log(np.clip(cal[np.arange(len(y)), cal_choice], eps, 1)))
-    else:
-        y = (df['esito'].astype(str).to_numpy() == 'Over').astype(float)
-        raw = df['raw_po'].to_numpy(float)
-        cal = df[f'{method.lower()}_po'].to_numpy(float)
-        raw_acc = np.mean((raw >= .5) == (y == 1))
-        cal_acc = np.mean((cal >= .5) == (y == 1))
-        raw_b = np.mean((raw-y)**2)
-        cal_b = np.mean((cal-y)**2)
-        eps=1e-12
-        raw_ll = -np.mean(y*np.log(np.clip(raw,eps,1-eps))+(1-y)*np.log(np.clip(1-raw,eps,1-eps)))
-        cal_ll = -np.mean(y*np.log(np.clip(cal,eps,1-eps))+(1-y)*np.log(np.clip(1-cal,eps,1-eps)))
-    return {'n':len(df),'raw_accuracy_pct':raw_acc*100,'method_accuracy_pct':cal_acc*100,
-            'delta_accuracy_pp':(cal_acc-raw_acc)*100,'raw_brier':raw_b,'method_brier':cal_b,
-            'delta_brier':cal_b-raw_b,'raw_log_loss':raw_ll,'method_log_loss':cal_ll,
-            'delta_log_loss':cal_ll-raw_ll}
+def _v13_1_predictive(df):
+    y = (df['esito'].astype(str).to_numpy() == 'Over').astype(float)
+    raw = df['raw_po'].to_numpy(float)
+    cal = df['platt_po'].to_numpy(float)
+    raw_acc = np.mean((raw >= .5) == (y == 1))
+    cal_acc = np.mean((cal >= .5) == (y == 1))
+    raw_b = np.mean((raw-y)**2)
+    cal_b = np.mean((cal-y)**2)
+    eps = 1e-12
+    raw_ll = -np.mean(y*np.log(np.clip(raw,eps,1-eps)) + (1-y)*np.log(np.clip(1-raw,eps,1-eps)))
+    cal_ll = -np.mean(y*np.log(np.clip(cal,eps,1-eps)) + (1-y)*np.log(np.clip(1-cal,eps,1-eps)))
+    return {
+        'n': len(df),
+        'raw_accuracy_pct': raw_acc*100,
+        'platt_accuracy_pct': cal_acc*100,
+        'delta_accuracy_pp': (cal_acc-raw_acc)*100,
+        'raw_brier': raw_b,
+        'platt_brier': cal_b,
+        'delta_brier': cal_b-raw_b,
+        'raw_log_loss': raw_ll,
+        'platt_log_loss': cal_ll,
+        'delta_log_loss': cal_ll-raw_ll,
+    }
 
 
-def _v13_bootstrap_profit(df, merc, method, n_boot=5000, seed=13013):
-    # Economic comparison on the COMMON BETS: both RAW and method must bet on the same row.
-    mask = df['raw_in'].astype(bool) & df[f'{method.lower()}_in'].astype(bool)
+def _v13_1_bootstrap(df, n_boot=10000, seed=13131):
+    mask = df['raw_in'].astype(bool) & df['platt_in'].astype(bool)
     d = df.loc[mask].copy()
     if d.empty:
-        return {'common_bets':0,'raw_profit_u':np.nan,'method_profit_u':np.nan,'delta_profit_u':np.nan,
-                'raw_roi_pct':np.nan,'method_roi_pct':np.nan,'delta_roi_pp':np.nan,
+        return {'common_bets':0,'raw_profit_u':np.nan,'platt_profit_u':np.nan,'delta_profit_u':np.nan,
+                'raw_roi_pct':np.nan,'platt_roi_pct':np.nan,'delta_roi_pp':np.nan,
                 'ci_low_pp':np.nan,'ci_high_pp':np.nan,'p_two_sided':np.nan}
-    rp=d['raw_profit'].to_numpy(float); cp=d[f'{method.lower()}_profit'].to_numpy(float)
-    delta=cp-rp
-    rng=np.random.default_rng(seed)
-    idx=rng.integers(0,len(delta),size=(n_boot,len(delta)))
-    boots=delta[idx].mean(axis=1)*100.0
-    lo,hi=np.percentile(boots,[2.5,97.5])
-    # descriptive two-sided bootstrap probability around zero
-    p=2*min(np.mean(boots<=0), np.mean(boots>=0))
-    raw_roi=rp.sum()/len(rp)*100
-    cal_roi=cp.sum()/len(cp)*100
-    return {'common_bets':len(d),'raw_profit_u':rp.sum(),'method_profit_u':cp.sum(),
-            'delta_profit_u':delta.sum(),'raw_roi_pct':raw_roi,'method_roi_pct':cal_roi,
-            'delta_roi_pp':cal_roi-raw_roi,'ci_low_pp':lo,'ci_high_pp':hi,
-            'p_two_sided':min(1.0,p)}
+    rp = d['raw_profit'].to_numpy(float)
+    cp = d['platt_profit'].to_numpy(float)
+    delta = cp-rp
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(delta), size=(int(n_boot), len(delta)))
+    boots = delta[idx].mean(axis=1)*100.0
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    p = 2*min(np.mean(boots <= 0), np.mean(boots >= 0))
+    raw_roi = rp.sum()/len(rp)*100
+    platt_roi = cp.sum()/len(cp)*100
+    return {
+        'common_bets': len(d),
+        'raw_profit_u': rp.sum(),
+        'platt_profit_u': cp.sum(),
+        'delta_profit_u': delta.sum(),
+        'raw_roi_pct': raw_roi,
+        'platt_roi_pct': platt_roi,
+        'delta_roi_pp': platt_roi-raw_roi,
+        'ci_low_pp': lo,
+        'ci_high_pp': hi,
+        'p_two_sided': min(1.0, p),
+    }
 
 
-def mostra_v13_validation():
+def mostra_v13_1_validation():
     st.divider()
-    st.markdown('## 🧪 V13 — PAIRED OOS + BOOTSTRAP')
-    st.caption('V13 non modifica il modello V12: confronta RAW contro ciascun calibratore sulle stesse osservazioni OOS e, per l’economia, sulle stesse opportunità in cui entrambi effettuano la giocata.')
+    st.markdown('## 🎯 V13.1 — VERIFICA FINALE PLATT O/U 2.5')
+    st.caption(
+        'Verifica finale mirata: RAW vs PLATT esclusivamente su O/U 2.5, con le stesse osservazioni OOS '
+        'e, per l’economia, sulle stesse opportunità in cui entrambi effettuano la giocata. '
+        'Il modello V12 non viene modificato.'
+    )
     c1,c2=st.columns(2)
     with c1:
-        wu=st.number_input('Warm-up V13',50,300,100,10,key='v13_warm')
+        wu=st.number_input('Warm-up V13.1',50,300,100,10,key='v13_1_warm')
     with c2:
-        nboot=st.number_input('Bootstrap',1000,10000,5000,1000,key='v13_boot')
-    if st.button('🧪 ESEGUI V13 — CONFRONTO PAIRED',key='v13_run'):
+        st.metric('Bootstrap', '10.000')
+    st.info(
+        'Questa è una verifica finale del solo PLATT O/U 2.5. Un IC95% della delta ROI che include 0 '
+        'non fornisce una separazione statistica descrittiva nel bootstrap; anche un risultato positivo '
+        'non costituisce una garanzia di rendimento futuro.'
+    )
+    if st.button('🎯 ESEGUI V13.1 — TEST FINALE PLATT O/U', key='v13_1_run'):
         try:
-            with st.spinner('V13 in esecuzione...'):
-                packs, errors=_v13_build_all(int(wu))
+            with st.spinner('V13.1 in esecuzione: PLATT O/U 2.5 × 5 leghe × bootstrap 10.000...'):
+                packs, errors = _v13_1_build_all(int(wu))
                 rows=[]
-                for camp,merc,df in packs:
-                    for method in V13_METHODS:
-                        pm=_v13_pair_metrics(df,merc,method)
-                        ec=_v13_bootstrap_profit(df,merc,method,int(nboot))
-                        rows.append({'campionato':camp,'mercato':merc,'metodo':method,**pm,**ec})
+                for camp,df in packs:
+                    pm=_v13_1_predictive(df)
+                    ec=_v13_1_bootstrap(df,10000)
+                    rows.append({'campionato':camp,'mercato':'O/U 2.5',**pm,**ec})
                 res=pd.DataFrame(rows)
             if not res.empty:
-                st.markdown('### 1. Confronto predittivo paired — stesso OOS')
-                st.dataframe(res[['campionato','mercato','metodo','n','raw_accuracy_pct','method_accuracy_pct','delta_accuracy_pp','raw_brier','method_brier','delta_brier','raw_log_loss','method_log_loss','delta_log_loss']],use_container_width=True,hide_index=True)
-                st.markdown('### 2. Confronto economico — COMMON BETS')
-                st.dataframe(res[['campionato','mercato','metodo','common_bets','raw_profit_u','method_profit_u','delta_profit_u','raw_roi_pct','method_roi_pct','delta_roi_pp','ci_low_pp','ci_high_pp','p_two_sided']],use_container_width=True,hide_index=True)
-                st.download_button('⬇️ Scarica V13 paired',data=res.to_csv(index=False).encode('utf-8'),file_name='V13_paired_bootstrap.csv',mime='text/csv',key='v13_dl')
-                st.info('L’IC95% della delta ROI deve escludere 0 per avere una separazione statistica descrittiva nel bootstrap. Non è una garanzia di rendimento futuro.')
+                st.markdown('### 1. Qualità predittiva OOS — RAW vs PLATT')
+                st.dataframe(res[['campionato','mercato','n','raw_accuracy_pct','platt_accuracy_pct','delta_accuracy_pp',
+                                  'raw_brier','platt_brier','delta_brier','raw_log_loss','platt_log_loss','delta_log_loss']],
+                             use_container_width=True,hide_index=True)
+                st.markdown('### 2. Economia — COMMON BETS')
+                st.dataframe(res[['campionato','mercato','common_bets','raw_profit_u','platt_profit_u','delta_profit_u',
+                                  'raw_roi_pct','platt_roi_pct','delta_roi_pp','ci_low_pp','ci_high_pp','p_two_sided']],
+                             use_container_width=True,hide_index=True)
+                st.download_button('⬇️ Scarica V13.1',data=res.to_csv(index=False).encode('utf-8'),
+                                   file_name='V13_1_PLATT_OU_finale.csv',mime='text/csv',key='v13_1_dl')
             if errors:
                 st.error('Campionati non completati:')
-                for nome,msg in errors: st.write(f'- **{nome}**: {msg}')
+                for nome,msg in errors:
+                    st.write(f'- **{nome}**: {msg}')
         except Exception as e:
-            st.error(f'Errore V13: {type(e).__name__}: {e}')
+            st.error(f'Errore V13.1: {type(e).__name__}: {e}')
 
-# Manteniamo l’app completa e rendiamo disponibili V12 e V13 nello stesso progetto.
+# App completa: V12 + V13.1, senza rimuovere la parte operativa.
 try:
     mostra_v12_validation()
 except Exception as _v12_err:
     st.error(f"V12 non disponibile: {type(_v12_err).__name__}: {_v12_err}")
 try:
-    mostra_v13_validation()
-except Exception as _v13_err:
-    st.error(f"V13 non disponibile: {type(_v13_err).__name__}: {_v13_err}")
+    mostra_v13_1_validation()
+except Exception as _v13_1_err:
+    st.error(f"V13.1 non disponibile: {type(_v13_1_err).__name__}: {_v13_1_err}")
