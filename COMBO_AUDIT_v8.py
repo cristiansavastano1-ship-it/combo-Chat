@@ -2454,6 +2454,58 @@ else:
 # appaiato sugli stessi eventi.
 # =====================================================================
 
+def _v7_bootstrap_roi(df, n_boot=2000, seed=42):
+    """Bootstrap a livello di scommessa per ROI/profitto."""
+    if df is None or df.empty or 'vinta' not in df.columns or 'quota' not in df.columns:
+        return {'n': 0, 'roi': None, 'roi_lo': None, 'roi_hi': None,
+                'profit': None, 'profit_lo': None, 'profit_hi': None}
+    import numpy as _np
+    wins = df['vinta'].astype(bool).to_numpy()
+    odds = df['quota'].astype(float).to_numpy()
+    profit = _np.where(wins, odds - 1.0, -1.0)
+    roi = float(profit.mean() * 100.0)
+    total = float(profit.sum())
+    rng = _np.random.default_rng(seed)
+    idx = rng.integers(0, len(profit), size=(n_boot, len(profit)))
+    samples = profit[idx].mean(axis=1) * 100.0
+    lo, hi = _np.percentile(samples, [2.5, 97.5])
+    totals = profit[idx].sum(axis=1)
+    plo, phi = _np.percentile(totals, [2.5, 97.5])
+    return {'n': int(len(profit)), 'roi': roi, 'roi_lo': float(lo), 'roi_hi': float(hi),
+            'profit': total, 'profit_lo': float(plo), 'profit_hi': float(phi)}
+
+
+def _v7_make_row(campionato, mercato, versione, df, ev_col='ev', seed=42):
+    if df is None or df.empty:
+        return {'campionato': campionato, 'mercato': mercato, 'versione': versione,
+                'bet': 0, 'strike_%': None, 'brier': None, 'logloss': None,
+                'EV_%': None, 'ROI_%': None, 'ROI_IC95_low_%': None,
+                'ROI_IC95_high_%': None, 'profit_u': None,
+                'profit_IC95_low_u': None, 'profit_IC95_high_u': None,
+                'quota_media': None, 'max_dd_u': None}
+    d = df.copy()
+    if 'vinta' in d.columns and 'quota' in d.columns:
+        s = _v6_stats_df(d)
+        bs = _v7_bootstrap_roi(d, seed=seed)
+    else:
+        s = {'bet': len(d), 'strike': None, 'roi': None, 'profit': None,
+             'avg_odds': None, 'ev': None, 'max_dd': None}
+        bs = {'roi_lo': None, 'roi_hi': None, 'profit_lo': None, 'profit_hi': None}
+    ev = None
+    if ev_col in d.columns and len(d):
+        ev = float(d[ev_col].astype(float).mean() * 100.0)
+    elif 'ev' in d.columns and len(d):
+        ev = float(d['ev'].astype(float).mean() * 100.0)
+    return {'campionato': campionato, 'mercato': mercato, 'versione': versione,
+            'bet': int(s.get('bet', len(d))), 'strike_%': s.get('strike'),
+            'brier': None, 'logloss': None, 'EV_%': ev,
+            'ROI_%': s.get('roi'), 'ROI_IC95_low_%': bs.get('roi_lo'),
+            'ROI_IC95_high_%': bs.get('roi_hi'), 'profit_u': s.get('profit'),
+            'profit_IC95_low_u': bs.get('profit_lo'),
+            'profit_IC95_high_u': bs.get('profit_hi'),
+            'quota_media': s.get('avg_odds'), 'max_dd_u': s.get('max_dd')}
+
+
 def _v8_bootstrap_compare(df_raw, df_cal, n_boot=3000, seed=42):
     import numpy as _np
     def prof(df):
