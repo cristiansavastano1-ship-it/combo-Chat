@@ -261,24 +261,57 @@ def estrai_scontri_diretti(squadra_casa, squadra_trasferta, df_coppa, df_globale
 # Basata direttamente sulla V11 funzionante. Nessuna modifica al
 # motore 1X2, Goal/No Goal, Multigol o Combo Rapide.
 # =====================================================================
-def _v13_fit_platt_ou(dati_precedenti, rho, ewma_span, emivita, warmup=100):
+@st.cache_data(show_spinner=False, ttl=3600)
+def _v13_fit_platt_ou(dati_precedenti, rho, ewma_span, emivita, warmup=20):
+    """PLATT O/U 2.5 temporale, alleggerita per non bloccare l'app.
+    Usa solo partite già concluse e non guarda mai il risultato della partita
+    selezionata. Per evitare un O(n^2) che rende Streamlit inutilizzabile,
+    usa gli ultimi 120 match storici e, per ogni previsione, al massimo gli
+    80 match precedenti come contesto del modello.
+    """
     try:
-        hist = _v5_raw_history(dati_precedenti, rho, ewma_span, emivita)
+        tutte = dati_precedenti[dati_precedenti['FTHG'].notna() & dati_precedenti['FTAG'].notna()].copy()
+        if 'Date_parsed' in tutte.columns:
+            tutte = tutte.sort_values('Date_parsed')
+        tutte = tutte.reset_index(drop=True)
+        if len(tutte) < 60:
+            return None
+
+        # Campione temporale recente: evita di ricalcolare centinaia di modelli.
+        start = max(15, len(tutte) - 120)
+        righe = []
+        for i in range(start, len(tutte)):
+            partita = tutte.iloc[i]
+            # Solo informazioni disponibili prima della partita i.
+            prec = tutte.iloc[max(0, i - 80):i].copy()
+            if len(prec) < 15:
+                continue
+            m = calcola_modello_completo(
+                prec, partita['HomeTeam'], partita['AwayTeam'],
+                rho, ewma_span, emivita, pd.DataFrame(),
+                data_riferimento=partita.get('Date_parsed')
+            )
+            if m is None:
+                continue
+            po = (100.0 - float(m['prob_under'][2.5])) / 100.0
+            esito = 1 if (float(partita['FTHG']) + float(partita['FTAG'])) > 2.5 else 0
+            righe.append((po, esito))
+
+        if len(righe) < 30:
+            return None
+        train = righe[int(warmup):] if len(righe) > int(warmup) else righe
+        if len(train) < 30:
+            train = righe
+        x = np.asarray([[r[0]] for r in train], dtype=float)
+        y = np.asarray([r[1] for r in train], dtype=int)
+        if len(np.unique(y)) < 2:
+            return None
+        clf = LogisticRegression(solver='lbfgs', C=1.0, max_iter=1000)
+        clf.fit(x, y)
+        return clf, len(train)
     except Exception:
+        # PLATT non deve mai impedire la visualizzazione del modello V11.
         return None
-    if hist is None or hist.empty:
-        return None
-    hist = hist.sort_values('indice').reset_index(drop=True)
-    train = hist.iloc[int(warmup):].copy() if len(hist) > int(warmup) else pd.DataFrame()
-    if len(train) < 30 or train['esito_ou'].nunique() < 2:
-        return None
-    x = train[['po']].astype(float).to_numpy()
-    y = (train['esito_ou'] == 'Over').astype(int).to_numpy()
-    if len(np.unique(y)) < 2:
-        return None
-    clf = LogisticRegression(solver='lbfgs', C=1.0, max_iter=1000)
-    clf.fit(x, y)
-    return clf, len(train)
 
 
 def _v13_apply_platt_ou(modello, calibratore_info):
