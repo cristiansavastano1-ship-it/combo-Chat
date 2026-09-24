@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -2625,6 +2624,7 @@ def _v9_build_paired(dati_completi, rho, ewma_span, emivita, soglia_ev=0.10, war
 
 
 def _v9_paired_stats(df, n_boot=3000, seed=42, common_only=False):
+    import numpy as _np
     if df is None or df.empty: return {'n':0,'raw_bets':0,'cal_bets':0,'delta_profit':None,'delta_roi_pp':None,'lo':None,'hi':None,'p_two_sided':None}
     d=df[df.raw_in & df.cal_in].copy() if common_only else df.copy()
     if d.empty: return {'n':0,'raw_bets':0,'cal_bets':0,'delta_profit':None,'delta_roi_pp':None,'lo':None,'hi':None,'p_two_sided':None}
@@ -2727,3 +2727,4 @@ try:
     mostra_v9_validation()
 except Exception as _v9_err:
     st.error(f"V9 non disponibile: {type(_v9_err).__name__}: {_v9_err}")
+
