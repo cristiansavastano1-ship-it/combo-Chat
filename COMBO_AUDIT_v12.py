@@ -11,7 +11,7 @@ from scipy.stats import poisson
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 
-st.set_page_config(page_title="COMBO — V13 Operativa", page_icon="⚽", layout="centered")
+st.set_page_config(page_title="COMBO — Audit Model v5", page_icon="🔎", layout="centered")
 
 # =====================================================================
 # 🔎 AUDIT VERSION v5 — derivata dall'app originale, ma separata.
@@ -256,6 +256,42 @@ def estrai_scontri_diretti(squadra_casa, squadra_trasferta, df_coppa, df_globale
 # Il chiamante riceve n_casa/n_trasf per mostrare un avviso onesto quando
 # il campione specifico è scarso.
 # =====================================================================
+# =====================================================================
+# V13 — PLATT SOLO O/U 2.5
+# Basata direttamente sulla V11 funzionante. Nessuna modifica al
+# motore 1X2, Goal/No Goal, Multigol o Combo Rapide.
+# =====================================================================
+def _v13_fit_platt_ou(dati_precedenti, rho, ewma_span, emivita, warmup=100):
+    try:
+        hist = _v5_raw_history(dati_precedenti, rho, ewma_span, emivita)
+    except Exception:
+        return None
+    if hist is None or hist.empty:
+        return None
+    hist = hist.sort_values('indice').reset_index(drop=True)
+    train = hist.iloc[int(warmup):].copy() if len(hist) > int(warmup) else pd.DataFrame()
+    if len(train) < 30 or train['esito_ou'].nunique() < 2:
+        return None
+    x = train[['po']].astype(float).to_numpy()
+    y = (train['esito_ou'] == 'Over').astype(int).to_numpy()
+    if len(np.unique(y)) < 2:
+        return None
+    clf = LogisticRegression(solver='lbfgs', C=1.0, max_iter=1000)
+    clf.fit(x, y)
+    return clf, len(train)
+
+
+def _v13_apply_platt_ou(modello, calibratore_info):
+    if modello is None or calibratore_info is None:
+        return modello
+    clf, _ = calibratore_info
+    raw_over = (100.0 - float(modello['prob_under'][2.5])) / 100.0
+    cal_over = float(clf.predict_proba(np.array([[raw_over]], dtype=float))[0, 1])
+    cal_over = min(max(cal_over, 0.001), 0.999)
+    modello['prob_under'][2.5] = (1.0 - cal_over) * 100.0
+    return modello
+
+
 def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho, ewma_span,
                               emivita, df_globale, data_riferimento=None):
     giocate_validi = giocate_coppa.dropna(subset=['FTHG', 'FTAG']) if giocate_coppa is not None else pd.DataFrame()
@@ -1809,9 +1845,9 @@ def mostra_sezione_v5_calibrazione_ev(dati, campionato, rho_val, ewma_span_val, 
             st.download_button('⬇️ Scarica dettaglio V5 CSV',data=out.to_csv(index=False).encode('utf-8'),file_name='v5_calibrazione_ev.csv',mime='text/csv',key='v5_dl')
 
 
-st.caption("Versione operativa V13 — modello completo con PLATT solo O/U 2.5")
+st.caption("V13 operativa — base V11 invariata + PLATT solo O/U 2.5")
 
-st.info("V13 mantiene il motore operativo completo. PLATT viene applicato esclusivamente a O/U 2.5; 1X2 e gli altri mercati restano invariati.")
+st.info("Questa app è un laboratorio separato. v2 confronta il modello grezzo con una calibrazione isotonic allenata SOLO su dati temporali precedenti al test: non usa i calibratori salvati del progetto originale e non modifica v1.")
 
 # Parametri del modello fissati ai valori di default validati — non più
 # esposti nell'interfaccia: erano controlli tecnici che richiedevano di
@@ -1830,10 +1866,10 @@ with st.sidebar:
         value=False,
         help="In questa versione audit è disattivata di default: sulla base della verifica storica. Disattiva per confrontare prima/dopo."
     )
-    usa_platt_ou_v13 = st.checkbox(
+    usa_platt_v13 = st.checkbox(
         "🎯 V13 — PLATT solo O/U 2.5",
         value=True,
-        help="Calibra solo Over/Under 2.5 con PLATT OOS; 1X2 e motore del modello restano invariati."
+        help="Calibra esclusivamente Over/Under 2.5 con regressione logistica walk-forward sui dati precedenti. 1X2 e gli altri mercati restano invariati."
     )
 
 scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)"], horizontal=True)
@@ -2211,35 +2247,6 @@ else:
         mappa_partite.append(r.to_dict())
     is_coppa = True
 
-def v13_platt_ou_calibratore(dati_storici, rho, ewma_span, emivita):
-    """Fit PLATT O/U 2.5 using only historical matches available before the target match."""
-    hist = _v5_raw_history(dati_storici, rho, ewma_span, emivita)
-    if hist is None or hist.empty or len(hist) < 100:
-        return None, 0
-    p = hist['po'].astype(float).to_numpy()
-    y = (hist['esito_ou'] == 'Over').astype(int).to_numpy()
-    if len(set(y.tolist())) < 2:
-        return None, len(hist)
-    p = np.clip(p, 1e-6, 1.0 - 1e-6)
-    cal = LogisticRegression(C=1e6, solver='lbfgs', max_iter=1000)
-    cal.fit(p.reshape(-1, 1), y)
-    return cal, len(hist)
-
-
-def v13_applica_platt_ou(modello, dati_storici, rho, ewma_span, emivita):
-    if modello is None or dati_storici is None or dati_storici.empty:
-        return modello, None
-    cal, n = v13_platt_ou_calibratore(dati_storici, rho, ewma_span, emivita)
-    if cal is None:
-        return modello, None
-    p_raw_over = (100.0 - float(modello['prob_under'][2.5])) / 100.0
-    p_cal_over = float(cal.predict_proba(np.array([[np.clip(p_raw_over, 1e-6, 1.0 - 1e-6)]], dtype=float))[0, 1])
-    p_cal_over = float(np.clip(p_cal_over, 0.001, 0.999))
-    modello['prob_under'][2.5] = (1.0 - p_cal_over) * 100.0
-    return modello, {'n_osservazioni': n, 'p_raw_over': p_raw_over, 'p_cal_over': p_cal_over}
-
-
-
 if not opzioni_partite:
     st.warning("Nessuna partita disponibile al momento.")
 else:
@@ -2274,11 +2281,11 @@ else:
         if calib_1x2_info:
             modello = applica_calibrazione_1x2(modello, calib_1x2_info["calibratore"])
 
-    calib_ou_v13_info = None
-    if modello is not None and not is_coppa and usa_platt_ou_v13:
-        modello, calib_ou_v13_info = v13_applica_platt_ou(
-            modello, dati_filtrati, rho_val, ewma_span_val, emivita_val
-        )
+    platt_v13_info = None
+    if modello is not None and not is_coppa and usa_platt_v13:
+        platt_v13_info = _v13_fit_platt_ou(dati_filtrati, rho_val, ewma_span_val, emivita_val, warmup=100)
+        if platt_v13_info is not None:
+            modello = _v13_apply_platt_ou(modello, platt_v13_info)
 
     if modello is None:
         st.warning(f"⚠️ Impossibile elaborare il match per **{partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}**.")
@@ -2287,11 +2294,10 @@ else:
         if calib_1x2_info:
             st.caption(f"🎯 Probabilità 1X2 corrette con calibrazione (allenata su "
                        f"{calib_1x2_info['n_osservazioni']} osservazioni, {calib_1x2_info['timestamp']}).")
-        if calib_ou_v13_info:
-            st.caption(
-                f"🎯 V13 PLATT O/U 2.5 attiva — {calib_ou_v13_info['n_osservazioni']} osservazioni storiche OOS; "
-                f"Over raw {calib_ou_v13_info['p_raw_over']*100:.1f}% → calibrato {calib_ou_v13_info['p_cal_over']*100:.1f}%."
-            )
+        if platt_v13_info:
+            st.caption(f"🎯 V13 PLATT attiva solo su O/U 2.5 — {platt_v13_info[1]} osservazioni OOS precedenti. 1X2, Goal/No Goal e gli altri mercati non sono modificati.")
+        elif not is_coppa and usa_platt_v13:
+            st.info("ℹ️ V13 PLATT non applicata: storico O/U insufficiente per l'addestramento.")
 
         # Avviso trasparenza dati (sostituisce il vecchio generatore silenzioso di dati finti)
         SOGLIA_AVVISO = 5
@@ -3144,466 +3150,7 @@ def mostra_v11_validation():
         except Exception as e:
             st.error(f'Errore V11: {type(e).__name__}: {e}')
 
-# V12.1 CPU optimization: keep V11 functions intact, but do not execute the
-# V11 validation automatically. Running both V11 and V12 on every Streamlit
-# rerun unnecessarily doubles the heavy historical/OOS computation.
-# The original V11 source remains untouched in its own file.
-
-
-# =====================================================================
-# V12 — CONFRONTO OOS DI METODI DI CALIBRAZIONE
-# =====================================================================
-# V12 è una derivazione separata dal V11.
-# Non modifica il motore RAW.
-#
-# Metodi confrontati:
-#   RAW       = probabilità del modello senza calibrazione
-#   ISOTONIC  = Isotonic Regression walk-forward
-#   PLATT     = Logistic/Platt scaling walk-forward
-#   BETA      = Beta calibration walk-forward
-#   SHRINK50  = shrinkage verso 50%, con intensità alpha stimata sul solo passato
-#
-# Regola anti-leakage:
-# per ogni partita i calibratori sono allenati SOLO sulle osservazioni
-# precedenti. La partita corrente viene valutata prima di essere aggiunta
-# al training successivo.
-#
-# 1X2: calibrazione one-vs-rest separata per 1/X/2, poi normalizzazione a 1.
-# O/U: calibrazione binaria Over; Under = 1 - Over.
-#
-# V12 mantiene anche il confronto economico EV >= 10% per continuità con V11,
-# ma ROI/profit sono proxy storiche basate sulle quote medie dei CSV.
-# =====================================================================
-
-from sklearn.linear_model import LogisticRegression
-from scipy.optimize import minimize_scalar
-
-V12_CAL_MIN_TRAIN = 100
-V12_METHODS = ['RAW', 'ISOTONIC', 'PLATT', 'BETA', 'SHRINK50']
-
-
-
-# =====================================================================
-# V13 OPERATIVA — PLATT SOLO O/U 2.5
-# Applicata esclusivamente alle probabilita O/U 2.5 della partita selezionata.
-# Il motore V12 e il mercato 1X2 restano invariati.
-# =====================================================================
-@st.cache_data(ttl=3600, max_entries=10)
-def _v12_clip(p):
-    return float(np.clip(p, 1e-6, 1.0 - 1e-6))
-
-
-def _v12_logloss_binary(p, y):
-    p = np.clip(np.asarray(p, dtype=float), 1e-6, 1-1e-6)
-    y = np.asarray(y, dtype=float)
-    return float(-np.mean(y*np.log(p) + (1-y)*np.log(1-p)))
-
-
-def _v12_fit_isotonic(p, y):
-    if len(p) < V12_CAL_MIN_TRAIN or len(set(y)) < 2:
-        return None
-    cal = IsotonicRegression(out_of_bounds='clip', y_min=0.001, y_max=0.999)
-    cal.fit(np.asarray(p, dtype=float), np.asarray(y, dtype=float))
-    return cal
-
-
-def _v12_fit_platt(p, y):
-    if len(p) < V12_CAL_MIN_TRAIN or len(set(y)) < 2:
-        return None
-    x = np.asarray(p, dtype=float).reshape(-1, 1)
-    yy = np.asarray(y, dtype=int)
-    # Platt scaling: logistic regression on the raw probability.
-    cal = LogisticRegression(C=1e6, solver='lbfgs', max_iter=1000)
-    cal.fit(x, yy)
-    return cal
-
-
-def _v12_fit_beta(p, y):
-    if len(p) < V12_CAL_MIN_TRAIN or len(set(y)) < 2:
-        return None
-    p = np.clip(np.asarray(p, dtype=float), 1e-6, 1-1e-6)
-    x = np.column_stack([np.log(p), np.log1p(-p)])
-    yy = np.asarray(y, dtype=int)
-    # Beta calibration in the canonical logistic form:
-    # logit(p_cal) = a*log(p) + b*log(1-p) + c.
-    cal = LogisticRegression(C=1e6, solver='lbfgs', max_iter=1000)
-    cal.fit(x, yy)
-    return cal
-
-
-def _v12_apply_binary(cal, p):
-    if cal is None:
-        return float(p)
-    p = _v12_clip(p)
-    if isinstance(cal, tuple) and cal and cal[0] == 'shrink50':
-        alpha = float(cal[1])
-        return float(np.clip(0.5 + alpha*(p-0.5), 0.001, 0.999))
-    if isinstance(cal, tuple) and cal and cal[0] == 'beta':
-        model = cal[1]
-        x = np.array([[np.log(p), np.log1p(-p)]], dtype=float)
-        return float(np.clip(model.predict_proba(x)[0,1], 0.001, 0.999))
-    # Isotonic or Platt
-    if isinstance(cal, IsotonicRegression):
-        return float(np.clip(cal.predict([p])[0], 0.001, 0.999))
-    return float(np.clip(cal.predict_proba(np.array([[p]], dtype=float))[0,1], 0.001, 0.999))
-
-
-def _v12_fit_shrink50(p, y):
-    if len(p) < V12_CAL_MIN_TRAIN or len(set(y)) < 2:
-        return None
-    p = np.asarray(p, dtype=float)
-    y = np.asarray(y, dtype=float)
-
-    # alpha=0 -> 50%; alpha=1 -> RAW.
-    def objective(alpha):
-        pc = np.clip(0.5 + alpha*(p-0.5), 1e-6, 1-1e-6)
-        return _v12_logloss_binary(pc, y)
-
-    res = minimize_scalar(objective, bounds=(0.0, 1.0), method='bounded',
-                          options={'xatol': 1e-4})
-    alpha = float(np.clip(res.x if res.success else 1.0, 0.0, 1.0))
-    return ('shrink50', alpha)
-
-
-def _v12_fit_method(name, p, y):
-    if name == 'ISOTONIC':
-        return _v12_fit_isotonic(p, y)
-    if name == 'PLATT':
-        return _v12_fit_platt(p, y)
-    if name == 'BETA':
-        fitted = _v12_fit_beta(p, y)
-        return ('beta', fitted) if fitted is not None else None
-    if name == 'SHRINK50':
-        return _v12_fit_shrink50(p, y)
-    return None
-
-
-def _v12_apply_1x2(rawp, models):
-    if models is None or not all(models.get(s) is not None for s in ['1','X','2']):
-        return rawp.copy()
-    cp = {s: _v12_apply_binary(models[s], rawp[s]) for s in ['1','X','2']}
-    tot = sum(cp.values())
-    if tot <= 0:
-        return rawp.copy()
-    return {s: cp[s]/tot for s in ['1','X','2']}
-
-
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=20)
-def _v12_build_paired(dati_completi, rho, ewma_span, emivita,
-                      soglia_ev=0.10, warmup=100):
-    """Costruisce un dataset OOS paired per RAW + 4 calibratori."""
-    hist = _v5_raw_history(dati_completi, rho, ewma_span, emivita)
-    if hist.empty:
-        return None
-
-    rows12, rowsou = [], []
-
-    prior12_p = {'1': [], 'X': [], '2': []}
-    prior12_y = {'1': [], 'X': [], '2': []}
-    prior_ou_p, prior_ou_y = [], []
-
-    for j, r in hist.iterrows():
-        if j < warmup:
-            prior12_p['1'].append(float(r.p1)); prior12_y['1'].append(int(r.esito12 == '1'))
-            prior12_p['X'].append(float(r.px)); prior12_y['X'].append(int(r.esito12 == 'X'))
-            prior12_p['2'].append(float(r.p2)); prior12_y['2'].append(int(r.esito12 == '2'))
-            prior_ou_p.append(float(r.po)); prior_ou_y.append(int(r.esito_ou == 'Over'))
-            continue
-
-        raw12 = {'1': float(r.p1), 'X': float(r.px), '2': float(r.p2)}
-
-        models12 = {
-            method: {
-                s: _v12_fit_method(method, prior12_p[s], prior12_y[s])
-                for s in ['1','X','2']
-            }
-            for method in V12_METHODS if method != 'RAW'
-        }
-        probs12 = {'RAW': raw12.copy()}
-        for method in V12_METHODS:
-            if method == 'RAW':
-                continue
-            probs12[method] = _v12_apply_1x2(raw12, models12[method])
-
-        rq = {'1': float(r.q1), 'X': float(r.qx), '2': float(r.q2)}
-        row12 = {
-            'data': r.data, 'esito': r.esito12,
-            'p1_raw': raw12['1'], 'px_raw': raw12['X'], 'p2_raw': raw12['2']
-        }
-
-        for method in V12_METHODS:
-            pp = probs12[method]
-            choice = max(pp, key=pp.get)
-            ev = pp[choice] * rq[choice] - 1.0
-            bet = bool(ev >= soglia_ev)
-            profit = ((rq[choice]-1.0) if choice == r.esito12 else -1.0) if bet else 0.0
-            row12.update({
-                f'{method.lower()}_p1': pp['1'],
-                f'{method.lower()}_px': pp['X'],
-                f'{method.lower()}_p2': pp['2'],
-                f'{method.lower()}_conf': pp[choice],
-                f'{method.lower()}_choice': choice,
-                f'{method.lower()}_hit': bool(choice == r.esito12),
-                f'{method.lower()}_ev': ev,
-                f'{method.lower()}_in': bet,
-                f'{method.lower()}_profit': profit,
-                f'{method.lower()}_quota': rq[choice],
-            })
-        rows12.append(row12)
-
-        rawou = {'Over': float(r.po), 'Under': float(r.pu)}
-        ou_models = {
-            method: _v12_fit_method(method, prior_ou_p, prior_ou_y)
-            for method in V12_METHODS if method != 'RAW'
-        }
-        probsou = {'RAW': rawou.copy()}
-        for method in V12_METHODS:
-            if method == 'RAW':
-                continue
-            po_cal = _v12_apply_binary(ou_models[method], rawou['Over'])
-            probsou[method] = {'Over': po_cal, 'Under': 1.0-po_cal}
-
-        oq = {'Over': float(r.qo), 'Under': float(r.qu)}
-        rowou = {'data': r.data, 'esito': r.esito_ou,
-                  'po_raw': rawou['Over'], 'pu_raw': rawou['Under']}
-
-        for method in V12_METHODS:
-            pp = probsou[method]
-            choice = max(pp, key=pp.get)
-            ev = pp[choice] * oq[choice] - 1.0
-            bet = bool(ev >= soglia_ev)
-            profit = ((oq[choice]-1.0) if choice == r.esito_ou else -1.0) if bet else 0.0
-            rowou.update({
-                f'{method.lower()}_po': pp['Over'],
-                f'{method.lower()}_pu': pp['Under'],
-                f'{method.lower()}_conf': pp[choice],
-                f'{method.lower()}_choice': choice,
-                f'{method.lower()}_hit': bool(choice == r.esito_ou),
-                f'{method.lower()}_ev': ev,
-                f'{method.lower()}_in': bet,
-                f'{method.lower()}_profit': profit,
-                f'{method.lower()}_quota': oq[choice],
-            })
-        rowsou.append(rowou)
-
-        # IMPORTANT: current observation enters training only AFTER evaluation.
-        prior12_p['1'].append(float(r.p1)); prior12_y['1'].append(int(r.esito12 == '1'))
-        prior12_p['X'].append(float(r.px)); prior12_y['X'].append(int(r.esito12 == 'X'))
-        prior12_p['2'].append(float(r.p2)); prior12_y['2'].append(int(r.esito12 == '2'))
-        prior_ou_p.append(float(r.po)); prior_ou_y.append(int(r.esito_ou == 'Over'))
-
-    return {'1X2': pd.DataFrame(rows12), 'O/U 2.5': pd.DataFrame(rowsou)}
-
-
-def _v12_metriche(df, merc, common_only=False):
-    if df is None or df.empty:
-        return pd.DataFrame()
-    d = df[df.raw_in & df.cal_dummy].copy() if False else df.copy()
-    if common_only:
-        mask = np.ones(len(df), dtype=bool)
-        for m in V12_METHODS:
-            mask &= df[f'{m.lower()}_in'].to_numpy(dtype=bool)
-        d = df.loc[mask].copy()
-    if d.empty:
-        return pd.DataFrame()
-
-    out = []
-    for method in V12_METHODS:
-        key = method.lower()
-        hits = d[f'{key}_hit'].to_numpy(dtype=bool)
-        n = len(d)
-        probs = []
-        true_probs = []
-        brier = []
-        logloss = []
-        for _, r in d.iterrows():
-            if merc == '1X2':
-                ps = np.array([r[f'{key}_p1'], r[f'{key}_px'], r[f'{key}_p2']], dtype=float)
-                y = np.array([r.esito == '1', r.esito == 'X', r.esito == '2'], dtype=float)
-                true_p = float(ps[int(np.argmax(y))])
-                brier.append(float(np.sum((ps-y)**2)))
-            else:
-                po = float(r[f'{key}_po'])
-                ps = {'Over': po, 'Under': 1-po}
-                true_p = ps[r.esito]
-                brier.append(float((po-(r.esito == 'Over'))**2 +
-                                   ((1-po)-(r.esito == 'Under'))**2))
-            true_probs.append(true_p)
-            logloss.append(-np.log(_v12_clip(true_p)))
-
-        profit = d[f'{key}_profit'].to_numpy(dtype=float)
-        bets = d[f'{key}_in'].to_numpy(dtype=bool)
-        nb = int(bets.sum())
-        out.append({
-            'metodo': method,
-            'n': n,
-            'accuracy_pct': float(hits.mean()*100),
-            'brier': float(np.mean(brier)),
-            'log_loss': float(np.mean(logloss)),
-            'calibration_mae_pp': float(np.mean(np.abs(
-                np.asarray(true_probs)*100 -
-                np.asarray(hits, dtype=float)*100
-            ))),
-            'bets_ev10': nb,
-            'profit_ev10_u': float(profit.sum()),
-            'roi_ev10_pct': float(100*profit.sum()/nb) if nb else np.nan
-        })
-    return pd.DataFrame(out)
-
-
-def _v12_band_table(df, merc, common_only=False):
-    if df is None or df.empty:
-        return pd.DataFrame()
-    if common_only:
-        mask = np.ones(len(df), dtype=bool)
-        for m in V12_METHODS:
-            mask &= df[f'{m.lower()}_in'].to_numpy(dtype=bool)
-        d = df.loc[mask].copy()
-    else:
-        d = df.copy()
-    if d.empty:
-        return pd.DataFrame()
-
-    bins = [0.0, 0.40, 0.50, 0.60, 0.70, 0.80, 1.0000001]
-    labels = ['0-40%','40-50%','50-60%','60-70%','70-80%','80-100%']
-    out = []
-
-    for method in V12_METHODS:
-        key = method.lower()
-        conf = np.asarray(d[f'{key}_conf'], dtype=float)
-        hit = np.asarray(d[f'{key}_hit'], dtype=bool)
-        idx = np.digitize(conf, bins[1:-1], right=False)
-        for k, label in enumerate(labels):
-            mask = idx == k
-            n = int(mask.sum())
-            if not n:
-                continue
-            p = conf[mask]
-            h = hit[mask]
-            profit = np.asarray(d.loc[mask, f'{key}_profit'], dtype=float)
-            bets = np.asarray(d.loc[mask, f'{key}_in'], dtype=bool)
-            nb = int(bets.sum())
-            out.append({
-                'metodo': method,
-                'fascia': label,
-                'n_opportunita': n,
-                'prob_media': float(p.mean()*100),
-                'frequenza_reale': float(h.mean()*100),
-                'errore_cal_pp': float(h.mean()*100-p.mean()*100),
-                'bets_ev10': nb,
-                'roi_ev10_pct': float(100*profit.sum()/nb) if nb else np.nan,
-                'profit_ev10_u': float(profit.sum())
-            })
-    return pd.DataFrame(out)
-
-
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=10)
-def _v12_build_all(warmup=100):
-    per_metriche = []
-    per_bands = []
-    dfs = {'1X2': {}, 'O/U 2.5': {}}
-    errors = []
-
-    for camp, info in CAMPIONATI_DOMESTICI.items():
-        try:
-            dati = carica_dati_campionato(info['id_fd'])
-            paired = _v12_build_paired(
-                dati, rho_val, ewma_span_val, emivita_val, 0.10, warmup
-            )
-            if paired is None:
-                raise ValueError('dati OOS vuoti')
-
-            for merc, df in paired.items():
-                dfs[merc][camp] = df
-                for common in [False, True]:
-                    m = _v12_metriche(df, merc, common)
-                    if not m.empty:
-                        m.insert(0, 'campionato', camp)
-                        m.insert(1, 'mercato', merc)
-                        m.insert(2, 'universo',
-                                  'COMMON BETS' if common else 'ALL OOS')
-                        per_metriche.append(m)
-
-                    b = _v12_band_table(df, merc, common)
-                    if not b.empty:
-                        b.insert(0, 'campionato', camp)
-                        b.insert(1, 'mercato', merc)
-                        b.insert(2, 'universo',
-                                  'COMMON BETS' if common else 'ALL OOS')
-                        per_bands.append(b)
-        except Exception as e:
-            errors.append((camp, f'{type(e).__name__}: {e}'))
-
-    metrics = pd.concat(per_metriche, ignore_index=True) if per_metriche else pd.DataFrame()
-    bands = pd.concat(per_bands, ignore_index=True) if per_bands else pd.DataFrame()
-    return metrics, bands, errors
-
-
-def mostra_v12_validation():
-    st.divider()
-    st.markdown('## 🧬 V12.1 — CONFRONTO 5 METODI DI CALIBRAZIONE OOS · CPU OPTIMIZED')
-    st.caption(
-        'RAW vs Isotonic vs Platt vs Beta vs Shrink50. Cache attiva e V11 non viene eseguito automaticamente. '
-        'Tutti i calibratori sono walk-forward: per ogni partita usano solo il passato. '
-        '1X2 e O/U 2.5 sono valutati separatamente.'
-    )
-
-    c1, c2 = st.columns(2)
-    with c1:
-        wu = st.number_input('Warm-up V12', 50, 300, 100, 10, key='v12_warm')
-    with c2:
-        st.metric('Metodi', '5')
-
-    st.info(
-        'Brier e Log Loss più bassi indicano probabilità più accurate. '
-        'Errore calibrazione vicino a 0 indica migliore allineamento tra probabilità '
-        'e frequenza osservata. ROI/profit sono proxy storiche sulle selezioni EV≥10%. '
-        'Le fasce alte possono avere campioni piccoli.'
-    )
-
-    if st.button('🧬 ESEGUI V12 — CONFRONTO 5 LEGHE', key='v12_run'):
-        try:
-            with st.spinner('V12.1 in esecuzione: 5 metodi × 5 leghe... primo run può essere pesante; i successivi usano cache.'):
-                metrics, bands, errors = _v12_build_all(int(wu))
-
-            if not metrics.empty:
-                st.markdown('### 1. Metriche OOS per lega')
-                st.dataframe(
-                    metrics[
-                        ['campionato','mercato','universo','metodo','n',
-                         'accuracy_pct','brier','log_loss',
-                         'calibration_mae_pp','bets_ev10',
-                         'roi_ev10_pct','profit_ev10_u']
-                    ],
-                    use_container_width=True, hide_index=True
-                )
-                st.download_button(
-                    '⬇️ Scarica V12 metriche',
-                    data=metrics.to_csv(index=False).encode('utf-8'),
-                    file_name='V12_metriche_metodi.csv',
-                    mime='text/csv', key='v12_dl_metrics'
-                )
-
-            if not bands.empty:
-                st.markdown('### 2. Reliability per fasce di probabilità')
-                st.dataframe(bands, use_container_width=True, hide_index=True)
-                st.download_button(
-                    '⬇️ Scarica V12 fasce',
-                    data=bands.to_csv(index=False).encode('utf-8'),
-                    file_name='V12_reliability_fasce.csv',
-                    mime='text/csv', key='v12_dl_bands'
-                )
-
-            if errors:
-                st.error('Campionati non completati:')
-                for nome, msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-        except Exception as e:
-            st.error(f'Errore V12: {type(e).__name__}: {e}')
-
-
 try:
-    mostra_v12_validation()
-except Exception as _v12_err:
-    st.error(f"V12 non disponibile: {type(_v12_err).__name__}: {_v12_err}")
+    mostra_v11_validation()
+except Exception as _v11_err:
+    st.error(f"V11 non disponibile: {type(_v11_err).__name__}: {_v11_err}")
