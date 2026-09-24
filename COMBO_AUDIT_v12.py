@@ -9,8 +9,9 @@ import pickle
 from datetime import datetime, date
 from scipy.stats import poisson
 from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 
-st.set_page_config(page_title="COMBO — Audit Model v5", page_icon="🔎", layout="centered")
+st.set_page_config(page_title="COMBO — V13 Operativa", page_icon="⚽", layout="centered")
 
 # =====================================================================
 # 🔎 AUDIT VERSION v5 — derivata dall'app originale, ma separata.
@@ -1808,9 +1809,9 @@ def mostra_sezione_v5_calibrazione_ev(dati, campionato, rho_val, ewma_span_val, 
             st.download_button('⬇️ Scarica dettaglio V5 CSV',data=out.to_csv(index=False).encode('utf-8'),file_name='v5_calibrazione_ev.csv',mime='text/csv',key='v5_dl')
 
 
-st.caption("Versione separata per testare calibrazione fuori campione senza modificare v1")
+st.caption("Versione operativa V13 — modello completo con PLATT solo O/U 2.5")
 
-st.info("Questa app è un laboratorio separato. v2 confronta il modello grezzo con una calibrazione isotonic allenata SOLO su dati temporali precedenti al test: non usa i calibratori salvati del progetto originale e non modifica v1.")
+st.info("V13 mantiene il motore operativo completo. PLATT viene applicato esclusivamente a O/U 2.5; 1X2 e gli altri mercati restano invariati.")
 
 # Parametri del modello fissati ai valori di default validati — non più
 # esposti nell'interfaccia: erano controlli tecnici che richiedevano di
@@ -2210,6 +2211,35 @@ else:
         mappa_partite.append(r.to_dict())
     is_coppa = True
 
+def v13_platt_ou_calibratore(dati_storici, rho, ewma_span, emivita):
+    """Fit PLATT O/U 2.5 using only historical matches available before the target match."""
+    hist = _v5_raw_history(dati_storici, rho, ewma_span, emivita)
+    if hist is None or hist.empty or len(hist) < 100:
+        return None, 0
+    p = hist['po'].astype(float).to_numpy()
+    y = (hist['esito_ou'] == 'Over').astype(int).to_numpy()
+    if len(set(y.tolist())) < 2:
+        return None, len(hist)
+    p = np.clip(p, 1e-6, 1.0 - 1e-6)
+    cal = LogisticRegression(C=1e6, solver='lbfgs', max_iter=1000)
+    cal.fit(p.reshape(-1, 1), y)
+    return cal, len(hist)
+
+
+def v13_applica_platt_ou(modello, dati_storici, rho, ewma_span, emivita):
+    if modello is None or dati_storici is None or dati_storici.empty:
+        return modello, None
+    cal, n = v13_platt_ou_calibratore(dati_storici, rho, ewma_span, emivita)
+    if cal is None:
+        return modello, None
+    p_raw_over = (100.0 - float(modello['prob_under'][2.5])) / 100.0
+    p_cal_over = float(cal.predict_proba(np.array([[np.clip(p_raw_over, 1e-6, 1.0 - 1e-6)]], dtype=float))[0, 1])
+    p_cal_over = float(np.clip(p_cal_over, 0.001, 0.999))
+    modello['prob_under'][2.5] = (1.0 - p_cal_over) * 100.0
+    return modello, {'n_osservazioni': n, 'p_raw_over': p_raw_over, 'p_cal_over': p_cal_over}
+
+
+
 if not opzioni_partite:
     st.warning("Nessuna partita disponibile al momento.")
 else:
@@ -2243,34 +2273,6 @@ else:
         calib_1x2_info = carica_calibratore(id_fd, "1x2")
         if calib_1x2_info:
             modello = applica_calibrazione_1x2(modello, calib_1x2_info["calibratore"])
-
-def v13_platt_ou_calibratore(dati_storici, rho, ewma_span, emivita):
-    """Fit PLATT O/U 2.5 using only historical matches available before the target match."""
-    hist = _v5_raw_history(dati_storici, rho, ewma_span, emivita)
-    if hist is None or hist.empty or len(hist) < V12_CAL_MIN_TRAIN:
-        return None, 0
-    p = hist['po'].astype(float).to_numpy()
-    y = (hist['esito_ou'] == 'Over').astype(int).to_numpy()
-    if len(set(y.tolist())) < 2:
-        return None, len(hist)
-    p = np.clip(p, 1e-6, 1.0 - 1e-6)
-    cal = LogisticRegression(C=1e6, solver='lbfgs', max_iter=1000)
-    cal.fit(p.reshape(-1, 1), y)
-    return cal, len(hist)
-
-
-def v13_applica_platt_ou(modello, dati_storici, rho, ewma_span, emivita):
-    if modello is None or dati_storici is None or dati_storici.empty:
-        return modello, None
-    cal, n = v13_platt_ou_calibratore(dati_storici, rho, ewma_span, emivita)
-    if cal is None:
-        return modello, None
-    p_raw_over = (100.0 - float(modello['prob_under'][2.5])) / 100.0
-    p_cal_over = float(cal.predict_proba(np.array([[np.clip(p_raw_over, 1e-6, 1.0 - 1e-6)]], dtype=float))[0, 1])
-    p_cal_over = float(np.clip(p_cal_over, 0.001, 0.999))
-    modello['prob_under'][2.5] = (1.0 - p_cal_over) * 100.0
-    return modello, {'n_osservazioni': n, 'p_raw_over': p_raw_over, 'p_cal_over': p_cal_over}
-
 
     calib_ou_v13_info = None
     if modello is not None and not is_coppa and usa_platt_ou_v13:
