@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -2720,3 +2721,9 @@ try:
     mostra_v8_validation()
 except Exception as _v8_err:
     st.error(f'V8 non disponibile: {type(_v8_err).__name__}: {_v8_err}')
+
+# V9 — render della sezione nell'app
+try:
+    mostra_v9_validation()
+except Exception as _v9_err:
+    st.error(f"V9 non disponibile: {type(_v9_err).__name__}: {_v9_err}")
