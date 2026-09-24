@@ -3098,10 +3098,10 @@ def mostra_v11_validation():
         except Exception as e:
             st.error(f'Errore V11: {type(e).__name__}: {e}')
 
-try:
-    mostra_v11_validation()
-except Exception as _v11_err:
-    st.error(f"V11 non disponibile: {type(_v11_err).__name__}: {_v11_err}")
+# V12.1 CPU optimization: keep V11 functions intact, but do not execute the
+# V11 validation automatically. Running both V11 and V12 on every Streamlit
+# rerun unnecessarily doubles the heavy historical/OOS computation.
+# The original V11 source remains untouched in its own file.
 
 
 # =====================================================================
@@ -3235,6 +3235,7 @@ def _v12_apply_1x2(rawp, models):
     return {s: cp[s]/tot for s in ['1','X','2']}
 
 
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=20)
 def _v12_build_paired(dati_completi, rho, ewma_span, emivita,
                       soglia_ev=0.10, warmup=100):
     """Costruisce un dataset OOS paired per RAW + 4 calibratori."""
@@ -3443,6 +3444,7 @@ def _v12_band_table(df, merc, common_only=False):
     return pd.DataFrame(out)
 
 
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=10)
 def _v12_build_all(warmup=100):
     per_metriche = []
     per_bands = []
@@ -3486,9 +3488,9 @@ def _v12_build_all(warmup=100):
 
 def mostra_v12_validation():
     st.divider()
-    st.markdown('## 🧬 V12 — CONFRONTO 5 METODI DI CALIBRAZIONE OOS')
+    st.markdown('## 🧬 V12.1 — CONFRONTO 5 METODI DI CALIBRAZIONE OOS · CPU OPTIMIZED')
     st.caption(
-        'RAW vs Isotonic vs Platt vs Beta vs Shrink50. '
+        'RAW vs Isotonic vs Platt vs Beta vs Shrink50. Cache attiva e V11 non viene eseguito automaticamente. '
         'Tutti i calibratori sono walk-forward: per ogni partita usano solo il passato. '
         '1X2 e O/U 2.5 sono valutati separatamente.'
     )
@@ -3508,7 +3510,7 @@ def mostra_v12_validation():
 
     if st.button('🧬 ESEGUI V12 — CONFRONTO 5 LEGHE', key='v12_run'):
         try:
-            with st.spinner('V12 in esecuzione: 5 metodi × 5 leghe...'):
+            with st.spinner('V12.1 in esecuzione: 5 metodi × 5 leghe... primo run può essere pesante; i successivi usano cache.'):
                 metrics, bands, errors = _v12_build_all(int(wu))
 
             if not metrics.empty:
