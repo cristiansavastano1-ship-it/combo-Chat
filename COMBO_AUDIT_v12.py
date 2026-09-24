@@ -1,4 +1,644 @@
 
+    
+          
+  import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+import io
+import time
+import os
+import pickle
+from datetime import datetime, date
+from scipy.stats import poisson
+from sklearn.isotonic import IsotonicRegression
+
+st.set_page_config(page_title="COMBO — Audit Model v5", page_icon="🔎", layout="centered")
+
+# =====================================================================
+# 🔎 AUDIT VERSION v5 — derivata dall'app originale, ma separata.
+# NON usare questa versione per sostituire l'app originale: serve solo a
+# misurare il modello in modo più rigoroso prima di decidere modifiche.
+# Principi dell'audit:
+#   1) nessuna calibrazione post-hoc globale nel backtest OOS;
+#   2) griglia risultati più ampia (0..12);
+#   3) Brier score + log loss oltre alla semplice accuratezza;
+#   4) curve di calibrazione per fasce di probabilità;
+#   5) confronto esplicito modello/mercato, senza dichiarare vincitori.
+# =====================================================================
+AUDIT_SCORE_MAX = 12
+EPS_PROB = 1e-9
+V4_MAX_BUCKETS = 8
+
+CAMPIONATI_DOMESTICI = {
+    "Italia - Serie A": {"id_fd": "I1"},
+    "Inghilterra - Premier League": {"id_fd": "E0"},
+    "Spagna - La Liga": {"id_fd": "SP1"},
+    "Germania - Bundesliga": {"id_fd": "D1"},
+    "Francia - Ligue 1": {"id_fd": "F1"},
+}
+
+CAMPIONATI_COPPE = {
+    "🌍 UEFA Champions League": {"code": "CL", "gratis_confermato": True},
+    "🌍 UEFA Europa League": {"code": "EL", "gratis_confermato": False},
+    "🌍 UEFA Conference League": {"code": "UECL", "gratis_confermato": False},
+}
+
+HEADERS_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
+K_SHRINKAGE = 10  # stesso principio già validato nell'App Risultati Fissi
+
+
+# =====================================================================
+# 🔧 FIX #4 — MATCHING SQUADRE "MORBIDO"
+# Prima: confronto testuale esatto. Con le coppe europee (nomi da
+# football-data.org, es. "Manchester United FC") contro i nomi domestici
+# (es. "Man United") il match esatto falliva spesso in silenzio, facendo
+# scattare il generatore di dati finti (ora rimosso, vedi FIX #1).
+# =====================================================================
+def normalizza_nome_squadra(nome):
+    nome = str(nome)
+    for suffisso in [" FC", " CF", " AFC", " AC", " SC", " CFC"]:
+        nome = nome.replace(suffisso, "")
+    return nome.strip().lower()
+
+
+def nomi_corrispondono(a, b):
+    na, nb = normalizza_nome_squadra(a), normalizza_nome_squadra(b)
+    return na == nb or na in nb or nb in na
+
+
+def codici_stagione(oggi=None):
+    oggi = oggi or date.today()
+    anno_inizio_corrente = oggi.year if oggi.month >= 7 else oggi.year - 1
+    anno_inizio_precedente = anno_inizio_corrente - 1
+    fmt = lambda a: f"{a % 100:02d}{(a + 1) % 100:02d}"
+    return fmt(anno_inizio_corrente), fmt(anno_inizio_precedente)
+
+
+def tau_dixon_coles(gc, gt, lc, lt, rho):
+    if gc == 0 and gt == 0: return 1 - (lc * lt * rho)
+    elif gc == 0 and gt == 1: return 1 + (lc * rho)
+    elif gc == 1 and gt == 0: return 1 + (lt * rho)
+    elif gc == 1 and gt == 1: return 1 - rho
+    return 1.0
+
+
+def media_ewma(serie, span):
+    serie = serie.dropna()
+    if len(serie) == 0: return None
+    return serie.ewm(span=span, min_periods=1).mean().iloc[-1]
+
+
+def media_pesata_decadimento(df, colonna, data_riferimento, emivita):
+    if colonna not in df.columns: return None
+    sub = df[[colonna, 'Date_parsed']].dropna()
+    if len(sub) == 0: return None
+    giorni = (data_riferimento - sub['Date_parsed']).dt.days.clip(lower=0)
+    pesi = 0.5 ** (giorni / emivita)
+    tot = pesi.sum()
+    return sub[colonna].mean() if tot <= 0 else (sub[colonna] * pesi).sum() / tot
+
+
+# =====================================================================
+# 🔧 Download robusto: header da browser + retry + fallback www/no-www
+# (stessa correzione già validata nell'App Risultati Fissi, dopo il
+# disservizio di football-data.co.uk causato dal blocco geografico su
+# "www" per il traffico non-UK)
+# =====================================================================
+def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
+    """FIX #11 — BOM (Byte Order Mark): fixtures.csv inizia con un carattere
+    invisibile Unicode che, se non gestito, si attacca al nome della prima
+    colonna ("Div" diventa "\\ufeffDiv"), facendo fallire in silenzio ogni
+    controllo tipo "if 'Div' in colonne" — nessuna fixture futura veniva mai
+    trovata, su nessun campionato, per questo motivo esatto. 'utf-8-sig' lo
+    rimuove in fase di decodifica; non fa danno se il file non ha il BOM."""
+    varianti_url = [url]
+    if "://www." in url:
+        varianti_url.append(url.replace("://www.", "://"))
+    elif "://" in url:
+        varianti_url.append(url.replace("://", "://www."))
+
+    ultimo_errore = None
+    for tentativo in range(tentativi):
+        for url_prova in varianti_url:
+            try:
+                resp = requests.get(url_prova, headers=HEADERS_BROWSER, timeout=15)
+                resp.raise_for_status()
+                testo = resp.content.decode('utf-8-sig', errors='replace')
+                df = pd.read_csv(io.StringIO(testo))
+                df.columns = [str(c).replace('\ufeff', '').strip() for c in df.columns]  # rete di sicurezza extra
+                return df, None
+            except Exception as e:
+                ultimo_errore = str(e)
+        if tentativo < tentativi - 1:
+            time.sleep(attesa_secondi)
+    return None, ultimo_errore
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def carica_dati_campionato(id_fd):
+    """FIX B — aggiunto il tag 'Stagione' (precedente/corrente), necessario
+    per poter validare il value bet SOLO sui risultati reali più recenti,
+    non su quelli già usati per calibrare le medie di lega."""
+    codice_corrente, codice_precedente = codici_stagione()
+    frames = []
+    for codice, label in [(codice_precedente, 'precedente'), (codice_corrente, 'corrente')]:
+        url = f"https://football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
+        df, _ = scarica_csv_robusto(url)
+        if df is not None:
+            df.columns = df.columns.str.strip()
+            df['Stagione'] = label
+            frames.append(df)
+    if frames:
+        dati = pd.concat(frames, ignore_index=True, sort=False)
+        dati['Date_parsed'] = pd.to_datetime(dati['Date'], errors='coerce', dayfirst=True)
+        return dati.dropna(subset=['Date_parsed']).sort_values('Date_parsed').reset_index(drop=True)
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def carica_tutti_i_campionati():
+    tutti_dati = []
+    for c_info in CAMPIONATI_DOMESTICI.values():
+        df = carica_dati_campionato(c_info["id_fd"])
+        if df is not None:
+            tutti_dati.append(df)
+    if tutti_dati:
+        return pd.concat(tutti_dati, ignore_index=True, sort=False)
+    return pd.DataFrame()
+
+
+def estrai_partite_squadra_intelligente(squadra, df_coppa, df_globale):
+    """Matching morbido (FIX #4): prima prova nel dataset della competizione
+    stessa, poi nel dataset globale domestico come fallback."""
+    if df_coppa is not None and not df_coppa.empty:
+        maschera = df_coppa['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra)) | \
+                   df_coppa['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra))
+        f_coppa = df_coppa[maschera]
+        if len(f_coppa) > 0:
+            return f_coppa
+
+    if df_globale is not None and not df_globale.empty:
+        maschera = df_globale['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra)) | \
+                   df_globale['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra))
+        f_glob = df_globale[maschera]
+        if len(f_glob) > 0:
+            return f_glob
+
+    return pd.DataFrame()
+
+
+# =====================================================================
+# 🔧 FIX CRITICO #12 — ATTRIBUZIONE CORRETTA DI GOL/TIRI/CORNER
+# BUG PRECEDENTE: le partite di una squadra venivano raccolte sia in casa
+# sia in trasferta, ma poi il codice leggeva sempre la colonna "di casa"
+# (FTHG) come "gol fatti". Per le partite giocate in TRASFERTA, FTHG sono
+# i gol dell'AVVERSARIO — quindi circa metà dei dati di attacco erano in
+# realtà dati di difesa e viceversa. Effetto: una squadra che segna 3 e
+# subisce 0 risultava 1.5/1.5, cioè perfettamente nella media — il modello
+# perdeva quasi del tutto la capacità di distinguere squadre forti e deboli,
+# e finiva sotto la semplice baseline "vince sempre la squadra di casa".
+# Qui i valori vengono attribuiti guardando, partita per partita, se la
+# squadra giocava in casa o fuori.
+# =====================================================================
+def serie_squadra(df, squadra, tipo):
+    """tipo: 'gol_fatti', 'gol_subiti', 'tiri_fatti', 'corner_fatti'.
+    Ritorna una Series con i valori attribuiti correttamente alla squadra,
+    indipendentemente dal fatto che giocasse in casa o in trasferta."""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+
+    colonne_casa = {'gol_fatti': 'FTHG', 'gol_subiti': 'FTAG', 'tiri_fatti': 'HST', 'corner_fatti': 'HC'}
+    colonne_trasf = {'gol_fatti': 'FTAG', 'gol_subiti': 'FTHG', 'tiri_fatti': 'AST', 'corner_fatti': 'AC'}
+    col_c, col_t = colonne_casa[tipo], colonne_trasf[tipo]
+
+    if col_c not in df.columns or col_t not in df.columns:
+        return pd.Series(dtype=float)
+
+    gioca_in_casa = df['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra))
+    valori = df[col_c].where(gioca_in_casa, df[col_t])
+    return valori.dropna()
+
+
+def estrai_scontri_diretti(squadra_casa, squadra_trasferta, df_coppa, df_globale):
+    frames_tot = []
+    if df_coppa is not None and not df_coppa.empty:
+        frames_tot.append(df_coppa)
+    if df_globale is not None and not df_globale.empty:
+        frames_tot.append(df_globale)
+    if not frames_tot:
+        return pd.DataFrame()
+
+    df_uni = pd.concat(frames_tot, ignore_index=True, sort=False)
+    if 'FTHG' not in df_uni.columns or 'FTAG' not in df_uni.columns:
+        return pd.DataFrame()
+
+    maschera_diretto = df_uni['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra_casa)) & \
+                        df_uni['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra_trasferta))
+    maschera_inverso = df_uni['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra_trasferta)) & \
+                        df_uni['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra_casa))
+
+    h2h = df_uni[(df_uni['FTHG'].notna()) & (df_uni['FTAG'].notna()) & (maschera_diretto | maschera_inverso)].copy()
+
+    if 'Date_parsed' in h2h.columns:
+        h2h = h2h.sort_values('Date_parsed', ascending=False)
+    return h2h.head(5)
+
+
+# =====================================================================
+# 🔧 FIX #1 — VIA IL GENERATORE DI DATI FINTI, DENTRO VERO SHRINKAGE
+# Prima: se una squadra non aveva partite trovate, il codice INVENTAVA un
+# profilo attacco/difesa calcolato dalla somma dei codici ASCII del nome
+# squadra — un numero pseudo-casuale spacciato per statistica.
+# Ora: quando i dati specifici sono pochi o assenti, la stima converge
+# gradualmente verso la media di lega (shrinkage, stesso principio già
+# validato nell'App Risultati Fissi) invece di inventare un profilo finto.
+# Il chiamante riceve n_casa/n_trasf per mostrare un avviso onesto quando
+# il campione specifico è scarso.
+# =====================================================================
+def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho, ewma_span,
+                              emivita, df_globale, data_riferimento=None):
+    giocate_validi = giocate_coppa.dropna(subset=['FTHG', 'FTAG']) if giocate_coppa is not None else pd.DataFrame()
+    if data_riferimento is None:
+        data_riferimento = giocate_validi['Date_parsed'].max() if not giocate_validi.empty else pd.Timestamp(date.today())
+
+    # Baseline di lega/competizione. Se il campione della competizione è
+    # troppo piccolo (tipico per le coppe a inizio stagione), lo arricchiamo
+    # con il dataset domestico globale per una stima più stabile.
+    base_per_media = giocate_validi
+    if len(giocate_validi) < 20 and df_globale is not None and not df_globale.empty:
+        base_per_media = pd.concat([giocate_validi, df_globale.dropna(subset=['FTHG', 'FTAG'])], ignore_index=True, sort=False)
+
+    m_gol_casa = media_pesata_decadimento(base_per_media, 'FTHG', data_riferimento, emivita) or 1.65
+    m_gol_trasf = media_pesata_decadimento(base_per_media, 'FTAG', data_riferimento, emivita) or 1.25
+    m_tiri_casa_lega = media_pesata_decadimento(base_per_media, 'HST', data_riferimento, emivita) or 4.8
+    m_tiri_trasf_lega = media_pesata_decadimento(base_per_media, 'AST', data_riferimento, emivita) or 4.1
+    m_corner_casa_lega = media_pesata_decadimento(base_per_media, 'HC', data_riferimento, emivita) or 5.4
+    m_corner_trasf_lega = media_pesata_decadimento(base_per_media, 'AC', data_riferimento, emivita) or 4.6
+
+    forma_casa = estrai_partite_squadra_intelligente(squadra_casa, giocate_coppa, df_globale)
+    forma_trasf = estrai_partite_squadra_intelligente(squadra_trasferta, giocate_coppa, df_globale)
+    n_casa, n_trasf = len(forma_casa), len(forma_trasf)
+
+    # FIX CRITICO #12 — i valori vengono attribuiti alla squadra giusta
+    # guardando, partita per partita, se giocava in casa o in trasferta.
+    gf_casa_rec = media_ewma(serie_squadra(forma_casa, squadra_casa, 'gol_fatti'), ewma_span) if n_casa else None
+    gs_casa_rec = media_ewma(serie_squadra(forma_casa, squadra_casa, 'gol_subiti'), ewma_span) if n_casa else None
+    gf_trasf_rec = media_ewma(serie_squadra(forma_trasf, squadra_trasferta, 'gol_fatti'), ewma_span) if n_trasf else None
+    gs_trasf_rec = media_ewma(serie_squadra(forma_trasf, squadra_trasferta, 'gol_subiti'), ewma_span) if n_trasf else None
+
+    tiri_casa = media_ewma(serie_squadra(forma_casa, squadra_casa, 'tiri_fatti'), ewma_span) if n_casa else None
+    corner_casa = media_ewma(serie_squadra(forma_casa, squadra_casa, 'corner_fatti'), ewma_span) if n_casa else None
+    tiri_trasf = media_ewma(serie_squadra(forma_trasf, squadra_trasferta, 'tiri_fatti'), ewma_span) if n_trasf else None
+    corner_trasf = media_ewma(serie_squadra(forma_trasf, squadra_trasferta, 'corner_fatti'), ewma_span) if n_trasf else None
+
+    # Shrinkage: peso -> 0 quando n_casa/n_trasf sono pochi o zero, quindi la
+    # stima converge verso il rapporto neutro 1.0 (= "come la media") invece
+    # di un profilo inventato. Peso -> 1 quando il campione è ampio, quindi ci
+    # si fida del dato specifico della squadra.
+    peso_casa = n_casa / (n_casa + K_SHRINKAGE)
+    peso_trasf = n_trasf / (n_trasf + K_SHRINKAGE)
+
+    # FIX CRITICO #13 — riferimento corretto per i rapporti attacco/difesa.
+    # I dati di una squadra mescolano partite in casa e in trasferta, quindi
+    # vanno confrontati con la media di lega COMPLESSIVA (casa+trasferta), non
+    # con quella specifica di casa o di trasferta. Prima si confrontava il dato
+    # misto della squadra di casa con la media "solo casa" (più alta) e quello
+    # della squadra ospite con la media "solo trasferta" (più bassa): risultato,
+    # le squadre di casa risultavano sistematicamente sottovalutate e le ospiti
+    # sopravvalutate — per questo il modello prevedeva più vittorie in trasferta
+    # che in casa, il contrario di come funziona davvero il calcio.
+    # Il vantaggio del fattore campo resta comunque applicato, più sotto, dal
+    # fatto che lambda_casa usa m_gol_casa e lambda_trasferta usa m_gol_trasf.
+    m_gol_complessiva = (m_gol_casa + m_gol_trasf) / 2.0
+
+    rapp_attacco_casa = (gf_casa_rec / max(0.1, m_gol_complessiva)) if gf_casa_rec is not None else 1.0
+    rapp_difesa_casa = (gs_casa_rec / max(0.1, m_gol_complessiva)) if gs_casa_rec is not None else 1.0
+    rapp_attacco_trasf = (gf_trasf_rec / max(0.1, m_gol_complessiva)) if gf_trasf_rec is not None else 1.0
+    rapp_difesa_trasf = (gs_trasf_rec / max(0.1, m_gol_complessiva)) if gs_trasf_rec is not None else 1.0
+
+    attacco_casa = peso_casa * rapp_attacco_casa + (1 - peso_casa) * 1.0
+    difesa_casa = peso_casa * rapp_difesa_casa + (1 - peso_casa) * 1.0
+    attacco_trasf = peso_trasf * rapp_attacco_trasf + (1 - peso_trasf) * 1.0
+    difesa_trasf = peso_trasf * rapp_difesa_trasf + (1 - peso_trasf) * 1.0
+
+    # Stessa logica del FIX #13 anche per tiri e angoli: i dati della squadra
+    # sono misti casa+trasferta, quindi il riferimento verso cui convergono
+    # (shrinkage) dev'essere la media complessiva, non quella specifica.
+    m_tiri_complessiva = (m_tiri_casa_lega + m_tiri_trasf_lega) / 2.0
+    m_corner_complessiva = (m_corner_casa_lega + m_corner_trasf_lega) / 2.0
+
+    tiri_casa_finale = peso_casa * tiri_casa + (1 - peso_casa) * m_tiri_complessiva if tiri_casa is not None else m_tiri_casa_lega
+    corner_casa_finale = peso_casa * corner_casa + (1 - peso_casa) * m_corner_complessiva if corner_casa is not None else m_corner_casa_lega
+    tiri_trasf_finale = peso_trasf * tiri_trasf + (1 - peso_trasf) * m_tiri_complessiva if tiri_trasf is not None else m_tiri_trasf_lega
+    corner_trasf_finale = peso_trasf * corner_trasf + (1 - peso_trasf) * m_corner_complessiva if corner_trasf is not None else m_corner_trasf_lega
+
+    lam_c = max(0.2, attacco_casa * difesa_trasf * m_gol_casa)
+    lam_t = max(0.2, attacco_trasf * difesa_casa * m_gol_trasf)
+
+    prob_1, prob_x, prob_2 = 0.0, 0.0, 0.0
+    prob_goal, prob_nogoal = 0.0, 0.0
+    limiti_under = [1.5, 2.5, 3.5]
+    prob_under = {l: 0.0 for l in limiti_under}
+    multigol_casa = {"0-1": 0.0, "0-2": 0.0, "1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
+    multigol_trasf = {"0-1": 0.0, "0-2": 0.0, "1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
+    combo_stats = {"1 + Goal": 0.0, "1 + Over 2.5": 0.0, "X + Under 2.5": 0.0, "2 + Goal": 0.0}
+    griglia_risultati = []  # FIX #5 — griglia completa per il motore combo libero
+
+    tot_p = 0.0
+    for gc in range(AUDIT_SCORE_MAX + 1):
+        for gt in range(AUDIT_SCORE_MAX + 1):
+            p = poisson.pmf(gc, lam_c) * poisson.pmf(gt, lam_t) * tau_dixon_coles(gc, gt, lam_c, lam_t, rho) * 100
+            tot_p += p
+            segno = 'X' if gc == gt else ('1' if gc > gt else '2')
+            griglia_risultati.append({"gc": gc, "gt": gt, "p": p, "segno": segno})
+
+            if segno == '1': prob_1 += p
+            elif segno == 'X': prob_x += p
+            else: prob_2 += p
+
+            if gc > 0 and gt > 0: prob_goal += p
+            else: prob_nogoal += p
+
+            for l in limiti_under:
+                if gc + gt < l: prob_under[l] += p
+
+            for mg_key, (mi_c, ma_c) in [("0-1", (0,1)), ("0-2", (0,2)), ("1-2", (1,2)), ("1-3", (1,3)), ("2-3", (2,3)), ("2-4", (2,4))]:
+                if mi_c <= gc <= ma_c: multigol_casa[mg_key] += p
+                if mi_c <= gt <= ma_c: multigol_trasf[mg_key] += p
+
+            if segno == '1' and gc > 0 and gt > 0: combo_stats["1 + Goal"] += p
+            if segno == '1' and (gc + gt) > 2.5: combo_stats["1 + Over 2.5"] += p
+            if segno == 'X' and (gc + gt) < 2.5: combo_stats["X + Under 2.5"] += p
+            if segno == '2' and gc > 0 and gt > 0: combo_stats["2 + Goal"] += p
+
+    if tot_p > 0:
+        f = 100.0 / tot_p
+        prob_1, prob_x, prob_2 = prob_1*f, prob_x*f, prob_2*f
+        prob_goal, prob_nogoal = prob_goal*f, prob_nogoal*f
+        prob_under = {l: v*f for l, v in prob_under.items()}
+        multigol_casa = {k: v*f for k, v in multigol_casa.items()}
+        multigol_trasf = {k: v*f for k, v in multigol_trasf.items()}
+        combo_stats = {k: v*f for k, v in combo_stats.items()}
+        for r in griglia_risultati:
+            r["p"] *= f
+
+    return {
+        "prob_1": prob_1, "prob_X": prob_x, "prob_2": prob_2,
+        "prob_goal": prob_goal, "prob_nogoal": prob_nogoal,
+        "prob_under": prob_under, "multigol_casa": multigol_casa, "multigol_trasf": multigol_trasf,
+        "combo": combo_stats, "griglia": griglia_risultati,
+        "angoli_stimati": f"{corner_casa_finale + corner_trasf_finale:.1f}",
+        "tiri_stimati": f"{tiri_casa_finale + tiri_trasf_finale:.1f}",
+        "n_casa": n_casa, "n_trasf": n_trasf,
+    }
+
+
+# =====================================================================
+# 🔧 FIX #5 — MOTORE COMBO LIBERO
+# Calcola la probabilità congiunta di qualunque combinazione di segno +
+# soglia gol (Over/Under) + Gol/No Gol, leggendo direttamente dalla griglia
+# di risultati già calcolata — corretto per costruzione (somma le celle
+# della griglia Poisson che soddisfano TUTTE le condizioni insieme, non
+# moltiplica probabilità come se fossero eventi indipendenti, cosa che
+# gol/segno NON sono).
+# =====================================================================
+def calcola_combo_libera(griglia, segno=None, soglia_gol=None, tipo_soglia=None, gol_nogol=None):
+    tot = 0.0
+    for r in griglia:
+        gc, gt, p = r["gc"], r["gt"], r["p"]
+        ok = True
+        if segno and r["segno"] != segno:
+            ok = False
+        if ok and soglia_gol is not None and tipo_soglia:
+            tot_g = gc + gt
+            if tipo_soglia == "Over" and not (tot_g > soglia_gol): ok = False
+            if tipo_soglia == "Under" and not (tot_g < soglia_gol): ok = False
+        if ok and gol_nogol:
+            entrambe_segnano = gc > 0 and gt > 0
+            if gol_nogol == "Goal" and not entrambe_segnano: ok = False
+            if gol_nogol == "NoGoal" and entrambe_segnano: ok = False
+        if ok:
+            tot += p
+    return tot
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def carica_fixture_future(id_fd):
+    df, _ = scarica_csv_robusto("https://football-data.co.uk/fixtures.csv")
+    if df is not None:
+        fx = df.copy()
+        fx.columns = fx.columns.str.strip()
+        if 'Div' in fx.columns:
+            fx = fx[fx['Div'] == id_fd].copy()
+            fx['Date_parsed'] = pd.to_datetime(fx['Date'], errors='coerce', dayfirst=True)
+            oggi = pd.Timestamp(date.today())
+            return fx[fx['Date_parsed'] >= oggi].sort_values('Date_parsed').reset_index(drop=True)
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def carica_dati_api_europee(codice_competizione, api_key):
+    headers = {"X-Auth-Token": api_key}
+    url_matches = f"https://api.football-data.org/v4/competitions/{codice_competizione}/matches"
+    try:
+        resp = requests.get(url_matches, headers=headers, timeout=15)
+        if resp.status_code == 403:
+            return "ERRORE_403"
+        resp.raise_for_status()
+        data = resp.json()
+        matches = data.get("matches", [])
+        rows = []
+        for m in matches:
+            status = m['status']
+            fthg, ftag = None, None
+            if status == 'FINISHED':
+                fthg = m['score']['fullTime']['home']
+                ftag = m['score']['fullTime']['away']
+            rows.append({
+                'Date': m['utcDate'][:10], 'HomeTeam': m['homeTeam']['name'], 'AwayTeam': m['awayTeam']['name'],
+                'FTHG': fthg, 'FTAG': ftag, 'Status': status,
+            })
+        df = pd.DataFrame(rows)
+        df['Date_parsed'] = pd.to_datetime(df['Date'], errors='coerce')
+        return df.sort_values('Date_parsed').reset_index(drop=True)
+    except Exception as e:
+        return str(e)
+
+
+# =====================================================================
+# 🔧 FIX #3 — VALUE BET CORRETTO (overround + media multi-bookmaker)
+# Prima: EV = probabilità_modello × quota_grezza di UN SOLO bookmaker
+# (Bet365), senza depurare la quota dal margine del bookmaker — lo stesso
+# bug dell'overround già corretto nell'App Risultati Fissi. Ora: media di
+# tutti i bookmaker disponibili nel file, quota "equa" depurata dal margine.
+# =====================================================================
+def classifica_colonne_quote(colonne):
+    apertura_h = [c for c in colonne if c.endswith('H') and not c.endswith('CH') and c not in ['FTHG', 'HTHG', 'PTHG']]
+    apertura_d = [c for c in colonne if c.endswith('D') and not c.endswith('CD') and c not in ['FTHG', 'FTAG', 'HTHG', 'HTAG']]
+    apertura_a = [c for c in colonne if c.endswith('A') and not c.endswith('CA') and c not in ['FTAG', 'HTAG', 'PTAG']]
+    return apertura_h, apertura_d, apertura_a
+
+
+def quote_mercato_normalizzate(riga, colonne_h, colonne_d, colonne_a):
+    vh = [riga[c] for c in colonne_h if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
+    vd = [riga[c] for c in colonne_d if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
+    va = [riga[c] for c in colonne_a if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
+    if not (vh and vd and va): return None
+    qh, qd, qa = sum(vh)/len(vh), sum(vd)/len(vd), sum(va)/len(va)
+    pih, pid, pia = 1/qh, 1/qd, 1/qa
+    over = pih + pid + pia
+    return {"q_casa_equa": over/pih, "q_x_equa": over/pid, "q_trasf_equa": over/pia,
+            "overround": over, "n_bookmakers": len(vh)}
+
+
+# =====================================================================
+# 🔧 PUNTO C — STIMA APPROSSIMATA DELLA QUOTA COMBO
+# Nessun bookmaker pubblica una quota per combo libere tipo "1 + Over 2.5 +
+# Goal" nei file gratuiti — solo per i mercati singoli (1X2, Over/Under
+# 2.5). Qui stimiamo una quota "come se" i mercati fossero indipendenti
+# (moltiplicando le quote eque dei singoli mercati disponibili) — è
+# un'APPROSSIMAZIONE, non un dato di mercato reale: segno e gol totali
+# nella stessa partita sono in una certa misura correlati, quindi il numero
+# vero si discosterà da questo. Il componente Gol/No Gol non ha una quota
+# disponibile nel file, quindi non entra nella stima — etichettato chiaramente.
+# =====================================================================
+def classifica_colonne_over_under(colonne, soglia="2.5"):
+    over_cols = [c for c in colonne if c.endswith(f'>{soglia}')]
+    under_cols = [c for c in colonne if c.endswith(f'<{soglia}')]
+    return over_cols, under_cols
+
+
+def quote_over_under_normalizzate(riga, colonne_over, colonne_under):
+    v_over = [riga[c] for c in colonne_over if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
+    v_under = [riga[c] for c in colonne_under if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
+    if not (v_over and v_under): return None
+    q_over, q_under = sum(v_over)/len(v_over), sum(v_under)/len(v_under)
+    pi_over, pi_under = 1/q_over, 1/q_under
+    overround = pi_over + pi_under
+    return {"q_over_equa": overround/pi_over, "q_under_equa": overround/pi_under, "n_bookmakers": len(v_over)}
+
+
+def stima_quota_combo_approssimata(segno, soglia_gol, tipo_soglia, quote_1x2, quote_ou_25):
+    """Ritorna (quota_stimata_o_None, lista_componenti_non_prezzate)."""
+    fattori = []
+    non_prezzate = []
+    if segno:
+        if quote_1x2:
+            mappa = {"1": quote_1x2["q_casa_equa"], "X": quote_1x2["q_x_equa"], "2": quote_1x2["q_trasf_equa"]}
+            fattori.append(mappa[segno])
+        else:
+            non_prezzate.append(f"segno {segno}")
+    if soglia_gol is not None and tipo_soglia:
+        if soglia_gol == 2.5 and quote_ou_25:
+            fattori.append(quote_ou_25["q_over_equa"] if tipo_soglia == "Over" else quote_ou_25["q_under_equa"])
+        else:
+            non_prezzate.append(f"{tipo_soglia} {soglia_gol}")
+    quota = None
+    if fattori:
+        quota = 1.0
+        for f in fattori:
+            quota *= f
+    return quota, non_prezzate
+
+
+# =====================================================================
+# 🔧 BACKTEST SENZA FILTRO — accuratezza pura del modello
+# Diverso dal value bet (che filtra per EV/soglia): qui valutiamo semplicemente
+# "quante volte la previsione principale del modello (il segno più probabile)
+# ha indovinato il risultato vero?", su TUTTE le partite disponibili, senza
+# nessun filtro — la metrica più diretta e senza sorprese sulla bontà di base
+# del modello, utile per mandarmi i numeri e controllarli insieme.
+# =====================================================================
+def esegui_backtest_senza_filtro(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd=None,
+                                  usa_calibrazione=False, richiedi_accordo_mercato=False):
+    """richiedi_accordo_mercato (IDEA #1): valuta la previsione principale SOLO
+    sulle partite dove il modello è d'accordo col favorito del mercato (stesso
+    segno con la quota più bassa) — un filtro di fiducia, non una correzione
+    della stima come il blending già scartato. Riduce il campione ma, se
+    l'idea è valida, dovrebbe alzare l'accuratezza sul sottoinsieme rimasto."""
+    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
+    ha_stagione = 'Stagione' in tutte.columns
+
+    if usa_oos and ha_stagione:
+        indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
+    else:
+        indici = list(range(15, len(tutte)))
+
+    if not indici:
+        return None
+
+    calib_info = carica_calibratore(id_fd, "1x2") if (usa_calibrazione and id_fd) else None
+    calibratore = calib_info["calibratore"] if calib_info else None
+    colonne_h, colonne_d, colonne_a = classifica_colonne_quote(tutte.columns)
+
+    n_partite, n_corrette = 0, 0
+    n_scartate_disaccordo, n_scartate_no_quote = 0, 0
+    per_segno = {"1": {"previste": 0, "corrette": 0}, "X": {"previste": 0, "corrette": 0}, "2": {"previste": 0, "corrette": 0}}
+
+    for i in indici:
+        partita = tutte.iloc[i]
+        prec = tutte.iloc[:i]
+        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
+                                      emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
+        if m is None: continue
+        if calibratore is not None:
+            m = applica_calibrazione_1x2(m, calibratore)
+
+        probabilita = {"1": m['prob_1'], "X": m['prob_X'], "2": m['prob_2']}
+        previsione_principale = max(probabilita, key=probabilita.get)
+
+        if richiedi_accordo_mercato:
+            quote = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a)
+            if quote is None:
+                n_scartate_no_quote += 1
+                continue
+            quote_per_segno = {"1": quote["q_casa_equa"], "X": quote["q_x_equa"], "2": quote["q_trasf_equa"]}
+            favorito_mercato = min(quote_per_segno, key=quote_per_segno.get)  # quota più bassa = favorito
+            if previsione_principale != favorito_mercato:
+                n_scartate_disaccordo += 1
+                continue
+
+        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
+        n_partite += 1
+        per_segno[previsione_principale]["previste"] += 1
+        if previsione_principale == esito:
+            n_corrette += 1
+            per_segno[previsione_principale]["corrette"] += 1
+
+    return {"n_partite": n_partite, "n_corrette": n_corrette, "per_segno": per_segno,
+            "n_scartate_disaccordo": n_scartate_disaccordo, "n_scartate_no_quote": n_scartate_no_quote}
+
+
+# =====================================================================
+# 🔧 PUNTO B — CALIBRAZIONE POST-HOC (1X2 + le 12 combo automatiche)
+# Stessa tecnica isotonic regression già validata nell'App Risultati Fissi.
+# Un correttore per 1X2 (corregge "Esito Finale" e il Value Bet), più uno
+# separato per ciascuna delle 12 combinazioni automatiche (segno × Gol/No
+# Gol × Over/Under 2.5) — la verità per allenarle è già nei risultati reali
+# che scarichiamo (nessuna fonte dati nuova serve). Le combo libere con
+# soglie diverse da 2.5 restano SENZA calibrazione: te lo segnaliamo,
+# non lo nascondiamo.
+# =====================================================================
+LE_12_COMBO = [(s, g, t) for s in ["1", "X", "2"] for g in ["Goal", "NoGoal"] for t in ["Over", "Under"]]
+
+
+def _path_calibratore(id_fd, chiave="1x2"):
+    return f"calibratore_combo_{chiave}_{id_fd}.pkl"
+
+
+def _salva_calibratore(id_fd, chiave, calibratore, n_oss):
+    try:
+        with open(_path_calibratore(id_fd, chiave), "wb") as f:
+            pickle.dump({"calibratore": calibratore, "n_osservazioni": n_oss,
+                         "timestamp": datetime.now().isoformat(timespec="minutes")}, f)
+    except Exception:
+        pass
+
+
+def carica_calibratore(id_fd, chiave="1x2"):
     path = _path_calibratore(id_fd, chiave)
     if os.path.exists(path):
         try:
@@ -7,6 +647,41 @@
         except Exception:
             return None
     return None
+
+
+def _allena_isotonic(osservazioni):
+    if len(osservazioni) < 100:
+        return None
+    x = np.array([p for p, _ in osservazioni])
+    y = np.array([1.0 if av else 0.0 for _, av in osservazioni])
+    calibratore = IsotonicRegression(out_of_bounds='clip', y_min=0.001, y_max=0.999)
+    calibratore.fit(x, y)
+    return calibratore
+
+
+def applica_calibrazione_1x2(modello, calibratore):
+    if calibratore is None or modello is None:
+        return modello
+    p1 = float(calibratore.predict([modello['prob_1']/100])[0])
+    px = float(calibratore.predict([modello['prob_X']/100])[0])
+    p2 = float(calibratore.predict([modello['prob_2']/100])[0])
+    tot = p1 + px + p2
+    if tot <= 0:
+        return modello
+    m = dict(modello)
+    m['prob_1'], m['prob_X'], m['prob_2'] = p1/tot*100, px/tot*100, p2/tot*100
+    return m
+
+
+def allena_tutte_le_calibrazioni(dati_completi, rho, ewma_span, emivita, id_fd):
+    """Un'unica passata sui dati storici: per ogni partita calcola il modello
+    UNA volta, poi costruisce le osservazioni (predetto, avverato) per 1X2 e
+    per tutte e 12 le combo insieme — efficiente, una sola passata."""
+    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
+    oss_1x2 = []
+    oss_combo = {c: [] for c in LE_12_COMBO}
+
+    for i in range(15, len(tutte)):
         partita = tutte.iloc[i]
         prec = tutte.iloc[:i]
         m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
@@ -1572,6 +2247,34 @@ else:
         if calib_1x2_info:
             modello = applica_calibrazione_1x2(modello, calib_1x2_info["calibratore"])
 
+def v13_platt_ou_calibratore(dati_storici, rho, ewma_span, emivita):
+    """Fit PLATT O/U 2.5 using only historical matches available before the target match."""
+    hist = _v5_raw_history(dati_storici, rho, ewma_span, emivita)
+    if hist is None or hist.empty or len(hist) < V12_CAL_MIN_TRAIN:
+        return None, 0
+    p = hist['po'].astype(float).to_numpy()
+    y = (hist['esito_ou'] == 'Over').astype(int).to_numpy()
+    if len(set(y.tolist())) < 2:
+        return None, len(hist)
+    p = np.clip(p, 1e-6, 1.0 - 1e-6)
+    cal = LogisticRegression(C=1e6, solver='lbfgs', max_iter=1000)
+    cal.fit(p.reshape(-1, 1), y)
+    return cal, len(hist)
+
+
+def v13_applica_platt_ou(modello, dati_storici, rho, ewma_span, emivita):
+    if modello is None or dati_storici is None or dati_storici.empty:
+        return modello, None
+    cal, n = v13_platt_ou_calibratore(dati_storici, rho, ewma_span, emivita)
+    if cal is None:
+        return modello, None
+    p_raw_over = (100.0 - float(modello['prob_under'][2.5])) / 100.0
+    p_cal_over = float(cal.predict_proba(np.array([[np.clip(p_raw_over, 1e-6, 1.0 - 1e-6)]], dtype=float))[0, 1])
+    p_cal_over = float(np.clip(p_cal_over, 0.001, 0.999))
+    modello['prob_under'][2.5] = (1.0 - p_cal_over) * 100.0
+    return modello, {'n_osservazioni': n, 'p_raw_over': p_raw_over, 'p_cal_over': p_cal_over}
+
+
     calib_ou_v13_info = None
     if modello is not None and not is_coppa and usa_platt_ou_v13:
         modello, calib_ou_v13_info = v13_applica_platt_ou(
@@ -2487,30 +3190,6 @@ V12_METHODS = ['RAW', 'ISOTONIC', 'PLATT', 'BETA', 'SHRINK50']
 # Il motore V12 e il mercato 1X2 restano invariati.
 # =====================================================================
 @st.cache_data(ttl=3600, max_entries=10)
-def v13_platt_ou_calibratore(dati_storici, rho, ewma_span, emivita):
-    if dati_storici is None or dati_storici.empty:
-        return None, 0
-    hist = _v5_raw_history(dati_storici, rho, ewma_span, emivita)
-    if hist is None or hist.empty or len(hist) < V12_CAL_MIN_TRAIN:
-        return None, 0
-    p = hist['po'].astype(float).tolist()
-    y = (hist['esito_ou'] == 'Over').astype(int).tolist()
-    cal = _v12_fit_platt(p, y)
-    return cal, len(hist)
-
-
-def v13_applica_platt_ou(modello, dati_storici, rho, ewma_span, emivita):
-    if modello is None or dati_storici is None or dati_storici.empty:
-        return modello, None
-    cal, n = v13_platt_ou_calibratore(dati_storici, rho, ewma_span, emivita)
-    if cal is None:
-        return modello, None
-    p_raw_over = (100.0 - float(modello['prob_under'][2.5])) / 100.0
-    p_cal_over = _v12_apply_binary(cal, p_raw_over)
-    p_cal_over = float(np.clip(p_cal_over, 0.001, 0.999))
-    modello['prob_under'][2.5] = (1.0 - p_cal_over) * 100.0
-    return modello, {'n_osservazioni': n, 'p_raw_over': p_raw_over, 'p_cal_over': p_cal_over}
-
 def _v12_clip(p):
     return float(np.clip(p, 1e-6, 1.0 - 1e-6))
 
