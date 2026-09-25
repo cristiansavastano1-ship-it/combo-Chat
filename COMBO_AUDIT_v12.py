@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -2336,6 +2337,10 @@ else:
                     'platt_over': p_new * 100.0,
                     'raw_under': (1.0 - p_raw) * 100.0,
                     'platt_under': (1.0 - p_new) * 100.0,
+                    'train_over_rate': float(train_platt['y_over'].mean()) * 100.0 if len(train_platt) else float('nan'),
+                    'train_raw_mean': float(train_platt['p_raw'].mean()) * 100.0 if len(train_platt) else float('nan'),
+                    'coef': float(platt_v13.coef_[0][0]),
+                    'intercept': float(platt_v13.intercept_[0]),
                 }
         except Exception as _platt_err:
             platt_v13_info = {'errore': f'{type(_platt_err).__name__}: {_platt_err}'}
@@ -2353,6 +2358,13 @@ else:
                 f"Over 2.5: {platt_v13_info['raw_over']:.1f}% → {platt_v13_info['platt_over']:.1f}% · "
                 f"Under 2.5: {platt_v13_info['raw_under']:.1f}% → {platt_v13_info['platt_under']:.1f}%."
             )
+            with st.expander("🔎 Dettagli PLATT della partita corrente", expanded=False):
+                st.write(f"**Training utilizzato:** {platt_v13_info['n_train']} partite precedenti")
+                st.write(f"**Over reali nel training:** {platt_v13_info['train_over_rate']:.1f}%")
+                st.write(f"**Probabilità RAW media nel training:** {platt_v13_info['train_raw_mean']:.1f}%")
+                st.write(f"**Coefficiente PLATT:** {platt_v13_info['coef']:.6f}")
+                st.write(f"**Intercetta PLATT:** {platt_v13_info['intercept']:.6f}")
+                st.caption("Questi parametri descrivono esclusivamente la correzione O/U 2.5 della partita selezionata; 1X2, Goal/No Goal, Multigol e Combo restano invariati.")
         elif platt_v13_info and 'errore' in platt_v13_info:
             st.warning(f"⚠️ PLATT O/U 2.5 non applicato: {platt_v13_info['errore']}")
 
