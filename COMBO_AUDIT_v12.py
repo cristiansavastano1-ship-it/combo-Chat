@@ -11,7 +11,7 @@ from scipy.stats import poisson
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 
-st.set_page_config(page_title="COMBO — Audit Model v5", page_icon="🔎", layout="centered")
+st.set_page_config(page_title="COMBO — V13 Operativa", page_icon="⚽", layout="centered")
 
 # =====================================================================
 # 🔎 AUDIT VERSION v5 — derivata dall'app originale, ma separata.
@@ -256,187 +256,6 @@ def estrai_scontri_diretti(squadra_casa, squadra_trasferta, df_coppa, df_globale
 # Il chiamante riceve n_casa/n_trasf per mostrare un avviso onesto quando
 # il campione specifico è scarso.
 # =====================================================================
-# =====================================================================
-# V13 — PLATT SOLO O/U 2.5
-# Basata direttamente sulla V11 funzionante. Nessuna modifica al
-# motore 1X2, Goal/No Goal, Multigol o Combo Rapide.
-# =====================================================================
-@st.cache_data(show_spinner=False, ttl=3600)
-def _v13_fit_platt_ou(dati_precedenti, rho, ewma_span, emivita, warmup=20):
-    """PLATT O/U 2.5 temporale, alleggerita per non bloccare l'app.
-    Usa solo partite già concluse e non guarda mai il risultato della partita
-    selezionata. Per evitare un O(n^2) che rende Streamlit inutilizzabile,
-    usa gli ultimi 120 match storici e, per ogni previsione, al massimo gli
-    80 match precedenti come contesto del modello.
-    """
-    try:
-        tutte = dati_precedenti[dati_precedenti['FTHG'].notna() & dati_precedenti['FTAG'].notna()].copy()
-        if 'Date_parsed' in tutte.columns:
-            tutte = tutte.sort_values('Date_parsed')
-        tutte = tutte.reset_index(drop=True)
-        if len(tutte) < 60:
-            return None
-
-        # Campione temporale recente: evita di ricalcolare centinaia di modelli.
-        # Costruiamo fino a 120 osservazioni recenti per contenere il costo,
-        # mantenendo poi fino a 100 osservazioni effettive per il fit.
-        start = max(15, len(tutte) - 120)
-        righe = []
-        for i in range(start, len(tutte)):
-            partita = tutte.iloc[i]
-            # Solo informazioni disponibili prima della partita i.
-            prec = tutte.iloc[max(0, i - 80):i].copy()
-            if len(prec) < 15:
-                continue
-            m = calcola_modello_completo(
-                prec, partita['HomeTeam'], partita['AwayTeam'],
-                rho, ewma_span, emivita, pd.DataFrame(),
-                data_riferimento=partita.get('Date_parsed')
-            )
-            if m is None:
-                continue
-            po = (100.0 - float(m['prob_under'][2.5])) / 100.0
-            esito = 1 if (float(partita['FTHG']) + float(partita['FTAG'])) > 2.5 else 0
-            righe.append((po, esito))
-
-        if len(righe) < 30:
-            return None
-        # Il warmup indica quante osservazioni servono prima di calibrare,
-        # NON quante osservazioni dobbiamo scartare dal campione di training.
-        # Con 120 righe e warmup=100 la V13 precedente lasciava solo 20 righe: campione troppo piccolo e instabile.
-        # Usiamo quindi le ultime 100 osservazioni OOS disponibili (o tutte se meno di 100).
-        n_train = min(int(warmup), len(righe))
-        train = righe[-n_train:]
-        if len(train) < 30:
-            train = righe
-        x = np.asarray([[r[0]] for r in train], dtype=float)
-        y = np.asarray([r[1] for r in train], dtype=int)
-        if len(np.unique(y)) < 2:
-            return None
-        clf = LogisticRegression(solver='lbfgs', C=1.0, max_iter=1000)
-        clf.fit(x, y)
-        return clf, len(train)
-    except Exception:
-        # PLATT non deve mai impedire la visualizzazione del modello V11.
-        return None
-
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def _v13_diagnostica_platt_ou(dati_precedenti, rho, ewma_span, emivita, max_recent=120, context=80, min_train=30):
-    """Diagnostica WALK-FORWARD del PLATT O/U 2.5.
-    Importante: ogni probabilita' calibrata viene calcolata usando solo righe
-    cronologicamente precedenti alla partita test. Quindi il test non riusa
-    gli esiti della stessa partita per allenare il calibratore.
-    """
-    try:
-        tutte = dati_precedenti[dati_precedenti['FTHG'].notna() & dati_precedenti['FTAG'].notna()].copy()
-        if 'Date_parsed' in tutte.columns:
-            tutte = tutte.sort_values('Date_parsed')
-        tutte = tutte.reset_index(drop=True)
-        if len(tutte) < 70:
-            return None
-
-        start = max(context, len(tutte) - max_recent)
-        righe = []
-        for i in range(start, len(tutte)):
-            partita = tutte.iloc[i]
-            prec = tutte.iloc[max(0, i - context):i].copy()
-            if len(prec) < 15:
-                continue
-            m = calcola_modello_completo(
-                prec, partita['HomeTeam'], partita['AwayTeam'],
-                rho, ewma_span, emivita, pd.DataFrame(),
-                data_riferimento=partita.get('Date_parsed')
-            )
-            if m is None:
-                continue
-            p_raw = (100.0 - float(m['prob_under'][2.5])) / 100.0
-            y = 1 if (float(partita['FTHG']) + float(partita['FTAG'])) > 2.5 else 0
-            righe.append((p_raw, y))
-
-        if len(righe) < (min_train + 10):
-            return None
-
-        rows = []
-        for j, (p_raw, y) in enumerate(righe):
-            if j < min_train:
-                continue
-            train = righe[max(0, j - 100):j]
-            if len(train) < min_train or len(set(r[1] for r in train)) < 2:
-                continue
-            x = np.asarray([[r[0]] for r in train], dtype=float)
-            yy = np.asarray([r[1] for r in train], dtype=int)
-            clf = LogisticRegression(solver='lbfgs', C=1.0, max_iter=1000)
-            clf.fit(x, yy)
-            p_cal = float(clf.predict_proba(np.array([[p_raw]], dtype=float))[0, 1])
-            p_cal = min(max(p_cal, 0.001), 0.999)
-            rows.append({
-                'p_raw': float(p_raw),
-                'y_over': int(y),
-                'p_platt': p_cal,
-                'train_n': len(train),
-            })
-
-        if not rows:
-            return None
-        df = pd.DataFrame(rows)
-        # Metriche probabilistiche, senza introdurre dipendenza da sklearn.metrics.
-        y = df['y_over'].to_numpy(dtype=float)
-        pr = np.clip(df['p_raw'].to_numpy(dtype=float), EPS_PROB, 1.0-EPS_PROB)
-        pc = np.clip(df['p_platt'].to_numpy(dtype=float), EPS_PROB, 1.0-EPS_PROB)
-        brier_raw = float(np.mean((pr-y)**2))
-        brier_cal = float(np.mean((pc-y)**2))
-        ll_raw = float(-np.mean(y*np.log(pr)+(1-y)*np.log(1-pr)))
-        ll_cal = float(-np.mean(y*np.log(pc)+(1-y)*np.log(1-pc)))
-
-        # Fit operativo sugli ultimi 100 OOS disponibili, per spiegare la
-        # trasformazione che l'utente vede sulla partita corrente.
-        train_n = min(100, len(righe))
-        train = righe[-train_n:]
-        clf_last = None
-        current_fit = None
-        if len(train) >= min_train and len(set(r[1] for r in train)) >= 2:
-            x = np.asarray([[r[0]] for r in train], dtype=float)
-            yy = np.asarray([r[1] for r in train], dtype=int)
-            clf_last = LogisticRegression(solver='lbfgs', C=1.0, max_iter=1000)
-            clf_last.fit(x, yy)
-            current_fit = {
-                'train_n': int(len(train)),
-                'over_rate': float(np.mean(yy)),
-                'raw_mean': float(np.mean(x[:,0])),
-                'coef': float(clf_last.coef_[0,0]),
-                'intercept': float(clf_last.intercept_[0]),
-            }
-        return {
-            'df': df,
-            'n_total': int(len(righe)),
-            'n_eval': int(len(df)),
-            'raw_mean': float(df['p_raw'].mean()),
-            'cal_mean': float(df['p_platt'].mean()),
-            'over_rate': float(df['y_over'].mean()),
-            'brier_raw': brier_raw,
-            'brier_cal': brier_cal,
-            'll_raw': ll_raw,
-            'll_cal': ll_cal,
-            'delta_brier': brier_cal-brier_raw,
-            'delta_ll': ll_cal-ll_raw,
-            'current_fit': current_fit,
-        }
-    except Exception as e:
-        return {'error': f'{type(e).__name__}: {e}'}
-
-def _v13_apply_platt_ou(modello, calibratore_info):
-    if modello is None or calibratore_info is None:
-        return modello
-    clf, _ = calibratore_info
-    raw_over = (100.0 - float(modello['prob_under'][2.5])) / 100.0
-    cal_over = float(clf.predict_proba(np.array([[raw_over]], dtype=float))[0, 1])
-    cal_over = min(max(cal_over, 0.001), 0.999)
-    modello['prob_under'][2.5] = (1.0 - cal_over) * 100.0
-    return modello
-
-
 def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho, ewma_span,
                               emivita, df_globale, data_riferimento=None):
     giocate_validi = giocate_coppa.dropna(subset=['FTHG', 'FTAG']) if giocate_coppa is not None else pd.DataFrame()
@@ -803,6 +622,73 @@ def esegui_backtest_senza_filtro(dati_completi, rho, ewma_span, emivita, usa_oos
 # =====================================================================
 LE_12_COMBO = [(s, g, t) for s in ["1", "X", "2"] for g in ["Goal", "NoGoal"] for t in ["Over", "Under"]]
 
+
+
+# =====================================================================
+# V13 — PLATT SOLO O/U 2.5
+# Walk-forward: il fit usa esclusivamente partite precedenti alla partita
+# da analizzare. Non modifica 1X2, Goal/No Goal, Multigol o la griglia.
+# =====================================================================
+@st.cache_data(show_spinner=False, ttl=3600)
+def _v13_training_ou_platt(dati, rho, ewma_span, emivita, data_riferimento, n_train=100):
+    """Costruisce il training O/U 2.5 senza look-ahead."""
+    if dati is None or len(dati) == 0 or 'FTHG' not in dati.columns or 'FTAG' not in dati.columns:
+        return pd.DataFrame()
+    df = dati.copy()
+    if 'Date_parsed' not in df.columns:
+        return pd.DataFrame()
+    df = df[df['FTHG'].notna() & df['FTAG'].notna() & df['Date_parsed'].notna()].copy()
+    if data_riferimento is not None and pd.notna(data_riferimento):
+        df = df[df['Date_parsed'] < data_riferimento].copy()
+    df = df.sort_values('Date_parsed').tail(max(int(n_train) + 40, int(n_train))).copy()
+    rows = []
+    for _, r in df.iterrows():
+        d = r['Date_parsed']
+        prior = df[df['Date_parsed'] < d].copy()
+        if len(prior) < 20:
+            continue
+        try:
+            m = calcola_modello_completo(
+                prior,
+                r['HomeTeam'], r['AwayTeam'],
+                rho, ewma_span, emivita, pd.DataFrame(),
+                data_riferimento=d
+            )
+            if not m or 'prob_under' not in m or 2.5 not in m['prob_under']:
+                continue
+            p_over = 1.0 - float(m['prob_under'][2.5]) / 100.0
+            y_over = int(float(r['FTHG']) + float(r['FTAG']) > 2.5)
+            if np.isfinite(p_over):
+                rows.append({'p_raw': float(np.clip(p_over, 0.001, 0.999)), 'y_over': y_over, 'Date': d})
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values('Date').tail(int(n_train)).reset_index(drop=True)
+
+
+def _v13_fit_platt_ou(df_train):
+    """Fit logistico Platt su probabilità raw O/U 2.5."""
+    if df_train is None or len(df_train) < 50:
+        return None
+    y = df_train['y_over'].astype(int).to_numpy()
+    if len(np.unique(y)) < 2:
+        return None
+    x = df_train[['p_raw']].astype(float).to_numpy()
+    model = LogisticRegression(solver='lbfgs', C=1e6, max_iter=1000)
+    model.fit(x, y)
+    return model
+
+
+def _v13_apply_platt_ou(modello, calibratore):
+    """Applica Platt esclusivamente alla probabilità O/U 2.5 del match."""
+    if modello is None or calibratore is None:
+        return modello
+    p_raw_over = 1.0 - float(modello['prob_under'][2.5]) / 100.0
+    p_platt_over = float(calibratore.predict_proba([[np.clip(p_raw_over, 0.001, 0.999)]])[0, 1])
+    p_platt_over = float(np.clip(p_platt_over, 0.001, 0.999))
+    modello['prob_under'][2.5] = (1.0 - p_platt_over) * 100.0
+    return modello
 
 def _path_calibratore(id_fd, chiave="1x2"):
     return f"calibratore_combo_{chiave}_{id_fd}.pkl"
@@ -1990,9 +1876,9 @@ def mostra_sezione_v5_calibrazione_ev(dati, campionato, rho_val, ewma_span_val, 
             st.download_button('⬇️ Scarica dettaglio V5 CSV',data=out.to_csv(index=False).encode('utf-8'),file_name='v5_calibrazione_ev.csv',mime='text/csv',key='v5_dl')
 
 
-st.caption("V13 operativa — base V11 invariata + PLATT solo O/U 2.5")
+st.caption("Versione operativa V13 — modello V11 completo + PLATT solo O/U 2.5")
 
-st.info("Questa app è un laboratorio separato. v2 confronta il modello grezzo con una calibrazione isotonic allenata SOLO su dati temporali precedenti al test: non usa i calibratori salvati del progetto originale e non modifica v1.")
+st.info("Uso operativo: il modello completo resta invariato; V13 applica PLATT esclusivamente a O/U 2.5 e solo con dati precedenti alla partita selezionata.")
 
 # Parametri del modello fissati ai valori di default validati — non più
 # esposti nell'interfaccia: erano controlli tecnici che richiedevano di
@@ -2007,14 +1893,19 @@ with st.sidebar:
                                    help="Gratuita: football-data.org/client/register")
     st.divider()
     usa_calibrazione = st.checkbox(
-        "🎯 Applica calibrazione (se allenata per questo campionato)",
+        "🎯 Applica calibrazione 1X2 (se allenata)",
         value=False,
-        help="In questa versione audit è disattivata di default: sulla base della verifica storica. Disattiva per confrontare prima/dopo."
+        help="Calibrazione separata del mercato 1X2. Disattivata di default."
     )
     usa_platt_v13 = st.checkbox(
         "🎯 V13 — PLATT solo O/U 2.5",
         value=True,
-        help="Calibra esclusivamente Over/Under 2.5 con regressione logistica walk-forward sui dati precedenti. 1X2 e gli altri mercati restano invariati."
+        help="Corregge esclusivamente la probabilità Over/Under 2.5 usando un fit walk-forward sulle partite precedenti."
+    )
+    mostra_diagnostica_v11 = st.checkbox(
+        "🔬 Mostra diagnostica V11",
+        value=False,
+        help="Mostra la diagnostica tecnica completa. Lascia disattivata per l'uso operativo."
     )
 
 scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)"], horizontal=True)
@@ -2032,34 +1923,6 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
         st.error("Impossibile scaricare i dati. Riprova tra poco.")
         st.stop()
 
-    with st.expander("🔬 Diagnostica V13 — PLATT O/U 2.5 (walk-forward)", expanded=False):
-        st.caption("Test separato: ogni probabilità calibrata usa solo partite precedenti. Non modifica l'analisi della partita e non cambia 1X2, Goal/No Goal o Multigol.")
-        if st.button("🔬 Esegui diagnostica PLATT", key="v13_diag_platt_run"):
-            with st.spinner("Calcolo diagnostica PLATT OOS..."):
-                diag = _v13_diagnostica_platt_ou(dati, rho_val, ewma_span_val, emivita_val)
-            if diag is None:
-                st.warning("Dati insufficienti per una diagnostica walk-forward affidabile.")
-            elif 'error' in diag:
-                st.error("Errore diagnostica PLATT: " + diag['error'])
-            else:
-                st.markdown("**Campione testato**")
-                st.write(f"OOS disponibili: **{diag['n_total']}** — osservazioni valutate: **{diag['n_eval']}**")
-                d1,d2,d3=st.columns(3)
-                d1.metric("Over reale", f"{diag['over_rate']*100:.1f}%")
-                d2.metric("Raw media", f"{diag['raw_mean']*100:.1f}%")
-                d3.metric("PLATT media", f"{diag['cal_mean']*100:.1f}%")
-                st.markdown("**Qualità probabilistica fuori campione**")
-                q=pd.DataFrame([
-                    {"Metrica":"Brier Score","RAW":diag['brier_raw'],"PLATT":diag['brier_cal'],"Delta PLATT-RAW":diag['delta_brier']},
-                    {"Metrica":"Log Loss","RAW":diag['ll_raw'],"PLATT":diag['ll_cal'],"Delta PLATT-RAW":diag['delta_ll']},
-                ])
-                st.dataframe(q,use_container_width=True,hide_index=True)
-                if diag['current_fit']:
-                    cf=diag['current_fit']
-                    st.markdown("**Fit operativo usato per correggere la partita corrente**")
-                    st.write(f"Training: **{cf['train_n']}** partite — Over reale: **{cf['over_rate']*100:.1f}%** — Raw media: **{cf['raw_mean']*100:.1f}%** — coefficiente: **{cf['coef']:.4f}** — intercetta: **{cf['intercept']:.4f}**")
-                st.dataframe(diag['df'].tail(20),use_container_width=True,hide_index=True)
-
     opzioni_partite, mappa_partite = [], []
     if not fixture_future.empty:
         for _, r in fixture_future.iterrows():
@@ -2073,7 +1936,7 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
     df_globale = pd.DataFrame()
     is_coppa = False
 
-    with st.expander("🧪 AUDIT RIGOROSO — modello grezzo", expanded=True):
+    with st.expander("🧪 AUDIT RIGOROSO — modello grezzo", expanded=False):
         st.write("**Obiettivo:** capire se le probabilità del modello sono affidabili prima di usare calibrazione e value bet.")
         col_a, col_b = st.columns(2)
         with col_a:
@@ -2105,7 +1968,7 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
                 st.table(pd.DataFrame(righe))
                 st.caption("Una previsione al 70% dovrebbe, su un campione sufficientemente grande, verificarsi circa 70% delle volte. La tabella serve a controllare questa proprietà; non è una garanzia su piccoli campioni.")
 
-    with st.expander("🧪 V2 — Confronto calibrazione fuori campione", expanded=True):
+    with st.expander("🧪 V2 — Confronto calibrazione fuori campione", expanded=False):
         st.write("**Obiettivo:** verificare se una calibrazione isotonic migliora le probabilità senza vedere gli esiti del periodo di test.")
         st.caption("La v2 non legge i calibratori salvati: li allena temporalmente e li applica solo al blocco successivo.")
         col_v2a, col_v2b = st.columns(2)
@@ -2456,9 +2319,26 @@ else:
 
     platt_v13_info = None
     if modello is not None and not is_coppa and usa_platt_v13:
-        platt_v13_info = _v13_fit_platt_ou(dati_filtrati, rho_val, ewma_span_val, emivita_val, warmup=100)
-        if platt_v13_info is not None:
-            modello = _v13_apply_platt_ou(modello, platt_v13_info)
+        try:
+            train_platt = _v13_training_ou_platt(
+                dati, rho_val, ewma_span_val, emivita_val,
+                data_rif_sel if pd.notna(data_rif_sel) else None,
+                n_train=100
+            )
+            platt_v13 = _v13_fit_platt_ou(train_platt)
+            if platt_v13 is not None:
+                p_raw = 1.0 - float(modello['prob_under'][2.5]) / 100.0
+                p_new = float(platt_v13.predict_proba([[np.clip(p_raw, 0.001, 0.999)]])[0, 1])
+                modello = _v13_apply_platt_ou(modello, platt_v13)
+                platt_v13_info = {
+                    'n_train': len(train_platt),
+                    'raw_over': p_raw * 100.0,
+                    'platt_over': p_new * 100.0,
+                    'raw_under': (1.0 - p_raw) * 100.0,
+                    'platt_under': (1.0 - p_new) * 100.0,
+                }
+        except Exception as _platt_err:
+            platt_v13_info = {'errore': f'{type(_platt_err).__name__}: {_platt_err}'}
 
     if modello is None:
         st.warning(f"⚠️ Impossibile elaborare il match per **{partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}**.")
@@ -2467,10 +2347,14 @@ else:
         if calib_1x2_info:
             st.caption(f"🎯 Probabilità 1X2 corrette con calibrazione (allenata su "
                        f"{calib_1x2_info['n_osservazioni']} osservazioni, {calib_1x2_info['timestamp']}).")
-        if platt_v13_info:
-            st.caption(f"🎯 V13 PLATT attiva solo su O/U 2.5 — {platt_v13_info[1]} osservazioni OOS precedenti. 1X2, Goal/No Goal e gli altri mercati non sono modificati.")
-        elif not is_coppa and usa_platt_v13:
-            st.info("ℹ️ V13 PLATT non applicata: storico O/U insufficiente per l'addestramento.")
+        if platt_v13_info and 'errore' not in platt_v13_info:
+            st.info(
+                f"🎯 **V13 PLATT O/U 2.5 attivo** — training walk-forward: {platt_v13_info['n_train']} partite. "
+                f"Over 2.5: {platt_v13_info['raw_over']:.1f}% → {platt_v13_info['platt_over']:.1f}% · "
+                f"Under 2.5: {platt_v13_info['raw_under']:.1f}% → {platt_v13_info['platt_under']:.1f}%."
+            )
+        elif platt_v13_info and 'errore' in platt_v13_info:
+            st.warning(f"⚠️ PLATT O/U 2.5 non applicato: {platt_v13_info['errore']}")
 
         # Avviso trasparenza dati (sostituisce il vecchio generatore silenzioso di dati finti)
         SOGLIA_AVVISO = 5
@@ -3323,7 +3207,8 @@ def mostra_v11_validation():
         except Exception as e:
             st.error(f'Errore V11: {type(e).__name__}: {e}')
 
-try:
-    mostra_v11_validation()
-except Exception as _v11_err:
-    st.error(f"V11 non disponibile: {type(_v11_err).__name__}: {_v11_err}")
+if mostra_diagnostica_v11:
+    try:
+        mostra_v11_validation()
+    except Exception as _v11_err:
+        st.error(f"V11 non disponibile: {type(_v11_err).__name__}: {_v11_err}")
