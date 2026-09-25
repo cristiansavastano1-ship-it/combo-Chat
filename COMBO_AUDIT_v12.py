@@ -321,6 +321,111 @@ def _v13_fit_platt_ou(dati_precedenti, rho, ewma_span, emivita, warmup=20):
         return None
 
 
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _v13_diagnostica_platt_ou(dati_precedenti, rho, ewma_span, emivita, max_recent=120, context=80, min_train=30):
+    """Diagnostica WALK-FORWARD del PLATT O/U 2.5.
+    Importante: ogni probabilita' calibrata viene calcolata usando solo righe
+    cronologicamente precedenti alla partita test. Quindi il test non riusa
+    gli esiti della stessa partita per allenare il calibratore.
+    """
+    try:
+        tutte = dati_precedenti[dati_precedenti['FTHG'].notna() & dati_precedenti['FTAG'].notna()].copy()
+        if 'Date_parsed' in tutte.columns:
+            tutte = tutte.sort_values('Date_parsed')
+        tutte = tutte.reset_index(drop=True)
+        if len(tutte) < 70:
+            return None
+
+        start = max(context, len(tutte) - max_recent)
+        righe = []
+        for i in range(start, len(tutte)):
+            partita = tutte.iloc[i]
+            prec = tutte.iloc[max(0, i - context):i].copy()
+            if len(prec) < 15:
+                continue
+            m = calcola_modello_completo(
+                prec, partita['HomeTeam'], partita['AwayTeam'],
+                rho, ewma_span, emivita, pd.DataFrame(),
+                data_riferimento=partita.get('Date_parsed')
+            )
+            if m is None:
+                continue
+            p_raw = (100.0 - float(m['prob_under'][2.5])) / 100.0
+            y = 1 if (float(partita['FTHG']) + float(partita['FTAG'])) > 2.5 else 0
+            righe.append((p_raw, y))
+
+        if len(righe) < (min_train + 10):
+            return None
+
+        rows = []
+        for j, (p_raw, y) in enumerate(righe):
+            if j < min_train:
+                continue
+            train = righe[max(0, j - 100):j]
+            if len(train) < min_train or len(set(r[1] for r in train)) < 2:
+                continue
+            x = np.asarray([[r[0]] for r in train], dtype=float)
+            yy = np.asarray([r[1] for r in train], dtype=int)
+            clf = LogisticRegression(solver='lbfgs', C=1.0, max_iter=1000)
+            clf.fit(x, yy)
+            p_cal = float(clf.predict_proba(np.array([[p_raw]], dtype=float))[0, 1])
+            p_cal = min(max(p_cal, 0.001), 0.999)
+            rows.append({
+                'p_raw': float(p_raw),
+                'y_over': int(y),
+                'p_platt': p_cal,
+                'train_n': len(train),
+            })
+
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        # Metriche probabilistiche, senza introdurre dipendenza da sklearn.metrics.
+        y = df['y_over'].to_numpy(dtype=float)
+        pr = np.clip(df['p_raw'].to_numpy(dtype=float), EPS_PROB, 1.0-EPS_PROB)
+        pc = np.clip(df['p_platt'].to_numpy(dtype=float), EPS_PROB, 1.0-EPS_PROB)
+        brier_raw = float(np.mean((pr-y)**2))
+        brier_cal = float(np.mean((pc-y)**2))
+        ll_raw = float(-np.mean(y*np.log(pr)+(1-y)*np.log(1-pr)))
+        ll_cal = float(-np.mean(y*np.log(pc)+(1-y)*np.log(1-pc)))
+
+        # Fit operativo sugli ultimi 100 OOS disponibili, per spiegare la
+        # trasformazione che l'utente vede sulla partita corrente.
+        train_n = min(100, len(righe))
+        train = righe[-train_n:]
+        clf_last = None
+        current_fit = None
+        if len(train) >= min_train and len(set(r[1] for r in train)) >= 2:
+            x = np.asarray([[r[0]] for r in train], dtype=float)
+            yy = np.asarray([r[1] for r in train], dtype=int)
+            clf_last = LogisticRegression(solver='lbfgs', C=1.0, max_iter=1000)
+            clf_last.fit(x, yy)
+            current_fit = {
+                'train_n': int(len(train)),
+                'over_rate': float(np.mean(yy)),
+                'raw_mean': float(np.mean(x[:,0])),
+                'coef': float(clf_last.coef_[0,0]),
+                'intercept': float(clf_last.intercept_[0]),
+            }
+        return {
+            'df': df,
+            'n_total': int(len(righe)),
+            'n_eval': int(len(df)),
+            'raw_mean': float(df['p_raw'].mean()),
+            'cal_mean': float(df['p_platt'].mean()),
+            'over_rate': float(df['y_over'].mean()),
+            'brier_raw': brier_raw,
+            'brier_cal': brier_cal,
+            'll_raw': ll_raw,
+            'll_cal': ll_cal,
+            'delta_brier': brier_cal-brier_raw,
+            'delta_ll': ll_cal-ll_raw,
+            'current_fit': current_fit,
+        }
+    except Exception as e:
+        return {'error': f'{type(e).__name__}: {e}'}
+
 def _v13_apply_platt_ou(modello, calibratore_info):
     if modello is None or calibratore_info is None:
         return modello
@@ -1926,6 +2031,34 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
     if dati is None or len(dati) == 0:
         st.error("Impossibile scaricare i dati. Riprova tra poco.")
         st.stop()
+
+    with st.expander("🔬 Diagnostica V13 — PLATT O/U 2.5 (walk-forward)", expanded=False):
+        st.caption("Test separato: ogni probabilità calibrata usa solo partite precedenti. Non modifica l'analisi della partita e non cambia 1X2, Goal/No Goal o Multigol.")
+        if st.button("🔬 Esegui diagnostica PLATT", key="v13_diag_platt_run"):
+            with st.spinner("Calcolo diagnostica PLATT OOS..."):
+                diag = _v13_diagnostica_platt_ou(dati, rho_val, ewma_span_val, emivita_val)
+            if diag is None:
+                st.warning("Dati insufficienti per una diagnostica walk-forward affidabile.")
+            elif 'error' in diag:
+                st.error("Errore diagnostica PLATT: " + diag['error'])
+            else:
+                st.markdown("**Campione testato**")
+                st.write(f"OOS disponibili: **{diag['n_total']}** — osservazioni valutate: **{diag['n_eval']}**")
+                d1,d2,d3=st.columns(3)
+                d1.metric("Over reale", f"{diag['over_rate']*100:.1f}%")
+                d2.metric("Raw media", f"{diag['raw_mean']*100:.1f}%")
+                d3.metric("PLATT media", f"{diag['cal_mean']*100:.1f}%")
+                st.markdown("**Qualità probabilistica fuori campione**")
+                q=pd.DataFrame([
+                    {"Metrica":"Brier Score","RAW":diag['brier_raw'],"PLATT":diag['brier_cal'],"Delta PLATT-RAW":diag['delta_brier']},
+                    {"Metrica":"Log Loss","RAW":diag['ll_raw'],"PLATT":diag['ll_cal'],"Delta PLATT-RAW":diag['delta_ll']},
+                ])
+                st.dataframe(q,use_container_width=True,hide_index=True)
+                if diag['current_fit']:
+                    cf=diag['current_fit']
+                    st.markdown("**Fit operativo usato per correggere la partita corrente**")
+                    st.write(f"Training: **{cf['train_n']}** partite — Over reale: **{cf['over_rate']*100:.1f}%** — Raw media: **{cf['raw_mean']*100:.1f}%** — coefficiente: **{cf['coef']:.4f}** — intercetta: **{cf['intercept']:.4f}**")
+                st.dataframe(diag['df'].tail(20),use_container_width=True,hide_index=True)
 
     opzioni_partite, mappa_partite = [], []
     if not fixture_future.empty:
