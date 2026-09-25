@@ -278,6 +278,8 @@ def _v13_fit_platt_ou(dati_precedenti, rho, ewma_span, emivita, warmup=20):
             return None
 
         # Campione temporale recente: evita di ricalcolare centinaia di modelli.
+        # Costruiamo fino a 120 osservazioni recenti per contenere il costo,
+        # mantenendo poi fino a 100 osservazioni effettive per il fit.
         start = max(15, len(tutte) - 120)
         righe = []
         for i in range(start, len(tutte)):
@@ -299,7 +301,12 @@ def _v13_fit_platt_ou(dati_precedenti, rho, ewma_span, emivita, warmup=20):
 
         if len(righe) < 30:
             return None
-        train = righe[int(warmup):] if len(righe) > int(warmup) else righe
+        # Il warmup indica quante osservazioni servono prima di calibrare,
+        # NON quante osservazioni dobbiamo scartare dal campione di training.
+        # Con 120 righe e warmup=100 la V13 precedente lasciava solo 20 righe: campione troppo piccolo e instabile.
+        # Usiamo quindi le ultime 100 osservazioni OOS disponibili (o tutte se meno di 100).
+        n_train = min(int(warmup), len(righe))
+        train = righe[-n_train:]
         if len(train) < 30:
             train = righe
         x = np.asarray([[r[0]] for r in train], dtype=float)
