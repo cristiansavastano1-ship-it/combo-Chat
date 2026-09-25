@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -668,26 +667,39 @@ def _v13_training_ou_platt(dati, rho, ewma_span, emivita, data_riferimento, n_tr
     return pd.DataFrame(rows).sort_values('Date').tail(int(n_train)).reset_index(drop=True)
 
 
+def _v13_logit(p):
+    """Logit numerically stable per una probabilita 0..1."""
+    p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+    return float(np.log(p / (1.0 - p)))
+
+
 def _v13_fit_platt_ou(df_train):
-    """Fit logistico Platt su probabilità raw O/U 2.5."""
+    """Fit Platt standard: regressione logistica sul logit della probabilita raw O/U 2.5."""
     if df_train is None or len(df_train) < 50:
         return None
     y = df_train['y_over'].astype(int).to_numpy()
     if len(np.unique(y)) < 2:
         return None
-    x = df_train[['p_raw']].astype(float).to_numpy()
+    p = df_train['p_raw'].astype(float).to_numpy()
+    x = np.array([_v13_logit(v) for v in p], dtype=float).reshape(-1, 1)
     model = LogisticRegression(solver='lbfgs', C=1e6, max_iter=1000)
     model.fit(x, y)
     return model
 
 
+def _v13_predict_platt_ou(p_raw_over, calibratore):
+    if calibratore is None:
+        return float(np.clip(p_raw_over, 0.001, 0.999))
+    x = [[_v13_logit(p_raw_over)]]
+    return float(np.clip(calibratore.predict_proba(x)[0, 1], 0.001, 0.999))
+
+
 def _v13_apply_platt_ou(modello, calibratore):
-    """Applica Platt esclusivamente alla probabilità O/U 2.5 del match."""
+    """Applica Platt esclusivamente alla probabilita O/U 2.5 del match."""
     if modello is None or calibratore is None:
         return modello
     p_raw_over = 1.0 - float(modello['prob_under'][2.5]) / 100.0
-    p_platt_over = float(calibratore.predict_proba([[np.clip(p_raw_over, 0.001, 0.999)]])[0, 1])
-    p_platt_over = float(np.clip(p_platt_over, 0.001, 0.999))
+    p_platt_over = _v13_predict_platt_ou(p_raw_over, calibratore)
     modello['prob_under'][2.5] = (1.0 - p_platt_over) * 100.0
     return modello
 
@@ -1877,7 +1889,7 @@ def mostra_sezione_v5_calibrazione_ev(dati, campionato, rho_val, ewma_span_val, 
             st.download_button('⬇️ Scarica dettaglio V5 CSV',data=out.to_csv(index=False).encode('utf-8'),file_name='v5_calibrazione_ev.csv',mime='text/csv',key='v5_dl')
 
 
-st.caption("Versione operativa V13 — modello V11 completo + PLATT solo O/U 2.5")
+st.caption("Versione operativa V13.4 — modello V11 completo + PLATT standard solo O/U 2.5")
 
 st.info("Uso operativo: il modello completo resta invariato; V13 applica PLATT esclusivamente a O/U 2.5 e solo con dati precedenti alla partita selezionata.")
 
@@ -2329,7 +2341,7 @@ else:
             platt_v13 = _v13_fit_platt_ou(train_platt)
             if platt_v13 is not None:
                 p_raw = 1.0 - float(modello['prob_under'][2.5]) / 100.0
-                p_new = float(platt_v13.predict_proba([[np.clip(p_raw, 0.001, 0.999)]])[0, 1])
+                p_new = _v13_predict_platt_ou(p_raw, platt_v13)
                 modello = _v13_apply_platt_ou(modello, platt_v13)
                 platt_v13_info = {
                     'n_train': len(train_platt),
@@ -2337,10 +2349,6 @@ else:
                     'platt_over': p_new * 100.0,
                     'raw_under': (1.0 - p_raw) * 100.0,
                     'platt_under': (1.0 - p_new) * 100.0,
-                    'train_over_rate': float(train_platt['y_over'].mean()) * 100.0 if len(train_platt) else float('nan'),
-                    'train_raw_mean': float(train_platt['p_raw'].mean()) * 100.0 if len(train_platt) else float('nan'),
-                    'coef': float(platt_v13.coef_[0][0]),
-                    'intercept': float(platt_v13.intercept_[0]),
                 }
         except Exception as _platt_err:
             platt_v13_info = {'errore': f'{type(_platt_err).__name__}: {_platt_err}'}
@@ -2358,13 +2366,6 @@ else:
                 f"Over 2.5: {platt_v13_info['raw_over']:.1f}% → {platt_v13_info['platt_over']:.1f}% · "
                 f"Under 2.5: {platt_v13_info['raw_under']:.1f}% → {platt_v13_info['platt_under']:.1f}%."
             )
-            with st.expander("🔎 Dettagli PLATT della partita corrente", expanded=False):
-                st.write(f"**Training utilizzato:** {platt_v13_info['n_train']} partite precedenti")
-                st.write(f"**Over reali nel training:** {platt_v13_info['train_over_rate']:.1f}%")
-                st.write(f"**Probabilità RAW media nel training:** {platt_v13_info['train_raw_mean']:.1f}%")
-                st.write(f"**Coefficiente PLATT:** {platt_v13_info['coef']:.6f}")
-                st.write(f"**Intercetta PLATT:** {platt_v13_info['intercept']:.6f}")
-                st.caption("Questi parametri descrivono esclusivamente la correzione O/U 2.5 della partita selezionata; 1X2, Goal/No Goal, Multigol e Combo restano invariati.")
         elif platt_v13_info and 'errore' in platt_v13_info:
             st.warning(f"⚠️ PLATT O/U 2.5 non applicato: {platt_v13_info['errore']}")
 
