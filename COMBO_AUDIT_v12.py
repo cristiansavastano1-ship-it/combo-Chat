@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -3245,6 +3246,169 @@ def mostra_v11_validation():
                 for nome,msg in errors: st.write(f'- **{nome}**: {msg}')
         except Exception as e:
             st.error(f'Errore V11: {type(e).__name__}: {e}')
+
+
+
+# =====================================================================
+# 🧪 V13.7 — TEST REALE PLATT O/U 2.5 CON SALVAGUARDIA
+# Questo blocco è SOLO diagnostico: non modifica l'analisi della partita.
+# Per ogni lega:
+#   1) costruisce le probabilità RAW O/U 2.5 in walk-forward;
+#   2) per ogni test usa SOLO le 100 osservazioni OOS precedenti;
+#   3) applica Platt standard sul LOGIT della probabilità RAW;
+#   4) se la pendenza <= 0, mantiene RAW (stessa salvaguardia operativa);
+#   5) confronta RAW vs PLATT su Brier, Log Loss e Accuracy.
+# =====================================================================
+def _v13_7_raw_ou_history(dati_completi, rho, ewma_span, emivita):
+    if dati_completi is None or len(dati_completi) == 0:
+        return pd.DataFrame()
+    tutte = dati_completi[dati_completi['FTHG'].notna() & dati_completi['FTAG'].notna()].reset_index(drop=True)
+    righe = []
+    for i in range(15, len(tutte)):
+        partita = tutte.iloc[i]
+        prec = tutte.iloc[:i]
+        try:
+            m = calcola_modello_completo(
+                prec, partita['HomeTeam'], partita['AwayTeam'],
+                rho, ewma_span, emivita, pd.DataFrame(),
+                data_riferimento=partita.get('Date_parsed')
+            )
+            if m is None or 'prob_under' not in m or 2.5 not in m['prob_under']:
+                continue
+            p_over = float(np.clip(1.0 - float(m['prob_under'][2.5]) / 100.0, 0.001, 0.999))
+            y = int(float(partita['FTHG']) + float(partita['FTAG']) > 2.5)
+            righe.append({'data': partita.get('Date_parsed'), 'p_raw': p_over, 'y_over': y})
+        except Exception:
+            continue
+    return pd.DataFrame(righe)
+
+
+def _v13_7_fit_platt_guard(df_train):
+    if df_train is None or len(df_train) < 50:
+        return None, 'campione insufficiente'
+    y = df_train['y_over'].astype(int).to_numpy()
+    if len(np.unique(y)) < 2:
+        return None, 'un solo esito nel training'
+    x = np.array([_v13_logit(v) for v in df_train['p_raw'].astype(float)], dtype=float).reshape(-1, 1)
+    model = LogisticRegression(solver='lbfgs', C=1e6, max_iter=1000)
+    model.fit(x, y)
+    coef = float(model.coef_[0, 0])
+    if not np.isfinite(coef) or coef <= 0.0:
+        return None, f'pendenza non positiva ({coef:.4f})'
+    return model, coef
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _v13_7_diagnostica_lega(id_fd, rho, ewma_span, emivita, n_train=100):
+    dati = carica_dati_campionato(id_fd)
+    hist = _v13_7_raw_ou_history(dati, rho, ewma_span, emivita)
+    if hist.empty or len(hist) <= int(n_train):
+        return {'summary': None, 'detail': pd.DataFrame()}
+
+    eval_rows=[]
+    for j in range(int(n_train), len(hist)):
+        train = hist.iloc[j-int(n_train):j].copy()
+        test = hist.iloc[j]
+        cal, reason = _v13_7_fit_platt_guard(train)
+        p_raw = float(test['p_raw'])
+        y = int(test['y_over'])
+        applied = cal is not None
+        if applied:
+            p_cal = float(np.clip(cal.predict_proba([[_v13_logit(p_raw)]])[0,1], 0.001, 0.999))
+            coef = float(cal.coef_[0,0])
+            intercept = float(cal.intercept_[0])
+        else:
+            p_cal = p_raw
+            coef = np.nan
+            intercept = np.nan
+        eval_rows.append({
+            'data': test['data'],
+            'p_raw': p_raw,
+            'p_platt': p_cal,
+            'y_over': y,
+            'applied': applied,
+            'reason': '' if applied else reason,
+            'coef': coef,
+            'intercept': intercept,
+            'train_n': len(train),
+            'train_over_pct': float(train['y_over'].mean()*100),
+            'train_raw_mean_pct': float(train['p_raw'].mean()*100),
+        })
+    detail=pd.DataFrame(eval_rows)
+    if detail.empty:
+        return {'summary': None, 'detail': detail}
+    y=detail['y_over'].to_numpy(dtype=float)
+    pr=np.clip(detail['p_raw'].to_numpy(dtype=float),0.001,0.999)
+    pc=np.clip(detail['p_platt'].to_numpy(dtype=float),0.001,0.999)
+    raw_brier=float(np.mean((pr-y)**2)); cal_brier=float(np.mean((pc-y)**2))
+    raw_ll=float(np.mean(-(y*np.log(pr)+(1-y)*np.log(1-pr))))
+    cal_ll=float(np.mean(-(y*np.log(pc)+(1-y)*np.log(1-pc))))
+    raw_acc=float(np.mean((pr>=0.5)==(y==1))*100)
+    cal_acc=float(np.mean((pc>=0.5)==(y==1))*100)
+    applied_n=int(detail['applied'].sum()); excluded_n=int((~detail['applied']).sum())
+    coefs=detail.loc[detail['applied'],'coef'].dropna()
+    summary={
+        'test_n':len(detail),
+        'train_n':int(n_train),
+        'over_real_pct':float(y.mean()*100),
+        'raw_mean_pct':float(pr.mean()*100),
+        'platt_mean_pct':float(pc.mean()*100),
+        'raw_brier':raw_brier,
+        'platt_brier':cal_brier,
+        'delta_brier':cal_brier-raw_brier,
+        'raw_logloss':raw_ll,
+        'platt_logloss':cal_ll,
+        'delta_logloss':cal_ll-raw_ll,
+        'raw_accuracy':raw_acc,
+        'platt_accuracy':cal_acc,
+        'delta_accuracy_pp':cal_acc-raw_acc,
+        'platt_applied_n':applied_n,
+        'platt_excluded_n':excluded_n,
+        'platt_applied_pct':100*applied_n/len(detail),
+        'coef_median':float(coefs.median()) if not coefs.empty else np.nan,
+    }
+    return {'summary':summary,'detail':detail}
+
+
+def mostra_v13_7_diagnostica():
+    st.divider()
+    st.markdown('## 🧪 V13.7 — TEST PLATT O/U 2.5 WALK-FORWARD')
+    st.caption('Diagnostica separata dall’operativa: per ogni partita di test usa le 100 osservazioni OOS precedenti, applica la stessa salvaguardia della V13.6 e confronta RAW vs PLATT.')
+    with st.expander('Apri diagnostica V13.7', expanded=False):
+        if st.button('🔬 ESEGUI TEST PLATT V13.7 — 5 LEGHE', key='v13_7_run'):
+            righe=[]; dettagli={}; errori=[]
+            with st.spinner('V13.7 in esecuzione sulle 5 leghe...'):
+                for camp,info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        res=_v13_7_diagnostica_lega(info['id_fd'],rho_val,ewma_span_val,emivita_val,100)
+                        dettagli[camp]=res.get('detail',pd.DataFrame())
+                        s=res.get('summary')
+                        if s is not None:
+                            righe.append({'Campionato':camp,**s})
+                        else:
+                            errori.append((camp,'dati OOS insufficienti'))
+                    except Exception as e:
+                        errori.append((camp,f'{type(e).__name__}: {e}'))
+            if righe:
+                df=pd.DataFrame(righe)
+                cols=['Campionato','test_n','train_n','over_real_pct','raw_mean_pct','platt_mean_pct',
+                      'raw_brier','platt_brier','delta_brier','raw_logloss','platt_logloss','delta_logloss',
+                      'raw_accuracy','platt_accuracy','delta_accuracy_pp','platt_applied_n','platt_excluded_n','platt_applied_pct','coef_median']
+                st.dataframe(df[cols].round(4),use_container_width=True,hide_index=True)
+                st.caption('Per Brier e Log Loss: delta negativo = PLATT migliore. Per Accuracy: delta positivo = PLATT migliore. “Escluso” significa che la pendenza era <= 0 e quindi è rimasto RAW.')
+                csv_parts=[]
+                for camp,d in dettagli.items():
+                    if d is not None and not d.empty:
+                        csv_parts.append(d.assign(Campionato=camp))
+                if csv_parts:
+                    all_detail=pd.concat(csv_parts,ignore_index=True)
+                    st.download_button('⬇️ Scarica dettaglio V13.7 CSV',data=all_detail.to_csv(index=False).encode('utf-8'),file_name='V13_7_PLATT_walkforward_dettaglio.csv',mime='text/csv',key='v13_7_dl')
+            if errori:
+                st.warning('Campionati non completati:')
+                for nome,msg in errori:
+                    st.write(f'- **{nome}**: {msg}')
+
+mostra_v13_7_diagnostica()
 
 if mostra_diagnostica_v11:
     try:
