@@ -3619,3 +3619,128 @@ if mostra_diagnostica_v11:
         mostra_v11_validation()
     except Exception as _v11_err:
         st.error(f"V11 non disponibile: {type(_v11_err).__name__}: {_v11_err}")
+
+# =====================================================================
+# 🧪 V13.9 — CONFRONTO PAIRED / COMMON BETS
+# Per evitare che il ROI apparente dipenda dal fatto che RAW e PLATT
+# effettuano un numero diverso di puntate, confrontiamo solo le occasioni
+# in cui ENTRAMBI i modelli qualificano la stessa partita con EV >= soglia.
+# Le due strategie vengono poi valutate sulla stessa partita, con 1u per lato.
+# Se la scelta Over/Under differisce, il confronto resta comunque appaiato:
+# stesso evento, stesso prezzo osservato per il lato scelto.
+# =====================================================================
+def _v13_9_common_from_detail(detail, soglia_ev_pct=0):
+    if detail is None or detail.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    d = detail.copy()
+    d = d[d['qualifies'] == True].copy()
+    if d.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    keys = ['Campionato','data','casa','trasferta']
+    # Richiede entrambe le strategie sulla stessa occasione.
+    counts = d.groupby(keys)['strategy'].nunique()
+    common_keys = counts[counts == 2].index
+    if len(common_keys) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+    common = d.set_index(keys).loc[common_keys].reset_index()
+    wide = common.pivot_table(index=keys, columns='strategy', values=['scelta','prob','quota','ev','esito','vinta','profitto'], aggfunc='first')
+    wide.columns = [f'{a}_{b.lower()}' for a,b in wide.columns]
+    wide = wide.reset_index()
+    # Delta paired = PLATT profit - RAW profit sulla stessa partita.
+    wide['delta_profit_platt_raw'] = wide['profitto_platt'] - wide['profitto_raw']
+    wide['platt_minus_raw_win'] = (wide['vinta_platt'].astype(int) - wide['vinta_raw'].astype(int))
+    return common, wide
+
+
+def _v13_9_bootstrap_delta(vals, n_boot=5000, seed=42):
+    vals = np.asarray(vals, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    n = len(vals)
+    if n == 0:
+        return np.nan, np.nan, np.nan, np.nan
+    rng = np.random.default_rng(seed)
+    if n == 1:
+        return float(vals.mean()), float(vals.mean()), float(vals.mean()), 1.0
+    boots = rng.choice(vals, size=(n_boot, n), replace=True).mean(axis=1)
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    delta = float(vals.mean())
+    # p descrittivo a due code per H0: delta=0
+    p = float(2 * min(np.mean(boots <= 0), np.mean(boots >= 0)))
+    return delta, float(lo), float(hi), min(1.0, p)
+
+
+def mostra_v13_9_common_bets():
+    st.divider()
+    st.markdown('## 🧪 V13.9 — COMMON BETS: CONFRONTO PAIRED RAW VS PLATT')
+    st.caption('Confronto più rigoroso del V13.8: prendiamo solo le partite in cui entrambe le strategie avrebbero qualificato una puntata con la stessa soglia EV, così il numero di occasioni è identico.')
+    c1,c2,c3=st.columns(3)
+    with c1:
+        periodo=st.selectbox('Periodo V13.9', ['Tutto lo storico','Stagione corrente OOS'], key='v13_9_periodo')
+    with c2:
+        soglia=st.selectbox('EV minimo V13.9', [0,5,10,15,20], index=0, key='v13_9_ev')
+    with c3:
+        ntrain=st.number_input('Training PLATT V13.9',50,200,100,10,key='v13_9_train')
+    nb=st.number_input('Bootstrap paired',1000,20000,5000,1000,key='v13_9_boot')
+    if st.button('🔬 ESEGUI V13.9 — COMMON BETS', key='v13_9_run'):
+        with st.spinner('Calcolo V13.9 paired sulle 5 leghe...'):
+            summaries, detail, errors = _v13_8_economic_all(periodo,int(soglia),int(ntrain))
+        common, wide = _v13_9_common_from_detail(detail, int(soglia))
+        if wide.empty:
+            st.warning('Nessuna occasione comune qualificata per entrambe le strategie con questi criteri.')
+        else:
+            rows=[]
+            for camp, g in wide.groupby('Campionato'):
+                n=len(g)
+                raw_profit=float(g['profitto_raw'].sum()); pl_profit=float(g['profitto_platt'].sum())
+                delta=float(g['delta_profit_platt_raw'].mean())
+                ci_lo,ci_hi,p=np.nan,np.nan,np.nan
+                delta,ci_lo,ci_hi,p=_v13_9_bootstrap_delta(g['delta_profit_platt_raw'].to_numpy(),int(nb),42)
+                rows.append({
+                    'Campionato':camp,
+                    'Common bets':n,
+                    'RAW profit':raw_profit,
+                    'RAW ROI %':100*raw_profit/n,
+                    'PLATT profit':pl_profit,
+                    'PLATT ROI %':100*pl_profit/n,
+                    'Δ profit medio (PLATT-RAW)':delta,
+                    'IC95% Δ profit medio':[ci_lo,ci_hi][0] if False else ci_lo,
+                    'IC95% Δ profit medio high':ci_hi,
+                    'p descrittivo':p,
+                    'RAW strike %':100*g['vinta_raw'].mean(),
+                    'PLATT strike %':100*g['vinta_platt'].mean(),
+                })
+            df=pd.DataFrame(rows)
+            st.markdown('### Common bets per lega')
+            st.dataframe(df.round(4),use_container_width=True,hide_index=True)
+
+            n=len(wide)
+            raw_profit=float(wide['profitto_raw'].sum()); pl_profit=float(wide['profitto_platt'].sum())
+            delta,ci_lo,ci_hi,p=_v13_9_bootstrap_delta(wide['delta_profit_platt_raw'].to_numpy(),int(nb),43)
+            agg=pd.DataFrame([{
+                'Common bets':n,
+                'RAW profit':raw_profit,
+                'RAW ROI %':100*raw_profit/n,
+                'PLATT profit':pl_profit,
+                'PLATT ROI %':100*pl_profit/n,
+                'Δ ROI pp':100*(pl_profit-raw_profit)/n,
+                'Δ profit medio per bet':delta,
+                'IC95% Δ profit medio low':ci_lo,
+                'IC95% Δ profit medio high':ci_hi,
+                'p descrittivo':p,
+                'RAW strike %':100*wide['vinta_raw'].mean(),
+                'PLATT strike %':100*wide['vinta_platt'].mean(),
+            }])
+            st.markdown('### Aggregato paired')
+            st.dataframe(agg.round(4),use_container_width=True,hide_index=True)
+            st.caption('Qui il confronto è appaiato: RAW e PLATT ricevono esattamente le stesse opportunità. Δ ROI pp = (profitto PLATT − profitto RAW) / common bets. L’IC bootstrap è descrittivo, non una prova causale.')
+
+            st.markdown('### Dettaglio delle occasioni comuni')
+            show_cols=['Campionato','data','casa','trasferta','scelta_raw','scelta_platt','prob_raw','prob_platt','quota_raw','quota_platt','ev_raw','ev_platt','esito_raw','vinta_raw','vinta_platt','profitto_raw','profitto_platt','delta_profit_platt_raw']
+            st.dataframe(wide[show_cols].round(4),use_container_width=True,hide_index=True)
+            st.download_button('⬇️ Scarica V13.9 common bets CSV',data=wide.to_csv(index=False).encode('utf-8'),file_name='V13_9_common_bets_paired.csv',mime='text/csv',key='v13_9_dl')
+        if errors:
+            st.warning('Campionati non completati:')
+            for nome,msg in errors:
+                st.write(f'- **{nome}**: {msg}')
+
+mostra_v13_9_common_bets()
