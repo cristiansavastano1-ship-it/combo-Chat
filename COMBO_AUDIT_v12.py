@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -684,6 +685,13 @@ def _v13_fit_platt_ou(df_train):
     x = np.array([_v13_logit(v) for v in p], dtype=float).reshape(-1, 1)
     model = LogisticRegression(solver='lbfgs', C=1e6, max_iter=1000)
     model.fit(x, y)
+    # Salvaguardia operativa: una calibrazione probabilistica deve essere
+    # monotona crescente rispetto alla probabilita raw. Se la pendenza
+    # stimata e' non positiva, il fit sta invertendo l'ordine delle
+    # probabilita' raw: in questo caso NON applichiamo PLATT.
+    coef = float(model.coef_[0, 0])
+    if not np.isfinite(coef) or coef <= 0.0:
+        raise ValueError(f"PLATT rifiutato: pendenza non positiva ({coef:.6f})")
     return model
 
 
