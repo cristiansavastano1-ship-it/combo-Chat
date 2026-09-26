@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,7 +11,7 @@ from scipy.stats import poisson
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 
-st.set_page_config(page_title="COMBO — V13 Operativa", page_icon="⚽", layout="centered")
+st.set_page_config(page_title="COMBO — V13.6 Operativa", page_icon="⚽", layout="centered")
 
 # =====================================================================
 # 🔎 AUDIT VERSION v5 — derivata dall'app originale, ma separata.
@@ -675,24 +674,24 @@ def _v13_logit(p):
 
 
 def _v13_fit_platt_ou(df_train):
-    """Fit Platt standard: regressione logistica sul logit della probabilita raw O/U 2.5."""
+    """Fit Platt standard e restituisce (modello, pendenza, motivo).
+
+    La calibrazione viene applicata solo quando la pendenza e' positiva:
+    una calibrazione valida deve preservare l'ordinamento delle probabilita'.
+    """
     if df_train is None or len(df_train) < 50:
-        return None
+        return None, np.nan, "campione insufficiente"
     y = df_train['y_over'].astype(int).to_numpy()
     if len(np.unique(y)) < 2:
-        return None
+        return None, np.nan, "un solo esito presente nel training"
     p = df_train['p_raw'].astype(float).to_numpy()
     x = np.array([_v13_logit(v) for v in p], dtype=float).reshape(-1, 1)
     model = LogisticRegression(solver='lbfgs', C=1e6, max_iter=1000)
     model.fit(x, y)
-    # Salvaguardia operativa: una calibrazione probabilistica deve essere
-    # monotona crescente rispetto alla probabilita raw. Se la pendenza
-    # stimata e' non positiva, il fit sta invertendo l'ordine delle
-    # probabilita' raw: in questo caso NON applichiamo PLATT.
     coef = float(model.coef_[0, 0])
     if not np.isfinite(coef) or coef <= 0.0:
-        raise ValueError(f"PLATT rifiutato: pendenza non positiva ({coef:.6f})")
-    return model
+        return None, coef, "fit non monotono: pendenza non positiva"
+    return model, coef, "applicabile"
 
 
 def _v13_predict_platt_ou(p_raw_over, calibratore):
@@ -1511,7 +1510,7 @@ def _tabella_calibrazione_metriche(met):
 # =====================================================================
 # 🖥️ INTERFACCIA
 # =====================================================================
-st.title("🧪 COMBO — Audit Model V13 Operativa")
+st.title("🧪 COMBO — Audit Model V13.6 Operativa")
 
 
 # =====================================================================
@@ -1897,7 +1896,7 @@ def mostra_sezione_v5_calibrazione_ev(dati, campionato, rho_val, ewma_span_val, 
             st.download_button('⬇️ Scarica dettaglio V5 CSV',data=out.to_csv(index=False).encode('utf-8'),file_name='v5_calibrazione_ev.csv',mime='text/csv',key='v5_dl')
 
 
-st.caption("Versione operativa V13.4 — modello V11 completo + PLATT standard solo O/U 2.5")
+st.caption("Versione operativa V13.6 — modello V11 completo + PLATT solo O/U 2.5 con salvaguardia monotona")
 
 st.info("Uso operativo: il modello completo resta invariato; V13 applica PLATT esclusivamente a O/U 2.5 e solo con dati precedenti alla partita selezionata.")
 
@@ -2346,17 +2345,28 @@ else:
                 data_rif_sel if pd.notna(data_rif_sel) else None,
                 n_train=100
             )
-            platt_v13 = _v13_fit_platt_ou(train_platt)
+            platt_v13, platt_coef, platt_status = _v13_fit_platt_ou(train_platt)
+            p_raw = 1.0 - float(modello['prob_under'][2.5]) / 100.0
             if platt_v13 is not None:
-                p_raw = 1.0 - float(modello['prob_under'][2.5]) / 100.0
                 p_new = _v13_predict_platt_ou(p_raw, platt_v13)
                 modello = _v13_apply_platt_ou(modello, platt_v13)
                 platt_v13_info = {
+                    'stato': 'applicato',
                     'n_train': len(train_platt),
+                    'coef': platt_coef,
                     'raw_over': p_raw * 100.0,
                     'platt_over': p_new * 100.0,
                     'raw_under': (1.0 - p_raw) * 100.0,
                     'platt_under': (1.0 - p_new) * 100.0,
+                }
+            else:
+                platt_v13_info = {
+                    'stato': 'escluso',
+                    'n_train': len(train_platt),
+                    'coef': platt_coef,
+                    'raw_over': p_raw * 100.0,
+                    'raw_under': (1.0 - p_raw) * 100.0,
+                    'motivo': platt_status,
                 }
         except Exception as _platt_err:
             platt_v13_info = {'errore': f'{type(_platt_err).__name__}: {_platt_err}'}
@@ -2368,14 +2378,22 @@ else:
         if calib_1x2_info:
             st.caption(f"🎯 Probabilità 1X2 corrette con calibrazione (allenata su "
                        f"{calib_1x2_info['n_osservazioni']} osservazioni, {calib_1x2_info['timestamp']}).")
-        if platt_v13_info and 'errore' not in platt_v13_info:
+        if platt_v13_info and platt_v13_info.get('stato') == 'applicato':
             st.info(
-                f"🎯 **V13 PLATT O/U 2.5 attivo** — training walk-forward: {platt_v13_info['n_train']} partite. "
+                f"🎯 **V13 PLATT O/U 2.5 applicato** — training walk-forward: {platt_v13_info['n_train']} partite · "
+                f"pendenza: {platt_v13_info['coef']:.4f}. "
                 f"Over 2.5: {platt_v13_info['raw_over']:.1f}% → {platt_v13_info['platt_over']:.1f}% · "
                 f"Under 2.5: {platt_v13_info['raw_under']:.1f}% → {platt_v13_info['platt_under']:.1f}%."
             )
+        elif platt_v13_info and platt_v13_info.get('stato') == 'escluso':
+            st.info(
+                f"ℹ️ **V13 PLATT O/U 2.5 escluso automaticamente** — training: {platt_v13_info['n_train']} partite · "
+                f"pendenza: {platt_v13_info['coef']:.4f}. "
+                f"Il fit non e' monotono; resta la probabilita RAW: "
+                f"Over 2.5 {platt_v13_info['raw_over']:.1f}% · Under 2.5 {platt_v13_info['raw_under']:.1f}%."
+            )
         elif platt_v13_info and 'errore' in platt_v13_info:
-            st.warning(f"⚠️ PLATT O/U 2.5 non applicato: {platt_v13_info['errore']}")
+            st.warning(f"⚠️ PLATT O/U 2.5 non applicato per errore tecnico: {platt_v13_info['errore']}")
 
         # Avviso trasparenza dati (sostituisce il vecchio generatore silenzioso di dati finti)
         SOGLIA_AVVISO = 5
