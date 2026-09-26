@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -3409,6 +3408,211 @@ def mostra_v13_7_diagnostica():
                     st.write(f'- **{nome}**: {msg}')
 
 mostra_v13_7_diagnostica()
+
+
+# =====================================================================
+# 🧪 V13.8 — TEST ECONOMICO O/U 2.5: RAW VS PLATT CON SALVAGUARDIA
+# Confronta sullo stesso universo OOS la selezione RAW e la selezione
+# PLATT+guardia, usando le quote medie grezze pre-partita disponibili nei CSV.
+# Il fit PLATT per ogni partita usa solo le 100 osservazioni O/U precedenti.
+# Se la pendenza <= 0, PLATT viene escluso e resta RAW.
+# =====================================================================
+def _stat_roi_v138(bets):
+    if not bets:
+        return {
+            'bets': 0, 'wins': 0, 'strike_pct': np.nan, 'profit': 0.0,
+            'roi_pct': np.nan, 'avg_odds': np.nan, 'avg_ev_pct': np.nan,
+            'max_dd': 0.0,
+        }
+    equity = peak = max_dd = 0.0
+    for b in bets:
+        equity += b['profitto']
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+    n=len(bets)
+    wins=sum(int(b['vinta']) for b in bets)
+    profit=sum(b['profitto'] for b in bets)
+    return {
+        'bets': n,
+        'wins': wins,
+        'strike_pct': 100.0*wins/n,
+        'profit': profit,
+        'roi_pct': 100.0*profit/n,
+        'avg_odds': float(np.mean([b['quota'] for b in bets])),
+        'avg_ev_pct': 100.0*float(np.mean([b['ev'] for b in bets])),
+        'max_dd': max_dd,
+    }
+
+
+def _v13_8_leg_economic(id_fd, rho, ewma_span, emivita, soglia_ev=0.0, solo_corrente=False, n_train=100):
+    dati = carica_dati_campionato(id_fd)
+    if dati is None or dati.empty:
+        return None, pd.DataFrame()
+    tutte = dati[dati['FTHG'].notna() & dati['FTAG'].notna()].reset_index(drop=True)
+    if len(tutte) <= 15 + n_train:
+        return None, pd.DataFrame()
+    colonne_over, colonne_under = classifica_colonne_over_under(tutte.columns, '2.5')
+    if not colonne_over or not colonne_under:
+        return None, pd.DataFrame()
+
+    # Prima costruisce la storia raw OOS identica alla diagnostica V13.7,
+    # mantenendo anche la partita necessaria per collegare le quote.
+    hist=[]
+    for i in range(15, len(tutte)):
+        partita=tutte.iloc[i]
+        try:
+            m=calcola_modello_completo(
+                tutte.iloc[:i], partita['HomeTeam'], partita['AwayTeam'],
+                rho, ewma_span, emivita, pd.DataFrame(),
+                data_riferimento=partita.get('Date_parsed')
+            )
+            if m is None: continue
+            p_raw=float(np.clip(1.0-float(m['prob_under'][2.5])/100.0,0.001,0.999))
+            hist.append({
+                'orig_i':i,
+                'data':partita.get('Date_parsed'),
+                'home':partita['HomeTeam'],
+                'away':partita['AwayTeam'],
+                'p_raw':p_raw,
+                'y_over':int(float(partita['FTHG'])+float(partita['FTAG'])>2.5),
+                'row':partita,
+            })
+        except Exception:
+            continue
+    if len(hist) <= n_train:
+        return None, pd.DataFrame()
+
+    test_hist = []
+    # stesso universo temporale: dalla 101a osservazione OOS in poi;
+    # eventualmente limitiamo alle partite della stagione corrente.
+    for j in range(n_train, len(hist)):
+        test=hist[j]
+        if solo_corrente and str(test['row'].get('Stagione','')) != 'corrente':
+            continue
+        test_hist.append((j,test))
+
+    raw_bets=[]; cal_bets=[]; detail=[]
+    applied_n=excluded_n=0
+    for j,test in test_hist:
+        train_df=pd.DataFrame([{
+            'p_raw':h['p_raw'],'y_over':h['y_over']
+        } for h in hist[j-n_train:j]])
+        cal, reason = _v13_7_fit_platt_guard(train_df)
+        p_raw=test['p_raw']
+        if cal is not None:
+            p_cal=float(np.clip(cal.predict_proba([[_v13_logit(p_raw)]])[0,1],0.001,0.999))
+            coef=float(cal.coef_[0,0])
+            applied=True; applied_n+=1
+        else:
+            p_cal=p_raw
+            coef=np.nan
+            applied=False; excluded_n+=1
+
+        q=quote_medie_grezze_ou(test['row'], colonne_over, colonne_under)
+        if q is None:
+            continue
+
+        for strategy,p_over in [('RAW',p_raw),('PLATT',p_cal)]:
+            probs={'Over':p_over,'Under':1.0-p_over}
+            scelta=max(probs,key=probs.get)
+            quota=float(q[scelta])
+            ev=float(probs[scelta]*quota-1.0)
+            esito='Over' if test['y_over']==1 else 'Under'
+            qualifies=ev >= soglia_ev
+            rec={
+                'data':test['data'],'casa':test['home'],'trasferta':test['away'],
+                'strategy':strategy,'scelta':scelta,'prob':float(probs[scelta]),
+                'quota':quota,'ev':ev,'esito':esito,'vinta':scelta==esito,
+                'profitto':(quota-1.0 if scelta==esito else -1.0),
+                'qualifies':qualifies,'coef':coef if strategy=='PLATT' else np.nan,
+                'platt_applied':applied,
+            }
+            detail.append(rec)
+            if qualifies:
+                (raw_bets if strategy=='RAW' else cal_bets).append(rec)
+
+    raw_stats=_stat_roi_v138(raw_bets)
+    cal_stats=_stat_roi_v138(cal_bets)
+    summary={
+        'campionato': next((k for k,v in CAMPIONATI_DOMESTICI.items() if v['id_fd']==id_fd), id_fd),
+        'test_opportunities': len(test_hist),
+        'quoted_opportunities': int(sum(1 for _,t in test_hist if quote_medie_grezze_ou(t['row'],colonne_over,colonne_under) is not None)),
+        'train_n': int(n_train),
+        'platt_applied_n': applied_n,
+        'platt_excluded_n': excluded_n,
+        'platt_applied_pct': 100.0*applied_n/max(1,len(test_hist)),
+        'raw': raw_stats,
+        'platt': cal_stats,
+    }
+    return summary, pd.DataFrame(detail)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _v13_8_economic_all(periodo='Tutto lo storico', soglia_ev_pct=0, n_train=100):
+    solo_corrente = periodo == 'Stagione corrente OOS'
+    summaries=[]; details=[]; errors=[]
+    for camp,info in CAMPIONATI_DOMESTICI.items():
+        try:
+            s,d=_v13_8_leg_economic(info['id_fd'],rho_val,ewma_span_val,emivita_val,float(soglia_ev_pct)/100.0,solo_corrente,n_train)
+            if s is not None:
+                summaries.append(s)
+                if d is not None and not d.empty:
+                    d=d.copy(); d['Campionato']=camp; details.append(d)
+            else:
+                errors.append((camp,'dati OOS/quote insufficienti'))
+        except Exception as e:
+            errors.append((camp,f'{type(e).__name__}: {e}'))
+    return summaries, (pd.concat(details,ignore_index=True) if details else pd.DataFrame()), errors
+
+
+def mostra_v13_8_economico():
+    st.divider()
+    st.markdown('## 💰 V13.8 — TEST ECONOMICO O/U 2.5: RAW VS PLATT')
+    st.caption('Confronto OOS walk-forward. Per ogni partita PLATT usa le 100 osservazioni O/U precedenti; se la pendenza è <= 0, resta RAW. Le quote sono la media grezza dei bookmaker presenti nei CSV: proxy storica del prezzo, non garanzia di esecuzione.')
+    c1,c2,c3=st.columns(3)
+    with c1:
+        periodo=st.selectbox('Periodo', ['Tutto lo storico','Stagione corrente OOS'], key='v13_8_periodo')
+    with c2:
+        soglia=st.selectbox('EV minimo', [0,5,10,15,20], index=0, key='v13_8_ev')
+    with c3:
+        ntrain=st.number_input('Training PLATT',50,200,100,10,key='v13_8_train')
+    if st.button('💰 ESEGUI V13.8 — RAW VS PLATT',key='v13_8_run'):
+        with st.spinner('V13.8 in esecuzione sulle 5 leghe...'):
+            summaries,detail,errors=_v13_8_economic_all(periodo,int(soglia),int(ntrain))
+        rows=[]
+        for s in summaries:
+            r=s['raw']; c=s['platt']
+            rows.append({
+                'Campionato':s['campionato'],
+                'OOS':s['test_opportunities'],'Quote disponibili':s['quoted_opportunities'],
+                'PLATT % applicato':s['platt_applied_pct'],
+                'RAW bet':r['bets'],'RAW strike %':r['strike_pct'],'RAW ROI %':r['roi_pct'],'RAW profit':r['profit'],'RAW EV %':r['avg_ev_pct'],
+                'PLATT bet':c['bets'],'PLATT strike %':c['strike_pct'],'PLATT ROI %':c['roi_pct'],'PLATT profit':c['profit'],'PLATT EV %':c['avg_ev_pct'],
+                'Δ ROI pp': c['roi_pct']-r['roi_pct'] if np.isfinite(c['roi_pct']) and np.isfinite(r['roi_pct']) else np.nan,
+                'Δ profit':c['profit']-r['profit']
+            })
+        if rows:
+            df=pd.DataFrame(rows)
+            st.dataframe(df.round(4),use_container_width=True,hide_index=True)
+            st.caption('ROI = profitto / numero di puntate. Un numero di puntate diverso fra RAW e PLATT è atteso: la calibrazione può cambiare sia il segno Over/Under sia l’EV e quindi le scommesse qualificate.')
+            agg_rows=[]
+            for strategy in ['RAW','PLATT']:
+                bets=[]
+                for s in summaries:
+                    bets.extend([1]*s[strategy.lower()]['bets'])
+                n=len(bets)
+                profit=sum(s[strategy.lower()]['profit'] for s in summaries)
+                wins=sum(s[strategy.lower()]['wins'] for s in summaries)
+                agg_rows.append({'Strategia':strategy,'Bet':n,'Strike %':100*wins/n if n else np.nan,'Profit':profit,'ROI %':100*profit/n if n else np.nan})
+            st.markdown('### Aggregato 5 leghe')
+            st.dataframe(pd.DataFrame(agg_rows).round(4),use_container_width=True,hide_index=True)
+        if errors:
+            st.warning('Campionati non completati:')
+            for nome,msg in errors: st.write(f'- **{nome}**: {msg}')
+        if detail is not None and not detail.empty:
+            st.download_button('⬇️ Scarica dettaglio V13.8 CSV',data=detail.to_csv(index=False).encode('utf-8'),file_name='V13_8_ROI_RAW_vs_PLATT.csv',mime='text/csv',key='v13_8_dl')
+
+mostra_v13_8_economico()
 
 if mostra_diagnostica_v11:
     try:
