@@ -3441,6 +3441,8 @@ def _v14_combo_leg(id_fd, rho, ewma_span, emivita, solo_corrente=False):
                 'top1_prob': top1_p, 'top1_hit': top1_key == true_key,
                 'top4_hit': true_key in top4_keys,
                 'brier': brier, 'logloss': logloss,
+                'true_combo_prob': float(probs[true_key]),
+                **{f'prob_{k}': float(v) for k, v in probs.items()},
             })
         except Exception:
             continue
@@ -3654,3 +3656,135 @@ def mostra_v14_1_combo_calibrazione(rho, ewma_span, emivita):
 mostra_v14_value_combo_audit()
 
 mostra_v14_1_combo_calibrazione(rho_val, ewma_span_val, emivita_val)
+
+# =====================================================================
+# 🧪 V14.2 — AUDIT DELLE 12 COMBO PER CLASSE (SOLO DIAGNOSTICO)
+# Per ogni classe misura la calibrazione one-vs-rest:
+#   - frequenza reale della classe;
+#   - probabilità media prevista dal modello;
+#   - errore = reale - previsto.
+# Inoltre mostra supporto reale e quante volte la classe è stata scelta come Top 1.
+# NON modifica il motore operativo e NON ricalibra le Combo.
+# =====================================================================
+
+def _v14_2_combo_per_class(df):
+    if df is None or df.empty:
+        return pd.DataFrame(), {'n': 0, 'mae_pp': np.nan, 'max_abs_error_pp': np.nan}
+
+    combo_keys = [f'{s}_{g}_{t}'
+                  for s in ['1','X','2']
+                  for g in ['Goal','NoGoal']
+                  for t in ['Over','Under']]
+    rows = []
+    n = len(df)
+    for key in combo_keys:
+        pcol = f'prob_{key}'
+        if pcol not in df.columns:
+            continue
+        y = (df['true_combo'].astype(str) == key).astype(float)
+        p = pd.to_numeric(df[pcol], errors='coerce')
+        ok = p.notna()
+        if not ok.any():
+            continue
+        p = p[ok]
+        y = y[ok]
+        pred_rate = float(p.mean())
+        real_rate = float(y.mean())
+        err_pp = 100.0 * (real_rate - pred_rate)
+        top1_sel = int((df.loc[ok, 'top1_combo'].astype(str) == key).sum())
+        top1_hit = int(((df.loc[ok, 'top1_combo'].astype(str) == key) & (df.loc[ok, 'true_combo'].astype(str) == key)).sum())
+        true_n = int(y.sum())
+        rows.append({
+            'Combo': key,
+            'N totale': int(len(p)),
+            'N esiti reali': true_n,
+            'Frequenza reale %': 100.0 * real_rate,
+            'Prob. media prevista %': 100.0 * pred_rate,
+            'Errore calibrazione pp': err_pp,
+            'Prob. media quando reale %': 100.0 * float(p[y > 0.5].mean()) if true_n else np.nan,
+            'Top 1 selezionata N': top1_sel,
+            'Top 1 corretta %': 100.0 * top1_hit / true_n if true_n else np.nan,
+        })
+
+    tab = pd.DataFrame(rows)
+    if tab.empty:
+        return tab, {'n': n, 'mae_pp': np.nan, 'max_abs_error_pp': np.nan}
+    mae = float(tab['Errore calibrazione pp'].abs().mean())
+    max_abs = float(tab['Errore calibrazione pp'].abs().max())
+    return tab, {'n': n, 'mae_pp': mae, 'max_abs_error_pp': max_abs}
+
+
+def mostra_v14_2_combo_per_class(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.2 — AUDIT DELLE 12 COMBO')
+    st.caption('Calibrazione one-vs-rest per ciascuna delle 12 classi. Solo diagnostico: non modifica le probabilità operative.')
+    with st.expander('Apri V14.2 — Audit 12 Combo per classe', expanded=False):
+        periodo = st.selectbox(
+            'Periodo V14.2',
+            ['Tutto lo storico', 'Stagione corrente OOS'],
+            key='v14_2_periodo'
+        )
+        solo_corrente = periodo == 'Stagione corrente OOS'
+
+        if st.button('🔬 ESEGUI V14.2 — AUDIT 12 COMBO', key='v14_2_run'):
+            tutti = []
+            errori = []
+            with st.spinner('Calcolo calibrazione delle 12 Combo sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        res, det = _v14_combo_leg(
+                            info['id_fd'], rho, ewma_span, emivita, solo_corrente
+                        )
+                        if det is not None and not det.empty:
+                            tutti.append(det.assign(Campionato=camp))
+                    except Exception as e:
+                        errori.append((camp, f'{type(e).__name__}: {e}'))
+
+            if tutti:
+                all_df = pd.concat(tutti, ignore_index=True)
+                tabs = []
+                for camp, g in all_df.groupby('Campionato'):
+                    t, m = _v14_2_combo_per_class(g)
+                    if not t.empty:
+                        t.insert(0, 'Campionato', camp)
+                        tabs.append(t)
+
+                if tabs:
+                    out = pd.concat(tabs, ignore_index=True)
+                    agg, met = _v14_2_combo_per_class(all_df)
+
+                    st.markdown('### 1. Aggregato — tutte le 12 Combo')
+                    st.write(
+                        f"**Partite:** {met['n']} · **MAE calibrazione:** {met['mae_pp']:.2f} pp · "
+                        f"**Errore massimo assoluto:** {met['max_abs_error_pp']:.2f} pp"
+                    )
+                    st.dataframe(agg.round(4), use_container_width=True, hide_index=True)
+                    st.caption('Errore calibrazione pp = frequenza reale − probabilità media prevista. Negativo = sovrastima; positivo = sottostima.')
+
+                    st.markdown('### 2. Per campionato')
+                    st.dataframe(out.round(4), use_container_width=True, hide_index=True)
+
+                    st.markdown('### 3. Dettaglio OOS')
+                    cols = ['Campionato','data','casa','trasferta','true_combo','top1_combo','top1_prob','true_combo_prob','top1_hit','top4_hit']
+                    extra = [c for c in all_df.columns if c.startswith('prob_')]
+                    st.dataframe(
+                        all_df[cols + extra].round(6),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                    st.download_button(
+                        '⬇️ Scarica V14.2 audit 12 Combo CSV',
+                        data=out.to_csv(index=False).encode('utf-8'),
+                        file_name='V14_2_combo_per_class.csv',
+                        mime='text/csv',
+                        key='v14_2_combo_dl'
+                    )
+
+            if errori:
+                st.warning('Campionati non completati:')
+                for nome, msg in errori:
+                    st.write(f'- **{nome}**: {msg}')
+
+
+mostra_v14_2_combo_per_class(rho_val, ewma_span_val, emivita_val)
+
