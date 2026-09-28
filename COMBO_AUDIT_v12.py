@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -3744,3 +3745,84 @@ def mostra_v13_9_common_bets():
                 st.write(f'- **{nome}**: {msg}')
 
 mostra_v13_9_common_bets()
+
+
+# =====================================================================
+# 🧪 V13.10 — TEST ECONOMICO A SOGLIE EV 0/5/10% (PAIRED)
+# Confronta RAW vs PLATT con salvaguardia sulle stesse occasioni comuni,
+# ripetendo il confronto a tre soglie EV: 0%, 5%, 10%.
+# NON modifica l'operativa: è una diagnostica separata.
+# =====================================================================
+def _v13_10_compute(periodo='Tutto lo storico', n_train=100, soglie=(0,5,10)):
+    solo_corrente = periodo == 'Stagione corrente OOS'
+    summaries, detail, errors = _v13_8_economic_all(periodo, 0, n_train)
+    if detail is None or detail.empty:
+        return pd.DataFrame(), pd.DataFrame(), errors
+
+    keys = ['Campionato','data','casa','trasferta']
+    out_rows=[]
+    paired_all=[]
+    for soglia_pct in soglie:
+        thr=float(soglia_pct)/100.0
+        d=detail.copy()
+        d['qualifies_thr'] = d['ev'] >= thr
+        qd=d[d['qualifies_thr']].copy()
+        if qd.empty:
+            continue
+        counts=qd.groupby(keys)['strategy'].nunique()
+        common_keys=counts[counts==2].index
+        if len(common_keys)==0:
+            continue
+        common=qd.set_index(keys).loc[common_keys].reset_index()
+        wide=common.pivot_table(index=keys, columns='strategy', values=['scelta','prob','quota','ev','esito','vinta','profitto'], aggfunc='first')
+        wide.columns=[f'{a}_{b.lower()}' for a,b in wide.columns]
+        wide=wide.reset_index()
+        wide['delta_profit']=wide['profitto_platt']-wide['profitto_raw']
+        wide['soglia_ev_pct']=soglia_pct
+        out_rows.append({
+            'EV minimo %':soglia_pct,
+            'Common bets':len(wide),
+            'RAW profit':float(wide['profitto_raw'].sum()),
+            'RAW ROI %':100*float(wide['profitto_raw'].sum())/len(wide),
+            'RAW strike %':100*float(wide['vinta_raw'].mean()),
+            'PLATT profit':float(wide['profitto_platt'].sum()),
+            'PLATT ROI %':100*float(wide['profitto_platt'].sum())/len(wide),
+            'PLATT strike %':100*float(wide['vinta_platt'].mean()),
+            'Δ ROI pp':100*float(wide['delta_profit'].mean()),
+            'Δ profit':float(wide['delta_profit'].sum()),
+        })
+        paired_all.append(wide)
+    return pd.DataFrame(out_rows), (pd.concat(paired_all,ignore_index=True) if paired_all else pd.DataFrame()), errors
+
+
+def mostra_v13_10_ev_thresholds():
+    st.divider()
+    st.markdown('## 🧪 V13.10 — TEST PAIRED A SOGLIE EV 0% / 5% / 10%')
+    st.caption('Diagnostica economica: per ogni soglia prende solo le occasioni in cui RAW e PLATT qualificano la stessa partita. Vengono confrontati ROI, profitto e strike sulle stesse occasioni.')
+    c1,c2=st.columns(2)
+    with c1:
+        periodo=st.selectbox('Periodo V13.10',['Tutto lo storico','Stagione corrente OOS'],key='v13_10_periodo')
+    with c2:
+        ntrain=st.number_input('Training PLATT V13.10',50,200,100,10,key='v13_10_train')
+    nb=st.number_input('Bootstrap V13.10',1000,20000,5000,1000,key='v13_10_boot')
+    if st.button('🔬 ESEGUI V13.10 — EV 0 / 5 / 10',key='v13_10_run'):
+        with st.spinner('Calcolo V13.10 sulle 5 leghe...'):
+            summary,paired,errors=_v13_10_compute(periodo,int(ntrain),(0,5,10))
+        if not summary.empty:
+            st.dataframe(summary.round(4),use_container_width=True,hide_index=True)
+            # Bootstrap sui delta di profitto per soglia, separatamente.
+            bs_rows=[]
+            for thr,g in paired.groupby('soglia_ev_pct'):
+                delta,lo,hi,p=_v13_9_bootstrap_delta(g['delta_profit'].to_numpy(),int(nb),100+int(thr))
+                bs_rows.append({'EV minimo %':int(thr),'Common bets':len(g),'Δ ROI pp':100*delta,
+                                'IC95% Δ ROI pp low':100*lo,'IC95% Δ ROI pp high':100*hi,'p descrittivo':p})
+            st.markdown('### Bootstrap paired delle differenze')
+            st.dataframe(pd.DataFrame(bs_rows).round(4),use_container_width=True,hide_index=True)
+            st.caption('Per la differenza ROI, un delta positivo è a favore di PLATT. Un intervallo bootstrap che attraversa 0 non separa nettamente le due strategie nel campione.')
+            st.download_button('⬇️ Scarica V13.10 CSV',data=paired.to_csv(index=False).encode('utf-8'),file_name='V13_10_EV_threshold_paired.csv',mime='text/csv',key='v13_10_dl')
+        if errors:
+            st.warning('Campionati non completati:')
+            for nome,msg in errors:
+                st.write(f'- **{nome}**: {msg}')
+
+mostra_v13_10_ev_thresholds()
