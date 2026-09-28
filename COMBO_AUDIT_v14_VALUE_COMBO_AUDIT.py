@@ -4115,3 +4115,119 @@ def mostra_v14_4_confidence_margin(rho, ewma_span, emivita):
 
 
 mostra_v14_4_confidence_margin(rho_val, ewma_span_val, emivita_val)
+
+
+# =====================================================================
+# 🧪 V14.5 — AUDIT SELEZIONE TOP K COMBO (NO QUOTE INVENTATE)
+# Misura l'efficienza della selezione Top 1/2/3/4:
+#   - copertura reale cumulativa;
+#   - massa di probabilità cumulativa delle prime K;
+#   - rapporto copertura reale / probabilità cumulativa;
+#   - rank medio della combo reale;
+#   - frequenza della combo reale esattamente al rank K.
+# Non calcola ROI combo perché il dataset storico non contiene quote eseguibili
+# per le combo libere 1X2 + Goal/NoGoal + O/U 2.5. Nessuna quota sintetica viene
+# usata per evitare di confondere un proxy con un prezzo bookmaker reale.
+# =====================================================================
+
+def _v14_5_selection_audit(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    req = ['true_rank','top1_prob','top2_prob','rank3_prob','rank4_prob']
+    if not all(c in x.columns for c in req):
+        return pd.DataFrame()
+    prob_cols = {1:'top1_prob',2:'top2_prob',3:'rank3_prob',4:'rank4_prob'}
+    rows=[]
+    for k in range(1,5):
+        mass = sum(pd.to_numeric(x[prob_cols[j]], errors='coerce').fillna(0.0) for j in range(1,k+1))
+        coverage = (pd.to_numeric(x['true_rank'], errors='coerce') <= k)
+        n = int(coverage.notna().sum())
+        cov_rate = float(coverage.mean())
+        mass_mean = float(mass.mean())
+        rows.append({
+            'Selezione': f'Top {k}',
+            'N': len(x),
+            'Copertura reale %': 100.0 * cov_rate,
+            'Prob. cumulativa media %': 100.0 * mass_mean,
+            'Rapporto copertura/probabilità %': 100.0 * cov_rate / mass_mean if mass_mean > 0 else np.nan,
+            'Rank medio combo reale': float(pd.to_numeric(x['true_rank'], errors='coerce').mean()),
+        })
+    return pd.DataFrame(rows)
+
+
+def _v14_5_exact_rank(df):
+    if df is None or df.empty or 'true_rank' not in df.columns:
+        return pd.DataFrame()
+    ranks=[]
+    for k in range(1,10):
+        n=int((df['true_rank']==k).sum())
+        ranks.append({'Rank reale':k,'N':n,'% partite':100.0*n/len(df)})
+    return pd.DataFrame(ranks)
+
+
+def mostra_v14_5_combo_selection(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.5 — AUDIT SELEZIONE COMBO')
+    st.caption('Confronta Top 1/2/3/4 senza inventare quote combo: misura quanta copertura reale otteniamo per quanta probabilità il modello concentra nelle prime K combinazioni.')
+    with st.expander('Apri V14.5 — Selection Audit', expanded=False):
+        periodo = st.selectbox(
+            'Periodo V14.5',
+            ['Tutto lo storico', 'Stagione corrente OOS'],
+            key='v14_5_periodo'
+        )
+        solo_corrente = periodo == 'Stagione corrente OOS'
+
+        if st.button('🔬 ESEGUI V14.5 — SELECTION AUDIT', key='v14_5_run'):
+            tutti=[]; errori=[]
+            with st.spinner('Calcolo efficienza Top K sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        d = _v14_3_ranking_leg(info['id_fd'], rho, ewma_span, emivita, solo_corrente)
+                        if d is not None and not d.empty:
+                            tutti.append(d.assign(Campionato=camp))
+                    except Exception as e:
+                        errori.append((camp, f'{type(e).__name__}: {e}'))
+
+            if tutti:
+                all_df=pd.concat(tutti,ignore_index=True)
+                st.markdown('### 1. Aggregato — Top K')
+                sel=_v14_5_selection_audit(all_df)
+                st.dataframe(sel.round(4),use_container_width=True,hide_index=True)
+                st.caption('Il rapporto copertura/probabilità è un indicatore descrittivo: >100% significa che la frequenza osservata supera la massa probabilistica media indicata per quella selezione.')
+
+                st.markdown('### 2. Per campionato')
+                rows=[]
+                for camp,g in all_df.groupby('Campionato'):
+                    t=_v14_5_selection_audit(g)
+                    if not t.empty:
+                        t.insert(0,'Campionato',camp)
+                        rows.append(t)
+                if rows:
+                    st.dataframe(pd.concat(rows,ignore_index=True).round(4),use_container_width=True,hide_index=True)
+
+                st.markdown('### 3. Rank esatto della combo reale')
+                rank_rows=[]
+                for camp,g in all_df.groupby('Campionato'):
+                    t=_v14_5_exact_rank(g)
+                    if not t.empty:
+                        t.insert(0,'Campionato',camp)
+                        rank_rows.append(t)
+                if rank_rows:
+                    st.dataframe(pd.concat(rank_rows,ignore_index=True).round(4),use_container_width=True,hide_index=True)
+
+                st.markdown('### 4. Nota economica')
+                st.info('Il dataset storico contiene quote pre-partita per 1X2 e O/U 2.5, ma non una quota eseguibile per ciascuna combo libera 1X2 + Goal/NoGoal + O/U. Per questo V14.5 non pubblica ROI combo sintetico: farlo richiederebbe introdurre un prezzo ipotetico.')
+
+                st.download_button(
+                    '⬇️ Scarica V14.5 selection audit CSV',
+                    data=all_df.to_csv(index=False).encode('utf-8'),
+                    file_name='V14_5_combo_selection_audit_dettaglio.csv',
+                    mime='text/csv', key='v14_5_dl'
+                )
+            if errori:
+                st.warning('Campionati non completati:')
+                for nome,msg in errori:
+                    st.write(f'- **{nome}**: {msg}')
+
+mostra_v14_5_combo_selection(rho_val, ewma_span_val, emivita_val)
