@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -3308,7 +3309,7 @@ def _v14_stats(bets):
         'roi': 100.0 * profit / n,
         'avg_ev': 100.0 * float(np.mean([b['ev'] for b in bets])),
         'avg_edge_pp': 100.0 * float(np.mean([b['edge'] for b in bets])),
-        'avg_odds': float(np.mean([b['odds'] for b in bets])),
+        'avg_odds': float(np.mean([b['quota_media_book'] for b in bets])),
     }
 
 
