@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -3532,4 +3531,126 @@ def mostra_v14_value_combo_audit():
                 for nome,msg in errors:
                     st.write(f'- **{nome}**: {msg}')
 
+
+# =====================================================================
+# 🧪 V14.1 — AUDIT CALIBRAZIONE COMBO (SOLO DIAGNOSTICO)
+# Misura la calibrazione della probabilità assegnata alla Top 1 combo:
+# probabilità media prevista vs frequenza reale di Top 1 corretta.
+# NON modifica il motore operativo e NON ricalibra le combo.
+# =====================================================================
+
+def _v14_1_calibration_top1(df):
+    if df is None or df.empty or 'top1_prob' not in df.columns or 'top1_hit' not in df.columns:
+        return pd.DataFrame(), {'ece_pp': np.nan, 'n': 0}
+
+    x = df.copy()
+    bins = [0.0, .10, .20, .30, .40, .50, .60, .70, .80, .90, 1.000001]
+    labels = ['0-10%', '10-20%', '20-30%', '30-40%', '40-50%',
+              '50-60%', '60-70%', '70-80%', '80-90%', '90-100%']
+    x['fascia_top1'] = pd.cut(
+        x['top1_prob'].astype(float), bins=bins, labels=labels,
+        right=False, include_lowest=True
+    )
+    rows = []
+    for lab, g in x.groupby('fascia_top1', observed=False):
+        if g.empty:
+            continue
+        prob = float(g['top1_prob'].mean())
+        freq = float(g['top1_hit'].mean())
+        rows.append({
+            'Fascia Top 1': str(lab),
+            'N': int(len(g)),
+            'Prob. media prevista %': 100.0 * prob,
+            'Frequenza reale %': 100.0 * freq,
+            'Errore calibrazione pp': 100.0 * (freq - prob),
+        })
+
+    tab = pd.DataFrame(rows)
+    if tab.empty:
+        return tab, {'ece_pp': np.nan, 'n': len(x)}
+
+    # ECE: errore assoluto medio pesato per numerosità.
+    n = len(x)
+    tab['peso'] = tab['N'] / n
+    ece = float((tab['peso'] * tab['Errore calibrazione pp'].abs()).sum())
+    tab = tab.drop(columns=['peso'])
+    return tab, {'ece_pp': ece, 'n': n}
+
+
+def mostra_v14_1_combo_calibrazione(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.1 — CALIBRAZIONE COMBO')
+    st.caption('Audit della Top 1: confronta la probabilità media prevista con la frequenza reale della Top 1. Solo diagnostico: non modifica le probabilità operative.')
+    with st.expander('Apri V14.1 — Audit calibrazione Combo', expanded=False):
+        periodo = st.selectbox(
+            'Periodo V14.1',
+            ['Tutto lo storico', 'Stagione corrente OOS'],
+            key='v14_1_periodo'
+        )
+        solo_corrente = periodo == 'Stagione corrente OOS'
+
+        if st.button('🔬 ESEGUI V14.1 — CALIBRAZIONE COMBO', key='v14_1_run'):
+            tutti = []
+            errori = []
+            with st.spinner('Calcolo calibrazione Top 1 sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        res, det = _v14_combo_leg(
+                            info['id_fd'], rho, ewma_span, emivita, solo_corrente
+                        )
+                        if det is not None and not det.empty:
+                            tutti.append(det.assign(Campionato=camp))
+                    except Exception as e:
+                        errori.append((camp, f'{type(e).__name__}: {e}'))
+
+            if tutti:
+                all_df = pd.concat(tutti, ignore_index=True)
+                tab, met = _v14_1_calibration_top1(all_df)
+
+                st.markdown('### 1. Calibrazione aggregata — Top 1')
+                st.write(
+                    f"**Partite:** {met['n']} · **ECE:** {met['ece_pp']:.2f} pp "
+                    f"(errore assoluto medio pesato sulle fasce)"
+                )
+                st.dataframe(tab.round(4), use_container_width=True, hide_index=True)
+                st.caption('Errore calibrazione pp = frequenza reale − probabilità media prevista. Valori negativi indicano sovrastima della probabilità.')
+
+                st.markdown('### 2. Calibrazione per campionato')
+                rows = []
+                for camp, g in all_df.groupby('Campionato'):
+                    t, m = _v14_1_calibration_top1(g)
+                    for _, r in t.iterrows():
+                        rows.append({
+                            'Campionato': camp,
+                            'Fascia Top 1': r['Fascia Top 1'],
+                            'N': r['N'],
+                            'Prob. media prevista %': r['Prob. media prevista %'],
+                            'Frequenza reale %': r['Frequenza reale %'],
+                            'Errore calibrazione pp': r['Errore calibrazione pp'],
+                        })
+                if rows:
+                    st.dataframe(pd.DataFrame(rows).round(4), use_container_width=True, hide_index=True)
+
+                st.markdown('### 3. Dettaglio OOS')
+                st.dataframe(
+                    all_df[['Campionato','data','casa','trasferta','true_combo','top1_combo','top1_prob','top1_hit','top4_hit']]
+                    .round(6),
+                    use_container_width=True,
+                    hide_index=True
+                )
+                st.download_button(
+                    '⬇️ Scarica V14.1 calibrazione Combo CSV',
+                    data=all_df.to_csv(index=False).encode('utf-8'),
+                    file_name='V14_1_combo_calibrazione_top1.csv',
+                    mime='text/csv',
+                    key='v14_1_combo_dl'
+                )
+
+            if errori:
+                st.warning('Campionati non completati:')
+                for nome, msg in errori:
+                    st.write(f'- **{nome}**: {msg}')
+
 mostra_v14_value_combo_audit()
+
+mostra_v14_1_combo_calibrazione(rho_val, ewma_span_val, emivita_val)
