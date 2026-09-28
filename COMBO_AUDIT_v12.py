@@ -3825,3 +3825,120 @@ def mostra_v13_10_ev_thresholds():
                 st.write(f'- **{nome}**: {msg}')
 
 mostra_v13_10_ev_thresholds()
+
+
+# =====================================================================
+# 🧪 V13.11 — EV 10% PAIRED PER LEGA
+# Ultimo controllo mirato: stesso evento e stessa soglia EV >= 10%
+# per RAW e PLATT, separato per ciascuna delle 5 leghe.
+# =====================================================================
+def _v13_11_build_ev10_detail(periodo='Tutto lo storico', n_train=100):
+    _, detail, errors = _v13_8_economic_all(periodo, 0, n_train)
+    if detail is None or detail.empty:
+        return pd.DataFrame(), errors
+
+    # Applica la soglia EV 10% a entrambe le strategie e conserva solo
+    # le partite in cui entrambe qualificano la giocata.
+    d = detail.copy()
+    d = d[d['ev'] >= 0.10].copy()
+    if d.empty:
+        return pd.DataFrame(), errors
+
+    keys = ['Campionato', 'data', 'casa', 'trasferta']
+    counts = d.groupby(keys)['strategy'].nunique()
+    common_keys = counts[counts == 2].index
+    if len(common_keys) == 0:
+        return pd.DataFrame(), errors
+
+    common = d.set_index(keys).loc[common_keys].reset_index()
+    wide = common.pivot_table(
+        index=keys,
+        columns='strategy',
+        values=['scelta','prob','quota','ev','esito','vinta','profitto','platt_applied'],
+        aggfunc='first'
+    )
+    wide.columns = [f'{a}_{b.lower()}' for a, b in wide.columns]
+    wide = wide.reset_index()
+    wide['delta_profit'] = wide['profitto_platt'] - wide['profitto_raw']
+    return wide, errors
+
+
+def mostra_v13_11_ev10_per_lega():
+    st.divider()
+    st.markdown('## 🧪 V13.11 — EV 10% PAIRED PER LEGA')
+    st.caption('Confronto RAW vs PLATT sulle stesse partite in cui entrambe le strategie raggiungono EV >= 10%. Il confronto è separato per lega.')
+    c1, c2 = st.columns(2)
+    with c1:
+        periodo = st.selectbox('Periodo V13.11', ['Tutto lo storico', 'Stagione corrente OOS'], key='v13_11_periodo')
+    with c2:
+        ntrain = st.number_input('Training PLATT V13.11', 50, 200, 100, 10, key='v13_11_train')
+    nb = st.number_input('Bootstrap V13.11', 1000, 20000, 5000, 1000, key='v13_11_boot')
+
+    if st.button('🔬 ESEGUI V13.11 — EV 10% PER LEGA', key='v13_11_run'):
+        with st.spinner('Calcolo V13.11 per le 5 leghe...'):
+            wide, errors = _v13_11_build_ev10_detail(periodo, int(ntrain))
+
+        if wide.empty:
+            st.warning('Nessuna occasione comune RAW/PLATT con EV >= 10%.')
+        else:
+            rows = []
+            for camp_idx, (camp, g) in enumerate(wide.groupby('Campionato')):
+                n = len(g)
+                raw_profit = float(g['profitto_raw'].sum())
+                pl_profit = float(g['profitto_platt'].sum())
+                delta, lo, hi, p = _v13_9_bootstrap_delta(
+                    g['delta_profit'].to_numpy(), int(nb), 110 + camp_idx
+                )
+                rows.append({
+                    'Campionato': camp,
+                    'Common bets EV>=10%': n,
+                    'RAW ROI %': 100.0 * raw_profit / n,
+                    'PLATT ROI %': 100.0 * pl_profit / n,
+                    'Δ ROI pp': 100.0 * delta,
+                    'IC95% low': 100.0 * lo,
+                    'IC95% high': 100.0 * hi,
+                    'p descrittivo': p,
+                    'RAW strike %': 100.0 * g['vinta_raw'].mean(),
+                    'PLATT strike %': 100.0 * g['vinta_platt'].mean(),
+                    'PLATT applicato %': 100.0 * g['platt_applied_platt'].mean(),
+                })
+            df = pd.DataFrame(rows).sort_values('Campionato')
+            st.markdown('### Risultati EV >= 10% per lega')
+            st.dataframe(df.round(4), use_container_width=True, hide_index=True)
+
+            # Aggregato paired EV >= 10%.
+            n = len(wide)
+            raw_profit = float(wide['profitto_raw'].sum())
+            pl_profit = float(wide['profitto_platt'].sum())
+            delta, lo, hi, p = _v13_9_bootstrap_delta(
+                wide['delta_profit'].to_numpy(), int(nb), 111
+            )
+            agg = pd.DataFrame([{
+                'Common bets': n,
+                'RAW ROI %': 100.0 * raw_profit / n,
+                'PLATT ROI %': 100.0 * pl_profit / n,
+                'Δ ROI pp': 100.0 * delta,
+                'IC95% low': 100.0 * lo,
+                'IC95% high': 100.0 * hi,
+                'p descrittivo': p,
+                'RAW strike %': 100.0 * wide['vinta_raw'].mean(),
+                'PLATT strike %': 100.0 * wide['vinta_platt'].mean(),
+                'PLATT applicato %': 100.0 * wide['platt_applied_platt'].mean(),
+            }])
+            st.markdown('### Aggregato paired EV >= 10%')
+            st.dataframe(agg.round(4), use_container_width=True, hide_index=True)
+
+            st.caption('Interpretazione: Δ ROI positivo = profitto medio maggiore per PLATT. Un IC95% che attraversa 0 non separa nettamente le strategie nel campione.')
+            st.download_button(
+                '⬇️ Scarica V13.11 EV10 per lega CSV',
+                data=wide.to_csv(index=False).encode('utf-8'),
+                file_name='V13_11_EV10_paired_per_lega.csv',
+                mime='text/csv',
+                key='v13_11_dl'
+            )
+        if errors:
+            st.warning('Campionati non completati:')
+            for nome, msg in errors:
+                st.write(f'- **{nome}**: {msg}')
+
+mostra_v13_11_ev10_per_lega()
