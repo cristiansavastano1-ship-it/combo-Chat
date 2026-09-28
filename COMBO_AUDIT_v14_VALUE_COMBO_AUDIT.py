@@ -3788,3 +3788,206 @@ def mostra_v14_2_combo_per_class(rho, ewma_span, emivita):
 
 mostra_v14_2_combo_per_class(rho_val, ewma_span_val, emivita_val)
 
+
+
+# =====================================================================
+# 🧪 V14.3 — AUDIT DEL RANKING DELLE 12 COMBO (SOLO DIAGNOSTICO)
+# Verifica se il ranking delle 12 combo contiene informazione oltre la Top 1.
+# Per ogni partita ordina le 12 probabilita' dalla piu' alta alla piu' bassa
+# e misura: hit@1..hit@5, probabilita' media assegnata alla combo nella
+# posizione, rank medio della combo realmente verificata e margine Top1-Top2.
+# NON modifica il motore operativo e NON calibra le combo.
+# =====================================================================
+
+def _v14_3_ranking_leg(id_fd, rho, ewma_span, emivita, solo_corrente=False):
+    dati = carica_dati_campionato(id_fd)
+    if dati is None or dati.empty:
+        return pd.DataFrame()
+    tutte = dati[dati['FTHG'].notna() & dati['FTAG'].notna()].reset_index(drop=True)
+    rows = []
+    for i in range(15, len(tutte)):
+        partita = tutte.iloc[i]
+        if solo_corrente and str(partita.get('Stagione','')) != 'corrente':
+            continue
+        try:
+            m = calcola_modello_completo(
+                tutte.iloc[:i], partita['HomeTeam'], partita['AwayTeam'],
+                rho, ewma_span, emivita, pd.DataFrame(),
+                data_riferimento=partita.get('Date_parsed')
+            )
+            if m is None or 'griglia' not in m:
+                continue
+
+            probs = {}
+            for s in ['1','X','2']:
+                for g in ['Goal','NoGoal']:
+                    for t in ['Over','Under']:
+                        key = f'{s}_{g}_{t}'
+                        probs[key] = float(np.clip(
+                            calcola_combo_libera(
+                                m['griglia'], segno=s, soglia_gol=2.5,
+                                tipo_soglia=t, gol_nogol=g
+                            ) / 100.0,
+                            0.0, 1.0
+                        ))
+
+            esito = '1' if float(partita['FTHG']) > float(partita['FTAG']) else (
+                '2' if float(partita['FTHG']) < float(partita['FTAG']) else 'X'
+            )
+            gg = 'Goal' if float(partita['FTHG']) > 0 and float(partita['FTAG']) > 0 else 'NoGoal'
+            tt = 'Over' if float(partita['FTHG']) + float(partita['FTAG']) > 2.5 else 'Under'
+            true_key = f'{esito}_{gg}_{tt}'
+            if true_key not in probs:
+                continue
+
+            order = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
+            rank_map = {k: r for r, (k, _) in enumerate(order, start=1)}
+            prob_map = dict(order)
+            true_rank = int(rank_map[true_key])
+            top1_p = float(order[0][1])
+            top2_p = float(order[1][1])
+
+            row = {
+                'data': partita.get('Date_parsed'),
+                'casa': partita['HomeTeam'],
+                'trasferta': partita['AwayTeam'],
+                'true_combo': true_key,
+                'true_rank': true_rank,
+                'true_combo_prob': float(prob_map[true_key]),
+                'top1_prob': top1_p,
+                'top2_prob': top2_p,
+                'margin_top1_top2': top1_p - top2_p,
+                'hit_at_1': true_rank <= 1,
+                'hit_at_2': true_rank <= 2,
+                'hit_at_3': true_rank <= 3,
+                'hit_at_4': true_rank <= 4,
+                'hit_at_5': true_rank <= 5,
+                'ranked_keys': '|'.join(k for k, _ in order),
+            }
+            for rr, (_, pp) in enumerate(order[:5], start=1):
+                row[f'rank{rr}_prob'] = float(pp)
+                row[f'rank{rr}_combo'] = order[rr-1][0]
+            rows.append(row)
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+
+def _v14_3_ranking_summary(df):
+    if df is None or df.empty:
+        return pd.DataFrame(), {}
+    rows = []
+    n = len(df)
+    for k in range(1, 6):
+        pcol = f'rank{k}_prob'
+        rows.append({
+            'Posizione': f'Top {k}',
+            'N': int(n),
+            'Hit rate cumulativo %': 100.0 * float(df[f'hit_at_{k}'].mean()),
+            'Prob. media posizione %': 100.0 * float(df[pcol].mean()) if pcol in df.columns else np.nan,
+        })
+    mean_rank=float(df['true_rank'].mean())
+    mrr=float(np.mean(1.0/df['true_rank'].astype(float)))
+    return pd.DataFrame(rows), {
+        'n': n,
+        'mean_true_rank': mean_rank,
+        'mrr': mrr,
+        'top1_top2_margin_pp': 100.0 * float(df['margin_top1_top2'].mean()),
+        'top1_prob_pp': 100.0 * float(df['top1_prob'].mean()),
+    }
+
+
+def mostra_v14_3_combo_ranking(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.3 — AUDIT RANKING DELLE 12 COMBO')
+    st.caption('Misura quanto il ranking delle 12 combo informa oltre la sola Top 1. Solo diagnostico: nessuna modifica alle probabilita operative.')
+    with st.expander('Apri V14.3 — Ranking Combo', expanded=False):
+        periodo = st.selectbox(
+            'Periodo V14.3',
+            ['Tutto lo storico', 'Stagione corrente OOS'],
+            key='v14_3_periodo'
+        )
+        solo_corrente = periodo == 'Stagione corrente OOS'
+
+        if st.button('🔬 ESEGUI V14.3 — RANKING COMBO', key='v14_3_run'):
+            ranking_all=[]
+            errors=[]
+            full_all=[]
+            with st.spinner('Calcolo ranking Top 1 → Top 5 sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        d = _v14_3_ranking_leg(
+                            info['id_fd'], rho, ewma_span, emivita, solo_corrente
+                        )
+                        if d is not None and not d.empty:
+                            d=d.copy(); d.insert(0,'Campionato',camp)
+                            ranking_all.append(d)
+                    except Exception as e:
+                        errors.append((camp, f'{type(e).__name__}: {e}'))
+
+            if ranking_all:
+                all_rank=pd.concat(ranking_all, ignore_index=True)
+                summary_rows=[]
+                for camp,g in all_rank.groupby('Campionato'):
+                    s,met=_v14_3_ranking_summary(g)
+                    for _,r in s.iterrows():
+                        summary_rows.append({
+                            'Campionato':camp,
+                            'Posizione':r['Posizione'],
+                            'N':int(r['N']),
+                            'Hit rate cumulativo %':r['Hit rate cumulativo %'],
+                            'Prob. media posizione %':r['Prob. media posizione %'],
+                        })
+                agg_s,agg_m=_v14_3_ranking_summary(all_rank)
+
+                st.markdown('### 1. Ranking aggregato')
+                st.write(
+                    f"**Partite:** {agg_m['n']} · **Rank medio combo reale:** {agg_m['mean_true_rank']:.2f} · "
+                    f"**MRR:** {agg_m['mrr']:.4f} · **Margine medio Top1−Top2:** {agg_m['top1_top2_margin_pp']:.2f} pp"
+                )
+                st.dataframe(agg_s.round(4), use_container_width=True, hide_index=True)
+
+                st.markdown('### 2. Per campionato')
+                st.dataframe(pd.DataFrame(summary_rows).round(4), use_container_width=True, hide_index=True)
+
+                st.markdown('### 3. Distribuzione del rank reale')
+                dist=[]
+                for camp,g in all_rank.groupby('Campionato'):
+                    vc=g['true_rank'].value_counts().reindex(range(1,13),fill_value=0)
+                    for rank,count in vc.items():
+                        dist.append({'Campionato':camp,'Rank combo reale':int(rank),'N':int(count),'%':100.0*count/len(g)})
+                dist_df=pd.DataFrame(dist)
+                st.dataframe(dist_df.round(4),use_container_width=True,hide_index=True)
+
+                st.markdown('### 4. Margine Top 1 − Top 2')
+                margin=[]
+                for camp,g in all_rank.groupby('Campionato'):
+                    margin.append({
+                        'Campionato':camp,
+                        'N':len(g),
+                        'Margine medio pp':100.0*float(g['margin_top1_top2'].mean()),
+                        'Mediana pp':100.0*float(g['margin_top1_top2'].median()),
+                    })
+                st.dataframe(pd.DataFrame(margin).round(4),use_container_width=True,hide_index=True)
+
+                st.markdown('### 5. Dettaglio OOS')
+                st.dataframe(
+                    all_rank[['Campionato','data','casa','trasferta','true_combo','true_rank','true_combo_prob','top1_prob','top2_prob','rank3_prob','rank4_prob','rank5_prob','margin_top1_top2','hit_at_1','hit_at_2','hit_at_3','hit_at_4','hit_at_5']].round(6),
+                    use_container_width=True,
+                    hide_index=True
+                )
+                st.download_button(
+                    '⬇️ Scarica V14.3 audit ranking CSV',
+                    data=all_rank.to_csv(index=False).encode('utf-8'),
+                    file_name='V14_3_combo_ranking.csv',
+                    mime='text/csv',
+                    key='v14_3_dl'
+                )
+
+            if errors:
+                st.warning('Campionati non completati:')
+                for nome,msg in errors:
+                    st.write(f'- **{nome}**: {msg}')
+
+
+mostra_v14_3_combo_ranking(rho_val, ewma_span_val, emivita_val)
