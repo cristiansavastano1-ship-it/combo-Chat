@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -3431,6 +3430,7 @@ def _v14_combo_leg(id_fd, rho, ewma_span, emivita, solo_corrente=False):
                 continue
             order = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
             top1_key, top1_p = order[0]
+            top2_p = float(order[1][1]) if len(order) > 1 else np.nan
             top4_keys = {k for k,_ in order[:4]}
             # Le 12 classi sono mutuamente esclusive ed esaustive.
             brier = sum((p - (1.0 if k == true_key else 0.0))**2 for k,p in probs.items())
@@ -3439,7 +3439,8 @@ def _v14_combo_leg(id_fd, rho, ewma_span, emivita, solo_corrente=False):
                 'data': partita.get('Date_parsed'),
                 'casa': partita['HomeTeam'], 'trasferta': partita['AwayTeam'],
                 'true_combo': true_key, 'top1_combo': top1_key,
-                'top1_prob': top1_p, 'top1_hit': top1_key == true_key,
+                'top1_prob': top1_p, 'top2_prob': top2_p,
+                'top1_hit': top1_key == true_key,
                 'top4_hit': true_key in top4_keys,
                 'brier': brier, 'logloss': logloss,
                 'true_combo_prob': float(probs[true_key]),
@@ -4297,6 +4298,18 @@ def mostra_v14_6_confidence_threshold_audit(rho, ewma_span, emivita):
                                 tutti.append(det.assign(Campionato=camp))
                             else:
                                 x=det.copy()
+                                if 'top2_prob' not in x.columns:
+                                    # Compatibilità con dettagli legacy: ricava Top 2
+                                    # dalle colonne prob_* escludendo la Top 1.
+                                    prob_cols=[c for c in x.columns if c.startswith('prob_')]
+                                    def _legacy_top2(row):
+                                        vals=[]
+                                        for c in prob_cols:
+                                            try: vals.append(float(row[c]))
+                                            except Exception: pass
+                                        vals=sorted(vals, reverse=True)
+                                        return vals[1] if len(vals)>1 else np.nan
+                                    x['top2_prob']=x.apply(_legacy_top2,axis=1)
                                 x['margin_top1_top2']=pd.to_numeric(x['top1_prob'],errors='coerce')-pd.to_numeric(x['top2_prob'],errors='coerce')
                                 x['hit_at_1']=x['top1_hit']
                                 x['hit_at_4']=x['top4_hit']
