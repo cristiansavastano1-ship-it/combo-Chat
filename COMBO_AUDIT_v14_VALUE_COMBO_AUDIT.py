@@ -3991,3 +3991,127 @@ def mostra_v14_3_combo_ranking(rho, ewma_span, emivita):
 
 
 mostra_v14_3_combo_ranking(rho_val, ewma_span_val, emivita_val)
+
+
+# =====================================================================
+# 🧪 V14.4 — AUDIT CONFIDENCE / MARGINE TOP 1 (SOLO DIAGNOSTICO)
+# Divide le partite per il margine Top1−Top2 e misura:
+#   - frequenza di Top1 corretta;
+#   - frequenza della combo reale dentro Top4;
+#   - probabilità media Top1;
+#   - numero di osservazioni.
+# NON modifica il motore operativo e NON cambia le probabilità.
+# =====================================================================
+
+def _v14_4_margin_audit(df):
+    if df is None or df.empty or 'margin_top1_top2' not in df.columns:
+        return pd.DataFrame()
+
+    x = df.copy()
+    x['margin_pp'] = 100.0 * pd.to_numeric(x['margin_top1_top2'], errors='coerce')
+    x = x.dropna(subset=['margin_pp'])
+
+    bins = [-np.inf, 2.0, 5.0, 10.0, np.inf]
+    labels = ['< 2 pp', '2–5 pp', '5–10 pp', '> 10 pp']
+    x['fascia_margine'] = pd.cut(
+        x['margin_pp'], bins=bins, labels=labels,
+        right=False, include_lowest=True
+    )
+
+    rows = []
+    for lab, g in x.groupby('fascia_margine', observed=False):
+        if g.empty:
+            continue
+        rows.append({
+            'Margine Top1−Top2': str(lab),
+            'N': int(len(g)),
+            'Top 1 hit rate %': 100.0 * float(g['hit_at_1'].mean()),
+            'Top 4 hit rate %': 100.0 * float(g['hit_at_4'].mean()),
+            'Prob. media Top 1 %': 100.0 * float(g['top1_prob'].mean()),
+            'Rank medio combo reale': float(g['true_rank'].mean()),
+            'Margine medio pp': float(g['margin_pp'].mean()),
+        })
+    return pd.DataFrame(rows)
+
+
+def mostra_v14_4_confidence_margin(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.4 — AUDIT CONFIDENCE / MARGINE COMBO')
+    st.caption('Verifica quanto la qualità della Top 1 cambia quando il margine tra prima e seconda combo è piccolo o grande. Solo diagnostico: nessuna modifica alle probabilità operative.')
+    with st.expander('Apri V14.4 — Confidence / Margin Audit', expanded=False):
+        periodo = st.selectbox(
+            'Periodo V14.4',
+            ['Tutto lo storico', 'Stagione corrente OOS'],
+            key='v14_4_periodo'
+        )
+        solo_corrente = periodo == 'Stagione corrente OOS'
+
+        if st.button('🔬 ESEGUI V14.4 — CONFIDENCE / MARGINE', key='v14_4_run'):
+            tutti = []
+            errori = []
+            with st.spinner('Calcolo confidence/margine sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        d = _v14_3_ranking_leg(
+                            info['id_fd'], rho, ewma_span, emivita, solo_corrente
+                        )
+                        if d is not None and not d.empty:
+                            tutti.append(d.assign(Campionato=camp))
+                    except Exception as e:
+                        errori.append((camp, f'{type(e).__name__}: {e}'))
+
+            if tutti:
+                all_df = pd.concat(tutti, ignore_index=True)
+
+                st.markdown('### 1. Aggregato — qualità per margine')
+                agg = _v14_4_margin_audit(all_df)
+                st.dataframe(agg.round(4), use_container_width=True, hide_index=True)
+
+                st.markdown('### 2. Per campionato')
+                rows = []
+                for camp, g in all_df.groupby('Campionato'):
+                    t = _v14_4_margin_audit(g)
+                    if not t.empty:
+                        t.insert(0, 'Campionato', camp)
+                        rows.append(t)
+                if rows:
+                    st.dataframe(pd.concat(rows, ignore_index=True).round(4), use_container_width=True, hide_index=True)
+
+                st.markdown('### 3. Densità delle fasce')
+                dens = all_df.copy()
+                dens['Margine pp'] = 100.0 * dens['margin_top1_top2']
+                dens['Fascia'] = pd.cut(
+                    dens['Margine pp'], bins=[-np.inf, 2, 5, 10, np.inf],
+                    labels=['< 2 pp', '2–5 pp', '5–10 pp', '> 10 pp'],
+                    right=False, include_lowest=True
+                )
+                dens_tab = (
+                    dens.groupby('Fascia', observed=False)
+                    .size().rename('N').reset_index()
+                )
+                dens_tab['% partite'] = 100.0 * dens_tab['N'] / max(1, len(dens))
+                st.dataframe(dens_tab.round(4), use_container_width=True, hide_index=True)
+
+                st.markdown('### 4. Dettaglio OOS')
+                cols = [
+                    'Campionato','data','casa','trasferta','true_combo','true_rank',
+                    'top1_prob','top2_prob','margin_top1_top2',
+                    'hit_at_1','hit_at_4'
+                ]
+                st.dataframe(all_df[cols].round(6), use_container_width=True, hide_index=True)
+
+                st.download_button(
+                    '⬇️ Scarica V14.4 confidence / margin CSV',
+                    data=agg.to_csv(index=False).encode('utf-8'),
+                    file_name='V14_4_combo_confidence_margin.csv',
+                    mime='text/csv',
+                    key='v14_4_dl'
+                )
+
+            if errori:
+                st.warning('Campionati non completati:')
+                for nome, msg in errori:
+                    st.write(f'- **{nome}**: {msg}')
+
+
+mostra_v14_4_confidence_margin(rho_val, ewma_span_val, emivita_val)
