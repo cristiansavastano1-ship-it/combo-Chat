@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -4231,3 +4232,97 @@ def mostra_v14_5_combo_selection(rho, ewma_span, emivita):
                     st.write(f'- **{nome}**: {msg}')
 
 mostra_v14_5_combo_selection(rho_val, ewma_span_val, emivita_val)
+
+
+# =====================================================================
+# 🧪 V14.6 — AUDIT SOGLIE CONFIDENZA COMBO (SOLO DIAGNOSTICO)
+# Verifica descrittiva della qualità Top 1 quando imponiamo soglie
+# predefinite su probabilità Top 1 e margine Top1-Top2.
+# NON modifica le probabilità operative e NON propone automaticamente
+# una soglia da usare in produzione.
+# =====================================================================
+
+def _v14_6_threshold_audit(df, prob_thresholds=(0.20,0.25,0.30,0.35), margin_thresholds=(0.0,0.02,0.05,0.10)):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    req = ['top1_prob','margin_top1_top2','hit_at_1','hit_at_4']
+    if any(c not in df.columns for c in req):
+        return pd.DataFrame()
+    rows=[]
+    for pt in prob_thresholds:
+        for mt in margin_thresholds:
+            d=df[(pd.to_numeric(df['top1_prob'],errors='coerce') >= pt) &
+                 (pd.to_numeric(df['margin_top1_top2'],errors='coerce') >= mt)].copy()
+            if d.empty:
+                rows.append({
+                    'Soglia prob. Top1 %':100*pt,
+                    'Soglia margine pp':100*mt,
+                    'N':0,
+                    'Top1 hit %':np.nan,
+                    'Top4 hit %':np.nan,
+                    'Prob. media Top1 %':np.nan,
+                    'Margine medio pp':np.nan,
+                    'Copertura/Prob. cumulativa %':np.nan,
+                })
+                continue
+            rows.append({
+                'Soglia prob. Top1 %':100*pt,
+                'Soglia margine pp':100*mt,
+                'N':int(len(d)),
+                'Top1 hit %':100*pd.to_numeric(d['hit_at_1'],errors='coerce').mean(),
+                'Top4 hit %':100*pd.to_numeric(d['hit_at_4'],errors='coerce').mean(),
+                'Prob. media Top1 %':100*pd.to_numeric(d['top1_prob'],errors='coerce').mean(),
+                'Margine medio pp':100*pd.to_numeric(d['margin_top1_top2'],errors='coerce').mean(),
+                'Copertura/Prob. cumulativa %':100*pd.to_numeric(d['hit_at_1'],errors='coerce').mean()/max(1e-9,pd.to_numeric(d['top1_prob'],errors='coerce').mean()),
+            })
+    return pd.DataFrame(rows)
+
+
+def mostra_v14_6_confidence_threshold_audit(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.6 — AUDIT SOGLIE CONFIDENZA COMBO')
+    st.caption('Test descrittivo di soglie predefinite su probabilità Top 1 e margine Top1−Top2. Solo diagnostico: nessuna soglia viene trasferita all’operativa.')
+    with st.expander('Apri V14.6 — Confidence Threshold Audit', expanded=False):
+        periodo = st.selectbox('Periodo V14.6',['Tutto lo storico','Stagione corrente OOS'],key='v14_6_periodo')
+        solo_corrente = periodo == 'Stagione corrente OOS'
+        if st.button('🔬 ESEGUI V14.6 — SOGLIE CONFIDENZA',key='v14_6_run'):
+            tutti=[]; errori=[]
+            with st.spinner('Calcolo soglie di confidenza sulle 5 leghe...'):
+                for camp,info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        _,det=_v14_combo_leg(info['id_fd'],rho,ewma_span,emivita,solo_corrente)
+                        if det is not None and not det.empty:
+                            # V14.3 usa già top1_prob/top2_prob e il margine.
+                            if 'margin_top1_top2' in det.columns and 'hit_at_1' in det.columns:
+                                tutti.append(det.assign(Campionato=camp))
+                            else:
+                                x=det.copy()
+                                x['margin_top1_top2']=pd.to_numeric(x['top1_prob'],errors='coerce')-pd.to_numeric(x['top2_prob'],errors='coerce')
+                                x['hit_at_1']=x['top1_hit']
+                                x['hit_at_4']=x['top4_hit']
+                                tutti.append(x.assign(Campionato=camp))
+                    except Exception as e:
+                        errori.append((camp,f'{type(e).__name__}: {e}'))
+            if tutti:
+                all_df=pd.concat(tutti,ignore_index=True)
+                st.markdown('### 1. Aggregato — matrice probabilità × margine')
+                tab=_v14_6_threshold_audit(all_df)
+                st.dataframe(tab.round(4),use_container_width=True,hide_index=True)
+                st.caption('Le soglie sono fissate ex ante nel codice e servono a descrivere la stabilità della selezione; non sono ottimizzate sui risultati.')
+                st.markdown('### 2. Per campionato')
+                rows=[]
+                for camp,g in all_df.groupby('Campionato'):
+                    t=_v14_6_threshold_audit(g)
+                    t.insert(0,'Campionato',camp)
+                    rows.append(t)
+                if rows:
+                    st.dataframe(pd.concat(rows,ignore_index=True).round(4),use_container_width=True,hide_index=True)
+                st.markdown('### 3. Dettaglio OOS')
+                st.dataframe(all_df[['Campionato','data','casa','trasferta','true_combo','top1_combo','top1_prob','top2_prob','margin_top1_top2','hit_at_1','hit_at_4']].round(6),use_container_width=True,hide_index=True)
+                st.download_button('⬇️ Scarica V14.6 soglie confidenza CSV',data=tab.to_csv(index=False).encode('utf-8'),file_name='V14_6_confidence_threshold_audit.csv',mime='text/csv',key='v14_6_dl')
+            if errori:
+                st.warning('Campionati non completati:')
+                for nome,msg in errori:
+                    st.write(f'- **{nome}**: {msg}')
+
+mostra_v14_6_confidence_threshold_audit(rho_val, ewma_span_val, emivita_val)
