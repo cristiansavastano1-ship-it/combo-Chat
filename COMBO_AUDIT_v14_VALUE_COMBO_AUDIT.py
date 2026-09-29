@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -4374,10 +4375,14 @@ def _v14_7_stability_summary(df, prob_threshold=0.35):
         x['hit_at_1'] = x['top1_hit']
     if 'hit_at_4' not in x.columns and 'top4_hit' in x.columns:
         x['hit_at_4'] = x['top4_hit']
+    if 'margin_top1_top2' not in x.columns and {'top1_prob','top2_prob'}.issubset(x.columns):
+        x['margin_top1_top2'] = (
+            pd.to_numeric(x['top1_prob'], errors='coerce')
+            - pd.to_numeric(x['top2_prob'], errors='coerce')
+        )
     x['hit_at_1'] = pd.to_numeric(x['hit_at_1'], errors='coerce')
     x['hit_at_4'] = pd.to_numeric(x['hit_at_4'], errors='coerce')
-    if 'margin_top1_top2' in x.columns:
-        x['margin_top1_top2'] = pd.to_numeric(x['margin_top1_top2'], errors='coerce')
+    x['margin_top1_top2'] = pd.to_numeric(x.get('margin_top1_top2'), errors='coerce')
     x = x[x['top1_prob'] >= prob_threshold].copy()
     x = x.dropna(subset=['hit_at_1','hit_at_4','top1_prob'])
     if x.empty:
@@ -4455,15 +4460,32 @@ def mostra_v14_7_threshold_stability(rho, ewma_span, emivita):
                     delta = c['Top1 hit %'] - h['Top1 hit %']
                     st.info(f"Differenza hit rate stagione corrente − storico: **{delta:+.2f} pp**. Il confronto serve a verificare stabilità, non a scegliere automaticamente una nuova soglia.")
 
-                export_cols = ['Campionato','Periodo','data','casa','trasferta','true_combo','top1_combo','top1_prob','top1_hit','top4_hit','margin_top1_top2']
-                out = all_df[export_cols].copy()
-                out = out.rename(columns={'top1_hit':'hit_at_1','top4_hit':'hit_at_4'})
-                st.download_button(
-                    '⬇️ Scarica V14.7 threshold stability CSV',
-                    data=out.to_csv(index=False).encode('utf-8'),
-                    file_name='V14_7_threshold_stability_35pct.csv',
-                    mime='text/csv', key='v14_7_dl'
-                )
+                # Normalizza le colonne richieste dall'export. Alcune versioni V14
+                # producono top1_hit/top4_hit, mentre l'audit usa hit_at_1/hit_at_4.
+                export_df = all_df.copy()
+                if 'hit_at_1' not in export_df.columns and 'top1_hit' in export_df.columns:
+                    export_df['hit_at_1'] = export_df['top1_hit']
+                if 'hit_at_4' not in export_df.columns and 'top4_hit' in export_df.columns:
+                    export_df['hit_at_4'] = export_df['top4_hit']
+                if 'margin_top1_top2' not in export_df.columns and {'top1_prob','top2_prob'}.issubset(export_df.columns):
+                    export_df['margin_top1_top2'] = (
+                        pd.to_numeric(export_df['top1_prob'], errors='coerce')
+                        - pd.to_numeric(export_df['top2_prob'], errors='coerce')
+                    )
+                export_cols = ['Campionato','Periodo','data','casa','trasferta','true_combo',
+                               'top1_combo','top1_prob','top2_prob','hit_at_1','hit_at_4',
+                               'margin_top1_top2']
+                missing_export = [c for c in export_cols if c not in export_df.columns]
+                if missing_export:
+                    st.warning(f'Export V14.7 non disponibile: colonne mancanti {missing_export}')
+                else:
+                    out = export_df[export_cols].copy()
+                    st.download_button(
+                        '⬇️ Scarica V14.7 threshold stability CSV',
+                        data=out.to_csv(index=False).encode('utf-8'),
+                        file_name='V14_7_threshold_stability_35pct.csv',
+                        mime='text/csv', key='v14_7_dl'
+                    )
 
             if errors:
                 st.warning('Campionati non completati:')
