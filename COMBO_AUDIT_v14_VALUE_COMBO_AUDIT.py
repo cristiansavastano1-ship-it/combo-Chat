@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -4893,4 +4892,135 @@ def mostra_v14_10_temporal_calibration_drift(rho, ewma_span, emivita):
                 for nome,msg in errors:
                     st.write(f'- **{nome}**: {msg}')
 
+
+# 🧪 V14.11 — CALIBRAZIONE PER FASCE DI CONFIDENZA ≥35% (SOLO DIAGNOSTICO)
+
+def _v14_11_band_summary(g, prob_threshold=0.35):
+    x = g.copy()
+    if 'hit_at_1' not in x.columns and 'top1_hit' in x.columns:
+        x['hit_at_1'] = x['top1_hit']
+    if 'top1_prob' not in x.columns:
+        return pd.DataFrame()
+    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
+    x['hit_at_1'] = pd.to_numeric(x.get('hit_at_1'), errors='coerce')
+    x = x.dropna(subset=['top1_prob', 'hit_at_1'])
+    x = x[x['top1_prob'] >= prob_threshold].copy()
+    if x.empty:
+        return pd.DataFrame()
+
+    bands = [0.35, 0.40, 0.45, 0.50, 0.60, 1.0000001]
+    labels = ['35–40%', '40–45%', '45–50%', '50–60%', '≥60%']
+    x['_band'] = pd.cut(x['top1_prob'], bins=bands, labels=labels, right=False, include_lowest=True)
+
+    rows = []
+    for band, gband in x.groupby('_band', observed=True):
+        n = len(gband)
+        y = gband['hit_at_1'].astype(float).to_numpy()
+        p = np.clip(gband['top1_prob'].astype(float).to_numpy(), 1e-6, 1-1e-6)
+        hit = float(y.mean())
+        mean_p = float(p.mean())
+        rows.append({
+            'Fascia probabilità': str(band),
+            'N': int(n),
+            'Top1 hit %': 100.0 * hit,
+            'Prob. media %': 100.0 * mean_p,
+            'Gap calibrazione pp': 100.0 * (hit - mean_p),
+            'Brier': float(np.mean((p-y)**2)),
+            'Log Loss': float(-np.mean(y*np.log(p) + (1-y)*np.log(1-p))),
+        })
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out['_abs_gap_weight'] = out['N'] * out['Gap calibrazione pp'].abs()
+        total_n = out['N'].sum()
+        ece = float(out['_abs_gap_weight'].sum() / total_n) if total_n else np.nan
+        out.attrs['ECE_pp'] = ece
+    return out
+
+
+def mostra_v14_11_confidence_bands(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.11 — CALIBRAZIONE PER FASCE DI CONFIDENZA ≥35%')
+    st.caption('Test diagnostico: verifica dove si concentra l’errore di calibrazione tra le selezioni Top1 con probabilità ≥35%. Nessuna modifica all’operativa e nessuna nuova soglia proposta automaticamente.')
+    with st.expander('Apri V14.11 — Confidence Bands', expanded=False):
+        if st.button('🔬 ESEGUI V14.11 — FASCE CONFIDENZA 35%+', key='v14_11_run'):
+            frames=[]; errors=[]
+            with st.spinner('Calcolo calibrazione per fasce sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        _, d = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
+                        if d is not None and not d.empty:
+                            frames.append(d.assign(Campionato=camp))
+                    except Exception as e:
+                        errors.append((camp, f'{type(e).__name__}: {e}'))
+
+            if frames:
+                all_df = pd.concat(frames, ignore_index=True)
+                all_df['data'] = pd.to_datetime(all_df['data'], errors='coerce')
+                all_df = all_df.dropna(subset=['data']).sort_values('data').reset_index(drop=True)
+
+                st.markdown('### 1. Storico OOS — fasce di probabilità')
+                hist = _v14_11_band_summary(all_df, 0.35)
+                if not hist.empty:
+                    st.dataframe(hist.drop(columns=['_abs_gap_weight']).round(4), use_container_width=True, hide_index=True)
+                    st.caption(f"ECE pesato sulle sole selezioni ≥35%: {hist.attrs.get('ECE_pp', np.nan):.2f} pp")
+                else:
+                    st.info('Nessuna selezione ≥35% disponibile.')
+
+                st.markdown('### 2. Stagione corrente OOS — fasce di probabilità')
+                if 'data' in all_df.columns:
+                    latest_year = int(all_df['data'].dt.year.max())
+                    current_cut = pd.Timestamp(year=latest_year, month=8, day=1)
+                    curr = all_df[all_df['data'] >= current_cut].copy()
+                else:
+                    curr = pd.DataFrame()
+                curr = _v14_11_band_summary(curr, 0.35)
+                if not curr.empty:
+                    st.dataframe(curr.drop(columns=['_abs_gap_weight']).round(4), use_container_width=True, hide_index=True)
+                    st.caption(f"ECE pesato stagione corrente OOS (dal 1° agosto dell'anno più recente presente nei dati): {curr.attrs.get('ECE_pp', np.nan):.2f} pp")
+                else:
+                    st.info('Nessuna selezione ≥35% nella finestra corrente disponibile.')
+
+                st.markdown('### 3. Confronto aggregato storico vs stagione corrente')
+                def _overall_band(g, period):
+                    h = _v14_11_band_summary(g, 0.35)
+                    if h.empty:
+                        return pd.DataFrame()
+                    h = h.drop(columns=['_abs_gap_weight']).copy()
+                    h.insert(0, 'Periodo', period)
+                    return h
+                cmp_frames=[]
+                h1=_overall_band(all_df,'Tutto lo storico OOS')
+                h2=_overall_band(all_df[all_df['data'] >= current_cut],'Stagione corrente OOS')
+                if not h1.empty: cmp_frames.append(h1)
+                if not h2.empty: cmp_frames.append(h2)
+                if cmp_frames:
+                    st.dataframe(pd.concat(cmp_frames, ignore_index=True).round(4), use_container_width=True, hide_index=True)
+
+                st.markdown('### 4. Dettaglio per campionato — storico OOS')
+                rows=[]
+                for camp, gc in all_df.groupby('Campionato'):
+                    h=_v14_11_band_summary(gc,0.35)
+                    if not h.empty:
+                        for _,r in h.iterrows():
+                            rows.append({'Campionato':camp,**r.to_dict()})
+                by_league=pd.DataFrame(rows)
+                if not by_league.empty:
+                    st.dataframe(by_league.drop(columns=['_abs_gap_weight'], errors='ignore').round(4),use_container_width=True,hide_index=True)
+
+                st.markdown('### 5. Export')
+                export_cols=['Campionato','data','casa','trasferta','true_combo','top1_combo','top1_prob','top2_prob','top1_hit','top4_hit','margin_top1_top2']
+                export_cols=[c for c in export_cols if c in all_df.columns]
+                st.download_button(
+                    '⬇️ Scarica V14.11 confidence bands CSV',
+                    data=all_df[export_cols].to_csv(index=False).encode('utf-8'),
+                    file_name='V14_11_confidence_bands_35pct.csv',
+                    mime='text/csv', key='v14_11_dl'
+                )
+            if errors:
+                st.warning('Campionati non completati:')
+                for nome,msg in errors:
+                    st.write(f'- **{nome}**: {msg}')
+
+
 mostra_v14_10_temporal_calibration_drift(rho_val, ewma_span_val, emivita_val)
+mostra_v14_11_confidence_bands(rho_val, ewma_span_val, emivita_val)
