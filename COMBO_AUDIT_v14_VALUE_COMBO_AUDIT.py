@@ -4493,3 +4493,131 @@ def mostra_v14_7_threshold_stability(rho, ewma_span, emivita):
                     st.write(f'- **{nome}**: {msg}')
 
 mostra_v14_7_threshold_stability(rho_val, ewma_span_val, emivita_val)
+
+
+# =====================================================================
+# 🧪 V14.8 — SENSIBILITÀ DELLA SOGLIA TOP 1 (SOLO DIAGNOSTICO)
+# Confronta più soglie intorno al 35% su:
+#   1) tutto lo storico OOS;
+#   2) stagione corrente OOS.
+# Nessuna soglia viene trasferita all'operativa.
+# =====================================================================
+
+def _v14_8_threshold_sensitivity_summary(df, prob_threshold):
+    if df is None or df.empty:
+        return {
+            'Soglia %': 100.0 * prob_threshold, 'N': 0,
+            'Top1 hit %': np.nan, 'IC95% Top1 low %': np.nan,
+            'IC95% Top1 high %': np.nan, 'Top4 hit %': np.nan,
+            'Prob. media Top1 %': np.nan, 'Margine medio pp': np.nan,
+            'Copertura/Prob. %': np.nan,
+        }
+    x = df.copy()
+    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
+    if 'hit_at_1' not in x.columns and 'top1_hit' in x.columns:
+        x['hit_at_1'] = x['top1_hit']
+    if 'hit_at_4' not in x.columns and 'top4_hit' in x.columns:
+        x['hit_at_4'] = x['top4_hit']
+    if 'margin_top1_top2' not in x.columns and {'top1_prob','top2_prob'}.issubset(x.columns):
+        x['margin_top1_top2'] = (
+            pd.to_numeric(x['top1_prob'], errors='coerce')
+            - pd.to_numeric(x['top2_prob'], errors='coerce')
+        )
+    x['hit_at_1'] = pd.to_numeric(x.get('hit_at_1'), errors='coerce')
+    x['hit_at_4'] = pd.to_numeric(x.get('hit_at_4'), errors='coerce')
+    x['margin_top1_top2'] = pd.to_numeric(x.get('margin_top1_top2'), errors='coerce')
+    x = x[x['top1_prob'] >= prob_threshold].dropna(subset=['hit_at_1','hit_at_4','top1_prob'])
+    if x.empty:
+        return {
+            'Soglia %': 100.0 * prob_threshold, 'N': 0,
+            'Top1 hit %': np.nan, 'IC95% Top1 low %': np.nan,
+            'IC95% Top1 high %': np.nan, 'Top4 hit %': np.nan,
+            'Prob. media Top1 %': np.nan, 'Margine medio pp': np.nan,
+            'Copertura/Prob. %': np.nan,
+        }
+    n = len(x)
+    wins = int(x['hit_at_1'].sum())
+    lo, hi = _v14_7_wilson_interval(wins, n)
+    mean_p = float(x['top1_prob'].mean())
+    return {
+        'Soglia %': 100.0 * prob_threshold,
+        'N': int(n),
+        'Top1 hit %': 100.0 * wins / n,
+        'IC95% Top1 low %': 100.0 * lo,
+        'IC95% Top1 high %': 100.0 * hi,
+        'Top4 hit %': 100.0 * float(x['hit_at_4'].mean()),
+        'Prob. media Top1 %': 100.0 * mean_p,
+        'Margine medio pp': 100.0 * float(x['margin_top1_top2'].mean()),
+        'Copertura/Prob. %': 100.0 * float(x['hit_at_1'].mean()) / max(1e-9, mean_p),
+    }
+
+
+def mostra_v14_8_threshold_sensitivity(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.8 — SENSIBILITÀ DELLA SOGLIA TOP 1')
+    st.caption('Test diagnostico ex post su soglie 30%, 32.5%, 35%, 37.5% e 40%. Confronta storico OOS e stagione corrente OOS senza modificare l’operativa.')
+    with st.expander('Apri V14.8 — Threshold Sensitivity', expanded=False):
+        if st.button('🔬 ESEGUI V14.8 — SENSIBILITÀ SOGLIA', key='v14_8_run'):
+            all_hist=[]; all_current=[]; errors=[]
+            with st.spinner('Calcolo sensibilità soglia sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        _, d_all = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
+                        if d_all is not None and not d_all.empty:
+                            all_hist.append(d_all.assign(Campionato=camp, Periodo='Tutto lo storico OOS'))
+                        _, d_cur = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, True)
+                        if d_cur is not None and not d_cur.empty:
+                            all_current.append(d_cur.assign(Campionato=camp, Periodo='Stagione corrente OOS'))
+                    except Exception as e:
+                        errors.append((camp, f'{type(e).__name__}: {e}'))
+
+            frames = all_hist + all_current
+            if frames:
+                all_df = pd.concat(frames, ignore_index=True)
+                thresholds = (0.30, 0.325, 0.35, 0.375, 0.40)
+
+                st.markdown('### 1. Sensibilità aggregata')
+                rows=[]
+                for periodo, g in all_df.groupby('Periodo'):
+                    for thr in thresholds:
+                        rows.append({'Periodo': periodo, **_v14_8_threshold_sensitivity_summary(g, thr)})
+                sens=pd.DataFrame(rows)
+                st.dataframe(sens.round(4), use_container_width=True, hide_index=True)
+
+                st.markdown('### 2. Differenza stagione corrente − storico')
+                hist = {float(r['Soglia %']): r for _, r in sens[sens['Periodo']=='Tutto lo storico OOS'].iterrows()}
+                cur = {float(r['Soglia %']): r for _, r in sens[sens['Periodo']=='Stagione corrente OOS'].iterrows()}
+                delta_rows=[]
+                for thr in sorted(set(hist) & set(cur)):
+                    delta_rows.append({
+                        'Soglia %': thr,
+                        'N storico': hist[thr]['N'],
+                        'N corrente': cur[thr]['N'],
+                        'Δ Top1 hit pp': cur[thr]['Top1 hit %'] - hist[thr]['Top1 hit %'],
+                        'Δ Top4 pp': cur[thr]['Top4 hit %'] - hist[thr]['Top4 hit %'],
+                        'Δ Prob. media Top1 pp': cur[thr]['Prob. media Top1 %'] - hist[thr]['Prob. media Top1 %'],
+                        'Δ Margine medio pp': cur[thr]['Margine medio pp'] - hist[thr]['Margine medio pp'],
+                        'Δ Copertura/Prob. pp': cur[thr]['Copertura/Prob. %'] - hist[thr]['Copertura/Prob. %'],
+                    })
+                delta_df=pd.DataFrame(delta_rows)
+                st.dataframe(delta_df.round(4), use_container_width=True, hide_index=True)
+                st.caption('Le differenze descrivono la stabilità della metrica al variare della soglia; non costituiscono una selezione automatica della soglia.')
+
+                st.markdown('### 3. Focus intorno al 35%')
+                focus = sens[sens['Soglia %'].isin([32.5,35.0,37.5])].copy()
+                st.dataframe(focus.round(4), use_container_width=True, hide_index=True)
+
+                export_cols=['Periodo','Soglia %','N','Top1 hit %','IC95% Top1 low %','IC95% Top1 high %','Top4 hit %','Prob. media Top1 %','Margine medio pp','Copertura/Prob. %']
+                st.download_button(
+                    '⬇️ Scarica V14.8 sensitivity CSV',
+                    data=sens[export_cols].to_csv(index=False).encode('utf-8'),
+                    file_name='V14_8_threshold_sensitivity.csv',
+                    mime='text/csv', key='v14_8_dl'
+                )
+
+            if errors:
+                st.warning('Campionati non completati:')
+                for nome,msg in errors:
+                    st.write(f'- **{nome}**: {msg}')
+
+mostra_v14_8_threshold_sensitivity(rho_val, ewma_span_val, emivita_val)
