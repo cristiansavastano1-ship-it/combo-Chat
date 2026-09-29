@@ -4369,6 +4369,11 @@ def _v14_7_stability_summary(df, prob_threshold=0.35):
         }
     x = df.copy()
     x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
+    # Compatibilità con _v14_combo_leg(), che restituisce top1_hit/top4_hit.
+    if 'hit_at_1' not in x.columns and 'top1_hit' in x.columns:
+        x['hit_at_1'] = x['top1_hit']
+    if 'hit_at_4' not in x.columns and 'top4_hit' in x.columns:
+        x['hit_at_4'] = x['top4_hit']
     x['hit_at_1'] = pd.to_numeric(x['hit_at_1'], errors='coerce')
     x['hit_at_4'] = pd.to_numeric(x['hit_at_4'], errors='coerce')
     if 'margin_top1_top2' in x.columns:
