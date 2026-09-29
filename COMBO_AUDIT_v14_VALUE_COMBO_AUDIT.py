@@ -4455,7 +4455,9 @@ def mostra_v14_7_threshold_stability(rho, ewma_span, emivita):
                     delta = c['Top1 hit %'] - h['Top1 hit %']
                     st.info(f"Differenza hit rate stagione corrente − storico: **{delta:+.2f} pp**. Il confronto serve a verificare stabilità, non a scegliere automaticamente una nuova soglia.")
 
-                out = all_df[['Campionato','Periodo','data','casa','trasferta','true_combo','top1_combo','top1_prob','hit_at_1','hit_at_4','margin_top1_top2']].copy()
+                export_cols = ['Campionato','Periodo','data','casa','trasferta','true_combo','top1_combo','top1_prob','top1_hit','top4_hit','margin_top1_top2']
+                out = all_df[export_cols].copy()
+                out = out.rename(columns={'top1_hit':'hit_at_1','top4_hit':'hit_at_4'})
                 st.download_button(
                     '⬇️ Scarica V14.7 threshold stability CSV',
                     data=out.to_csv(index=False).encode('utf-8'),
