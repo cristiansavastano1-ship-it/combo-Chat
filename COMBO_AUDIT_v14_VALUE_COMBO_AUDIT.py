@@ -4770,4 +4770,127 @@ def mostra_v14_9_temporal_stability(rho, ewma_span, emivita):
                 for nome,msg in errors:
                     st.write(f'- **{nome}**: {msg}')
 
-mostra_v14_9_temporal_stability(rho_val, ewma_span_val, emivita_val)
+
+
+# 🧪 V14.10 — DRIFT DI CALIBRAZIONE TEMPORALE DELLE SELEZIONI >=35% (SOLO DIAGNOSTICO)
+
+def _v14_10_calibration_window_summary(g, prob_threshold=0.35):
+    x = g.copy()
+    if 'hit_at_1' not in x.columns and 'top1_hit' in x.columns:
+        x['hit_at_1'] = x['top1_hit']
+    if 'top1_prob' not in x.columns:
+        return None
+    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
+    x['hit_at_1'] = pd.to_numeric(x.get('hit_at_1'), errors='coerce')
+    x = x.dropna(subset=['top1_prob', 'hit_at_1'])
+    s = x[x['top1_prob'] >= prob_threshold].copy()
+    n = len(s)
+    if n == 0:
+        return {
+            'N selezioni': 0,
+            'Top1 hit %': np.nan,
+            'Prob. media Top1 %': np.nan,
+            'Gap calibrazione pp': np.nan,
+            'Brier Top1': np.nan,
+            'Log Loss Top1': np.nan,
+        }
+    y = s['hit_at_1'].astype(float).to_numpy()
+    p = np.clip(s['top1_prob'].astype(float).to_numpy(), 1e-6, 1-1e-6)
+    hit = float(y.mean())
+    mean_p = float(p.mean())
+    brier = float(np.mean((p-y)**2))
+    logloss = float(-np.mean(y*np.log(p) + (1-y)*np.log(1-p)))
+    return {
+        'N selezioni': int(n),
+        'Top1 hit %': 100.0 * hit,
+        'Prob. media Top1 %': 100.0 * mean_p,
+        'Gap calibrazione pp': 100.0 * (hit - mean_p),
+        'Brier Top1': brier,
+        'Log Loss Top1': logloss,
+    }
+
+
+def mostra_v14_10_temporal_calibration_drift(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.10 — DRIFT DI CALIBRAZIONE TEMPORALE SOGLIA 35%')
+    st.caption('Test diagnostico: misura se il rapporto tra probabilità Top1 prevista e hit Top1 realizzata cambia nel tempo sulle sole selezioni >=35%. Nessuna modifica all’operativa.')
+    with st.expander('Apri V14.10 — Temporal Calibration Drift', expanded=False):
+        if st.button('🔬 ESEGUI V14.10 — DRIFT CALIBRAZIONE 35%', key='v14_10_run'):
+            frames=[]; errors=[]
+            with st.spinner('Calcolo drift di calibrazione sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        _, d = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
+                        if d is not None and not d.empty:
+                            frames.append(d.assign(Campionato=camp))
+                    except Exception as e:
+                        errors.append((camp, f'{type(e).__name__}: {e}'))
+
+            if frames:
+                all_df = pd.concat(frames, ignore_index=True)
+                all_df['data'] = pd.to_datetime(all_df['data'], errors='coerce')
+                all_df = all_df.dropna(subset=['data']).sort_values('data').reset_index(drop=True)
+
+                if len(all_df) >= 20:
+                    labels = ['Finestra 1 (più vecchia)', 'Finestra 2', 'Finestra 3', 'Finestra 4 (più recente)']
+                    all_df['_window'] = pd.qcut(all_df.index, q=4, labels=labels, duplicates='drop')
+
+                    st.markdown('### 1. Calibrazione Top1 nelle selezioni >=35%')
+                    rows=[]
+                    for window, g in all_df.groupby('_window', observed=True):
+                        s = _v14_10_calibration_window_summary(g, 0.35)
+                        if s is not None:
+                            s['Finestra'] = str(window)
+                            rows.append(s)
+                    cal_df = pd.DataFrame(rows)
+                    if not cal_df.empty:
+                        cols=['Finestra','N selezioni','Top1 hit %','Prob. media Top1 %','Gap calibrazione pp','Brier Top1','Log Loss Top1']
+                        st.dataframe(cal_df[cols].round(4), use_container_width=True, hide_index=True)
+                        st.caption('Gap calibrazione = Top1 hit % − probabilità media Top1 %. Un valore negativo indica probabilità media superiore agli hit osservati.')
+
+                    st.markdown('### 2. Prima vs ultima finestra')
+                    first = _v14_10_calibration_window_summary(all_df[all_df['_window'] == labels[0]], 0.35)
+                    last = _v14_10_calibration_window_summary(all_df[all_df['_window'] == labels[-1]], 0.35)
+                    if first and last and first['N selezioni'] > 0 and last['N selezioni'] > 0:
+                        cmp = pd.DataFrame([
+                            {'Metrica':'Top1 hit %','Prima finestra':first['Top1 hit %'],'Ultima finestra':last['Top1 hit %'],'Delta ultima-prima pp':last['Top1 hit %']-first['Top1 hit %']},
+                            {'Metrica':'Prob. media Top1 %','Prima finestra':first['Prob. media Top1 %'],'Ultima finestra':last['Prob. media Top1 %'],'Delta ultima-prima pp':last['Prob. media Top1 %']-first['Prob. media Top1 %']},
+                            {'Metrica':'Gap calibrazione pp','Prima finestra':first['Gap calibrazione pp'],'Ultima finestra':last['Gap calibrazione pp'],'Delta ultima-prima pp':last['Gap calibrazione pp']-first['Gap calibrazione pp']},
+                            {'Metrica':'Brier Top1','Prima finestra':first['Brier Top1'],'Ultima finestra':last['Brier Top1'],'Delta ultima-prima pp':last['Brier Top1']-first['Brier Top1']},
+                            {'Metrica':'Log Loss Top1','Prima finestra':first['Log Loss Top1'],'Ultima finestra':last['Log Loss Top1'],'Delta ultima-prima pp':last['Log Loss Top1']-first['Log Loss Top1']},
+                        ])
+                        st.dataframe(cmp.round(4), use_container_width=True, hide_index=True)
+
+                    st.markdown('### 3. Dettaglio per campionato')
+                    rows=[]
+                    for camp, gc in all_df.groupby('Campionato'):
+                        if len(gc) < 20:
+                            continue
+                        gc=gc.sort_values('data').reset_index(drop=True)
+                        gc['_window']=pd.qcut(gc.index, q=4, labels=labels, duplicates='drop')
+                        for window, g in gc.groupby('_window', observed=True):
+                            s=_v14_10_calibration_window_summary(g,0.35)
+                            if s is not None:
+                                rows.append({'Campionato':camp,'Finestra':str(window),**s})
+                    by_league=pd.DataFrame(rows)
+                    if not by_league.empty:
+                        st.dataframe(by_league.round(4),use_container_width=True,hide_index=True)
+
+                    st.markdown('### 4. Export')
+                    export_cols=['Campionato','data','casa','trasferta','true_combo','top1_combo','top1_prob','top2_prob','top1_hit','top4_hit','margin_top1_top2']
+                    export_cols=[c for c in export_cols if c in all_df.columns]
+                    st.download_button(
+                        '⬇️ Scarica V14.10 temporal calibration CSV',
+                        data=all_df[export_cols].to_csv(index=False).encode('utf-8'),
+                        file_name='V14_10_temporal_calibration_35pct.csv',
+                        mime='text/csv', key='v14_10_dl'
+                    )
+                else:
+                    st.warning('Numero di osservazioni OOS insufficiente per una divisione in 4 finestre.')
+
+            if errors:
+                st.warning('Campionati non completati:')
+                for nome,msg in errors:
+                    st.write(f'- **{nome}**: {msg}')
+
+mostra_v14_10_temporal_calibration_drift(rho_val, ewma_span_val, emivita_val)
