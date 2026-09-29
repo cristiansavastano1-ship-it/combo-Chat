@@ -4339,3 +4339,128 @@ def mostra_v14_6_confidence_threshold_audit(rho, ewma_span, emivita):
                     st.write(f'- **{nome}**: {msg}')
 
 mostra_v14_6_confidence_threshold_audit(rho_val, ewma_span_val, emivita_val)
+
+
+# =====================================================================
+# 🧪 V14.7 — STABILITÀ SOGLIA TOP 1 >= 35% (SOLO DIAGNOSTICO)
+# Verifica se una soglia fissata ex ante resta coerente tra:
+#   1) tutto lo storico OOS;
+#   2) stagione corrente OOS.
+# Nessuna soglia viene trasferita all'operativa.
+# =====================================================================
+
+def _v14_7_wilson_interval(wins, n, z=1.959963984540054):
+    if n <= 0:
+        return (np.nan, np.nan)
+    p = wins / n
+    den = 1.0 + (z*z)/n
+    center = (p + (z*z)/(2.0*n)) / den
+    half = z * np.sqrt((p*(1.0-p)/n) + (z*z)/(4.0*n*n)) / den
+    return center-half, center+half
+
+
+def _v14_7_stability_summary(df, prob_threshold=0.35):
+    if df is None or df.empty:
+        return {
+            'N': 0, 'Top1 hit %': np.nan, 'IC95% Top1 low %': np.nan,
+            'IC95% Top1 high %': np.nan, 'Top4 hit %': np.nan,
+            'Prob. media Top1 %': np.nan, 'Margine medio pp': np.nan,
+            'Copertura/Prob. %': np.nan,
+        }
+    x = df.copy()
+    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
+    x['hit_at_1'] = pd.to_numeric(x['hit_at_1'], errors='coerce')
+    x['hit_at_4'] = pd.to_numeric(x['hit_at_4'], errors='coerce')
+    if 'margin_top1_top2' in x.columns:
+        x['margin_top1_top2'] = pd.to_numeric(x['margin_top1_top2'], errors='coerce')
+    x = x[x['top1_prob'] >= prob_threshold].copy()
+    x = x.dropna(subset=['hit_at_1','hit_at_4','top1_prob'])
+    if x.empty:
+        return {
+            'N': 0, 'Top1 hit %': np.nan, 'IC95% Top1 low %': np.nan,
+            'IC95% Top1 high %': np.nan, 'Top4 hit %': np.nan,
+            'Prob. media Top1 %': np.nan, 'Margine medio pp': np.nan,
+            'Copertura/Prob. %': np.nan,
+        }
+    n = len(x)
+    wins = int(x['hit_at_1'].sum())
+    lo, hi = _v14_7_wilson_interval(wins, n)
+    mean_p = float(x['top1_prob'].mean())
+    return {
+        'N': int(n),
+        'Top1 hit %': 100.0 * wins / n,
+        'IC95% Top1 low %': 100.0 * lo,
+        'IC95% Top1 high %': 100.0 * hi,
+        'Top4 hit %': 100.0 * float(x['hit_at_4'].mean()),
+        'Prob. media Top1 %': 100.0 * mean_p,
+        'Margine medio pp': 100.0 * float(x['margin_top1_top2'].mean()) if 'margin_top1_top2' in x.columns else np.nan,
+        'Copertura/Prob. %': 100.0 * float(x['hit_at_1'].mean()) / max(1e-9, mean_p),
+    }
+
+
+def mostra_v14_7_threshold_stability(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.7 — STABILITÀ SOGLIA TOP 1 ≥ 35%')
+    st.caption('La soglia del 35% è fissata ex ante. Il test confronta tutto lo storico OOS con la sola stagione corrente OOS, senza modificare l’operativa.')
+    with st.expander('Apri V14.7 — Threshold Stability', expanded=False):
+        if st.button('🔬 ESEGUI V14.7 — STABILITÀ SOGLIA 35%', key='v14_7_run'):
+            all_hist=[]; all_current=[]; errors=[]
+            with st.spinner('Verifica stabilità della soglia ≥35% sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        # Tutto lo storico OOS
+                        _, d_all = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
+                        if d_all is not None and not d_all.empty:
+                            all_hist.append(d_all.assign(Campionato=camp, Periodo='Tutto lo storico OOS'))
+                        # Stagione corrente OOS
+                        _, d_cur = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, True)
+                        if d_cur is not None and not d_cur.empty:
+                            all_current.append(d_cur.assign(Campionato=camp, Periodo='Stagione corrente OOS'))
+                    except Exception as e:
+                        errors.append((camp, f'{type(e).__name__}: {e}'))
+
+            frames = all_hist + all_current
+            if frames:
+                all_df = pd.concat(frames, ignore_index=True)
+
+                st.markdown('### 1. Confronto aggregato')
+                rows=[]
+                for periodo, g in all_df.groupby('Periodo'):
+                    s = _v14_7_stability_summary(g, 0.35)
+                    rows.append({'Periodo':periodo, **s})
+                agg=pd.DataFrame(rows)
+                st.dataframe(agg.round(4), use_container_width=True, hide_index=True)
+                st.caption('IC95% = intervallo di confidenza binomiale di Wilson per il Top 1 hit rate. Non è una garanzia predittiva futura.')
+
+                st.markdown('### 2. Per campionato e periodo')
+                rows=[]
+                for (camp, periodo), g in all_df.groupby(['Campionato','Periodo']):
+                    s=_v14_7_stability_summary(g,0.35)
+                    rows.append({'Campionato':camp, 'Periodo':periodo, **s})
+                per=pd.DataFrame(rows)
+                st.dataframe(per.round(4), use_container_width=True, hide_index=True)
+
+                st.markdown('### 3. Stabilità del campione')
+                hist_n = int((all_df[all_df['Periodo']=='Tutto lo storico OOS']['top1_prob'] >= 0.35).sum()) if 'Tutto lo storico OOS' in set(all_df['Periodo']) else 0
+                cur_n = int((all_df[all_df['Periodo']=='Stagione corrente OOS']['top1_prob'] >= 0.35).sum()) if 'Stagione corrente OOS' in set(all_df['Periodo']) else 0
+                st.write(f'**Selezioni ≥35%:** storico {hist_n} · stagione corrente {cur_n}.')
+                if hist_n > 0 and cur_n > 0:
+                    h = _v14_7_stability_summary(all_df[all_df['Periodo']=='Tutto lo storico OOS'],0.35)
+                    c = _v14_7_stability_summary(all_df[all_df['Periodo']=='Stagione corrente OOS'],0.35)
+                    delta = c['Top1 hit %'] - h['Top1 hit %']
+                    st.info(f"Differenza hit rate stagione corrente − storico: **{delta:+.2f} pp**. Il confronto serve a verificare stabilità, non a scegliere automaticamente una nuova soglia.")
+
+                out = all_df[['Campionato','Periodo','data','casa','trasferta','true_combo','top1_combo','top1_prob','hit_at_1','hit_at_4','margin_top1_top2']].copy()
+                st.download_button(
+                    '⬇️ Scarica V14.7 threshold stability CSV',
+                    data=out.to_csv(index=False).encode('utf-8'),
+                    file_name='V14_7_threshold_stability_35pct.csv',
+                    mime='text/csv', key='v14_7_dl'
+                )
+
+            if errors:
+                st.warning('Campionati non completati:')
+                for nome,msg in errors:
+                    st.write(f'- **{nome}**: {msg}')
+
+mostra_v14_7_threshold_stability(rho_val, ewma_span_val, emivita_val)
