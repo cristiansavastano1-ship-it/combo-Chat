@@ -4621,3 +4621,153 @@ def mostra_v14_8_threshold_sensitivity(rho, ewma_span, emivita):
                     st.write(f'- **{nome}**: {msg}')
 
 mostra_v14_8_threshold_sensitivity(rho_val, ewma_span_val, emivita_val)
+
+# =====================================================================
+# 🧪 V14.9 — STABILITÀ TEMPORALE DELLA SOGLIA 35% (SOLO DIAGNOSTICO)
+# Divide lo storico OOS in 4 finestre cronologiche di numerosità simile e
+# verifica se la selezione Top1 >=35% mantiene comportamento coerente nel tempo.
+# Nessuna modifica all'operativa e nessuna ottimizzazione della soglia.
+# =====================================================================
+
+def _v14_9_window_summary(df, prob_threshold=0.35):
+    if df is None or df.empty:
+        return {
+            'N OOS': 0, 'N selezioni >= soglia': 0,
+            'Quota selezionata %': np.nan, 'Top1 hit %': np.nan,
+            'IC95% Top1 low %': np.nan, 'IC95% Top1 high %': np.nan,
+            'Top4 hit %': np.nan, 'Prob. media Top1 %': np.nan,
+            'Margine medio pp': np.nan, 'Copertura/Prob. %': np.nan,
+        }
+    x = df.copy()
+    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
+    if 'hit_at_1' not in x.columns and 'top1_hit' in x.columns:
+        x['hit_at_1'] = x['top1_hit']
+    if 'hit_at_4' not in x.columns and 'top4_hit' in x.columns:
+        x['hit_at_4'] = x['top4_hit']
+    if 'margin_top1_top2' not in x.columns and {'top1_prob','top2_prob'}.issubset(x.columns):
+        x['margin_top1_top2'] = (
+            pd.to_numeric(x['top1_prob'], errors='coerce')
+            - pd.to_numeric(x['top2_prob'], errors='coerce')
+        )
+    x['hit_at_1'] = pd.to_numeric(x.get('hit_at_1'), errors='coerce')
+    x['hit_at_4'] = pd.to_numeric(x.get('hit_at_4'), errors='coerce')
+    x['margin_top1_top2'] = pd.to_numeric(x.get('margin_top1_top2'), errors='coerce')
+    x = x.dropna(subset=['top1_prob','hit_at_1','hit_at_4'])
+    n_oos = len(x)
+    s = x[x['top1_prob'] >= prob_threshold].copy()
+    n = len(s)
+    if n == 0:
+        return {
+            'N OOS': int(n_oos), 'N selezioni >= soglia': 0,
+            'Quota selezionata %': 0.0, 'Top1 hit %': np.nan,
+            'IC95% Top1 low %': np.nan, 'IC95% Top1 high %': np.nan,
+            'Top4 hit %': np.nan, 'Prob. media Top1 %': np.nan,
+            'Margine medio pp': np.nan, 'Copertura/Prob. %': np.nan,
+        }
+    wins = int(s['hit_at_1'].sum())
+    lo, hi = _v14_7_wilson_interval(wins, n)
+    mean_p = float(s['top1_prob'].mean())
+    return {
+        'N OOS': int(n_oos),
+        'N selezioni >= soglia': int(n),
+        'Quota selezionata %': 100.0 * n / max(1, n_oos),
+        'Top1 hit %': 100.0 * wins / n,
+        'IC95% Top1 low %': 100.0 * lo,
+        'IC95% Top1 high %': 100.0 * hi,
+        'Top4 hit %': 100.0 * float(s['hit_at_4'].mean()),
+        'Prob. media Top1 %': 100.0 * mean_p,
+        'Margine medio pp': 100.0 * float(s['margin_top1_top2'].mean()) if 'margin_top1_top2' in s.columns else np.nan,
+        'Copertura/Prob. %': 100.0 * float(s['hit_at_1'].mean()) / max(1e-9, mean_p),
+    }
+
+
+def mostra_v14_9_temporal_stability(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.9 — STABILITÀ TEMPORALE SOGLIA 35%')
+    st.caption('Test diagnostico: tutto lo storico OOS viene ordinato per data e diviso in 4 finestre cronologiche. La soglia 35% resta fissa ex ante e non viene ottimizzata.')
+    with st.expander('Apri V14.9 — Temporal Stability', expanded=False):
+        if st.button('🔬 ESEGUI V14.9 — STABILITÀ TEMPORALE 35%', key='v14_9_run'):
+            frames=[]; errors=[]
+            with st.spinner('Calcolo stabilità temporale sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        _, d = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
+                        if d is not None and not d.empty:
+                            frames.append(d.assign(Campionato=camp))
+                    except Exception as e:
+                        errors.append((camp, f'{type(e).__name__}: {e}'))
+
+            if frames:
+                all_df = pd.concat(frames, ignore_index=True)
+                all_df['data'] = pd.to_datetime(all_df['data'], errors='coerce')
+                all_df = all_df.dropna(subset=['data']).sort_values('data').reset_index(drop=True)
+
+                st.markdown('### 1. Stabilità aggregata per finestra cronologica')
+                n = len(all_df)
+                if n >= 20:
+                    labels = ['Finestra 1 (più vecchia)', 'Finestra 2', 'Finestra 3', 'Finestra 4 (più recente)']
+                    all_df['_window'] = pd.qcut(all_df.index, q=4, labels=labels, duplicates='drop')
+                    rows=[]
+                    for window, g in all_df.groupby('_window', observed=True):
+                        s = _v14_9_window_summary(g, 0.35)
+                        rows.append({'Finestra':str(window), **s})
+                    win_df = pd.DataFrame(rows)
+                    st.dataframe(win_df.round(4), use_container_width=True, hide_index=True)
+                    st.caption('Le finestre sono cronologiche e hanno numerosità OOS simile. Le metriche Top1/Top4 sono calcolate solo sulle selezioni con probabilità Top1 >=35%.')
+
+                    st.markdown('### 2. Dettaglio per campionato e finestra')
+                    rows=[]
+                    for camp, gc in all_df.groupby('Campionato'):
+                        if len(gc) < 20:
+                            continue
+                        gc = gc.sort_values('data').reset_index(drop=True)
+                        gc['_window'] = pd.qcut(gc.index, q=4, labels=labels, duplicates='drop')
+                        for window, g in gc.groupby('_window', observed=True):
+                            s = _v14_9_window_summary(g, 0.35)
+                            rows.append({'Campionato':camp, 'Finestra':str(window), **s})
+                    by_league = pd.DataFrame(rows)
+                    if not by_league.empty:
+                        st.dataframe(by_league.round(4), use_container_width=True, hide_index=True)
+                    else:
+                        st.info('Campioni per campionato insufficienti per creare 4 finestre affidabili.')
+
+                    st.markdown('### 3. Confronto prima vs ultima finestra')
+                    first = _v14_9_window_summary(all_df[all_df['_window'] == labels[0]], 0.35)
+                    last = _v14_9_window_summary(all_df[all_df['_window'] == labels[-1]], 0.35)
+                    cmp = pd.DataFrame([{
+                        'Metrica':'Top1 hit %', 'Prima finestra':first['Top1 hit %'], 'Ultima finestra':last['Top1 hit %'],
+                        'Delta ultima-prima pp':last['Top1 hit %'] - first['Top1 hit %']
+                    },{
+                        'Metrica':'Top4 hit %', 'Prima finestra':first['Top4 hit %'], 'Ultima finestra':last['Top4 hit %'],
+                        'Delta ultima-prima pp':last['Top4 hit %'] - first['Top4 hit %']
+                    },{
+                        'Metrica':'Prob. media Top1 %', 'Prima finestra':first['Prob. media Top1 %'], 'Ultima finestra':last['Prob. media Top1 %'],
+                        'Delta ultima-prima pp':last['Prob. media Top1 %'] - first['Prob. media Top1 %']
+                    },{
+                        'Metrica':'Margine medio pp', 'Prima finestra':first['Margine medio pp'], 'Ultima finestra':last['Margine medio pp'],
+                        'Delta ultima-prima pp':last['Margine medio pp'] - first['Margine medio pp']
+                    },{
+                        'Metrica':'Copertura/Prob. %', 'Prima finestra':first['Copertura/Prob. %'], 'Ultima finestra':last['Copertura/Prob. %'],
+                        'Delta ultima-prima pp':last['Copertura/Prob. %'] - first['Copertura/Prob. %']
+                    }])
+                    st.dataframe(cmp.round(4), use_container_width=True, hide_index=True)
+                    st.info('Questo confronto descrive l’eventuale drift temporale. Non trasferisce automaticamente alcuna modifica alla soglia o all’operativa.')
+
+                    st.markdown('### 4. Export')
+                    export_cols=['Campionato','data','casa','trasferta','true_combo','top1_combo','top1_prob','top2_prob','top1_hit','top4_hit']
+                    export_cols=[c for c in export_cols if c in all_df.columns]
+                    st.download_button(
+                        '⬇️ Scarica V14.9 temporal stability CSV',
+                        data=all_df[export_cols].to_csv(index=False).encode('utf-8'),
+                        file_name='V14_9_temporal_stability_35pct.csv',
+                        mime='text/csv', key='v14_9_dl'
+                    )
+                else:
+                    st.warning('Numero di osservazioni OOS insufficiente per una divisione in 4 finestre.')
+
+            if errors:
+                st.warning('Campionati non completati:')
+                for nome,msg in errors:
+                    st.write(f'- **{nome}**: {msg}')
+
+mostra_v14_9_temporal_stability(rho_val, ewma_span_val, emivita_val)
