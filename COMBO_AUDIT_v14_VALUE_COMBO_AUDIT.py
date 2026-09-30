@@ -5545,3 +5545,133 @@ def mostra_v14_13_platt_bootstrap(rho, ewma_span, emivita):
 
 mostra_v14_13_platt_bootstrap(rho_val, ewma_span_val, emivita_val)
 
+
+
+# =====================================================================
+# 🧪 V14.14 — SENSIBILITÀ ALLA FINESTRA DI TRAINING PLATT TOP1
+# Solo diagnostico. Confronta la stessa metodologia walk-forward Top1 >=35%
+# usando tre lunghezze massime di training: 50, 75, 100 osservazioni.
+# Nessuna modifica alle probabilità operative.
+# =====================================================================
+
+V14_14_TRAIN_WINDOWS = [50, 75, 100]
+
+
+def _v14_14_aggregate_metrics(frames, period_label):
+    """Concatena i dettagli selezionati e calcola metriche pooled, esattamente match-level."""
+    if not frames:
+        return None
+    valid = [f for f in frames if f is not None and not f.empty]
+    if not valid:
+        return None
+    g = pd.concat(valid, ignore_index=True)
+    return _v14_12_metrics(g, period_label)
+
+
+def _v14_14_current_filter(wf):
+    if wf is None or wf.empty or 'data' not in wf.columns:
+        return pd.DataFrame()
+    dates = pd.to_datetime(wf['data'], errors='coerce')
+    if not dates.notna().any():
+        return pd.DataFrame()
+    latest_year = int(dates.dt.year.max())
+    cut = pd.Timestamp(year=latest_year, month=8, day=1)
+    return wf[dates >= cut].copy()
+
+
+def mostra_v14_14_training_window_sensitivity(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.14 — SENSIBILITÀ FINESTRA TRAINING PLATT TOP1')
+    st.caption(
+        'Solo diagnostico. Soglia Top1 >=35% fissa ex ante. Confronta il walk-forward '
+        'PLATT con finestra massima 50, 75 e 100 osservazioni precedenti nello stesso '
+        'campionato. Nessuna modifica alle probabilità operative.'
+    )
+
+    with st.expander('Apri V14.14 — Training Window Sensitivity', expanded=False):
+        if st.button('🔬 ESEGUI V14.14 — SENSIBILITÀ TRAINING PLATT', key='v14_14_run'):
+            aggregate_rows = []
+            league_rows = []
+            temporal_rows = []
+            errors = []
+
+            with st.spinner('Calcolo sensibilità della finestra di training sulle 5 leghe...'):
+                for ntrain in V14_14_TRAIN_WINDOWS:
+                    all_hist = []
+                    all_curr = []
+
+                    for camp, info in CAMPIONATI_DOMESTICI.items():
+                        try:
+                            res = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
+                            if res is None:
+                                continue
+                            _, det = res
+                            if det is None or det.empty:
+                                continue
+
+                            wf, _, _ = _v14_12_walkforward_top1(
+                                det,
+                                int(ntrain),
+                                V14_12_PROB_THRESHOLD
+                            )
+                            if wf is None or wf.empty:
+                                continue
+
+                            mh = _v14_12_metrics(wf, 'Tutto lo storico OOS')
+                            if mh is not None:
+                                mh['Training max'] = int(ntrain)
+                                mh['Campionato'] = camp
+                                league_rows.append(mh)
+
+                            all_hist.append(wf.assign(Campionato=camp))
+                            curr = _v14_14_current_filter(wf)
+                            if not curr.empty:
+                                all_curr.append(curr.assign(Campionato=camp))
+
+                        except Exception as e:
+                            errors.append((camp, f'Training {ntrain}: {type(e).__name__}: {e}'))
+
+                    mh_all = _v14_14_aggregate_metrics(all_hist, 'Tutto lo storico OOS')
+                    if mh_all is not None:
+                        mh_all['Training max'] = int(ntrain)
+                        aggregate_rows.append(mh_all)
+
+                    mc_all = _v14_14_aggregate_metrics(all_curr, 'Stagione corrente OOS')
+                    if mc_all is not None:
+                        mc_all['Training max'] = int(ntrain)
+                        aggregate_rows.append(mc_all)
+
+            if aggregate_rows:
+                adf = pd.DataFrame(aggregate_rows)
+                cols = [
+                    'Periodo', 'Training max', 'N selezioni >=35%', 'N PLATT applicato',
+                    'Top1 hit %', 'RAW Prob. media %', 'PLATT Prob. media %',
+                    'RAW Gap calibrazione pp', 'PLATT Gap calibrazione pp',
+                    'RAW Brier', 'PLATT Brier', 'RAW Log Loss', 'PLATT Log Loss',
+                    'Delta Brier pp', 'Delta Log Loss'
+                ]
+                adf = adf[[c for c in cols if c in adf.columns]]
+                st.markdown('### 1. Sensibilità aggregata — storico vs stagione corrente')
+                st.dataframe(adf.round(4), use_container_width=True, hide_index=True)
+                st.caption('Delta Brier e Delta Log Loss = PLATT − RAW. Il training usa solo osservazioni precedenti nello stesso campionato.')
+
+            if league_rows:
+                ldf = pd.DataFrame(league_rows)
+                cols = [
+                    'Campionato', 'Training max', 'Periodo', 'N selezioni >=35%',
+                    'N PLATT applicato', 'Top1 hit %', 'RAW Prob. media %',
+                    'PLATT Prob. media %', 'RAW Gap calibrazione pp',
+                    'PLATT Gap calibrazione pp', 'RAW Brier', 'PLATT Brier',
+                    'RAW Log Loss', 'PLATT Log Loss', 'Delta Brier pp',
+                    'Delta Log Loss'
+                ]
+                st.markdown('### 2. Dettaglio per campionato — storico OOS')
+                st.dataframe(ldf[[c for c in cols if c in ldf.columns]].round(4), use_container_width=True, hide_index=True)
+
+            if errors:
+                st.warning('Campionati non completati:')
+                for nome, msg in errors:
+                    st.write(f'- **{nome}**: {msg}')
+
+
+mostra_v14_14_training_window_sensitivity(rho_val, ewma_span_val, emivita_val)
