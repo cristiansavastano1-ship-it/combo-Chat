@@ -1,3 +1,5 @@
+
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5026,200 +5028,302 @@ mostra_v14_10_temporal_calibration_drift(rho_val, ewma_span_val, emivita_val)
 mostra_v14_11_confidence_bands(rho_val, ewma_span_val, emivita_val)
 
 # =====================================================================
-# 🧪 V14.12 — PLATT TOP1 WALK-FORWARD (SOLO DIAGNOSTICO)
-# Calibra la probabilità Top1 combo usando esclusivamente le selezioni
-# precedenti dello stesso campionato. Nessuna modifica all'operativa.
+# 🧪 V14.12-FIX — PLATT TOP1 WALK-FORWARD (SOLO DIAGNOSTICO)
+# Fix robusto del blocco V14.12.
+# Principi:
+#   1) valutazione SOLO sulle selezioni Top1 >= 35%;
+#   2) fit per singolo campionato usando esclusivamente osservazioni precedenti;
+#   3) training massimo 100 osservazioni precedenti; minimo 50 per applicare PLATT;
+#   4) training su tutte le Top1 storiche precedenti del campionato, mentre
+#      l'universo di valutazione resta limitato alle selezioni >=35%, così
+#      ogni campionato dispone di un campione di training sufficiente;
+#   5) nessuna informazione della partita da predire entra nel fit;
+#   6) niente np.array_split su DataFrame e indexing NumPy fragile nel ramo
+#      diagnostico, per evitare il KeyError/IndexError dell'ambiente Streamlit.
 # =====================================================================
+
+V14_12_PROB_THRESHOLD = 0.35
+V14_12_MIN_TRAIN = 50
+V14_12_MAX_TRAIN = 100
 
 
 def _v14_12_fit_platt_top1(hist_df, n_train=100):
-    """Fit Platt su logit(top1_prob) con sole osservazioni precedenti.
-
-    Restituisce (modello, coefficiente, motivo, n_train_eff).
-    La calibrazione viene applicata solo con pendenza positiva.
-    """
+    """Fit Platt sulla logit della Top1 usando solo osservazioni precedenti."""
     if hist_df is None or hist_df.empty:
         return None, np.nan, 'nessun training', 0
+
     x = hist_df.copy()
-    if 'top1_prob' not in x.columns or 'top1_hit' not in x.columns:
+    required = ['top1_prob', 'top1_hit']
+    if any(c not in x.columns for c in required):
         return None, np.nan, 'colonne mancanti', 0
+
     x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
     x['top1_hit'] = pd.to_numeric(x['top1_hit'], errors='coerce')
-    x = x.dropna(subset=['top1_prob', 'top1_hit']).copy()
+    x = x.dropna(subset=required).copy()
+    x = x[x['top1_prob'].between(1e-6, 1.0 - 1e-6)]
     x['top1_hit'] = x['top1_hit'].astype(int)
-    x = x.tail(int(n_train))
+    x = x.tail(int(min(max(n_train, V14_12_MIN_TRAIN), V14_12_MAX_TRAIN)))
+
     n = len(x)
-    if n < 50:
+    if n < V14_12_MIN_TRAIN:
         return None, np.nan, 'campione insufficiente', n
-    y = x['top1_hit'].to_numpy(dtype=int)
-    if len(np.unique(y)) < 2:
+
+    y = np.asarray(x['top1_hit'].to_numpy(dtype=int)).reshape(-1)
+    if np.unique(y).size < 2:
         return None, np.nan, 'un solo esito presente nel training', n
-    p = np.clip(x['top1_prob'].to_numpy(dtype=float), 1e-6, 1.0 - 1e-6)
+
+    p = np.asarray(x['top1_prob'].to_numpy(dtype=float)).reshape(-1)
     z = np.log(p / (1.0 - p)).reshape(-1, 1)
+
     model = LogisticRegression(solver='lbfgs', C=1e6, max_iter=1000)
     model.fit(z, y)
-    coef = float(model.coef_[0, 0])
+
+    coef_arr = np.asarray(model.coef_, dtype=float).reshape(-1)
+    coef = float(coef_arr[0]) if coef_arr.size else np.nan
     if not np.isfinite(coef) or coef <= 0.0:
         return None, coef, 'fit non monotono: pendenza non positiva', n
+
     return model, coef, 'applicabile', n
 
 
 def _v14_12_predict_platt_top1(p_raw, model):
-    p_raw = float(np.clip(p_raw, 1e-6, 1.0 - 1e-6))
+    p_raw = float(np.clip(float(p_raw), 1e-6, 1.0 - 1e-6))
     if model is None:
         return p_raw
-    z = [[float(np.log(p_raw / (1.0 - p_raw)))]]
-    return float(np.clip(model.predict_proba(z)[0, 1], 1e-6, 1.0 - 1e-6))
+
+    z = np.asarray([[np.log(p_raw / (1.0 - p_raw))]], dtype=float)
+    proba = np.asarray(model.predict_proba(z), dtype=float).reshape(-1)
+    if proba.size < 2:
+        return p_raw
+    return float(np.clip(proba[1], 1e-6, 1.0 - 1e-6))
 
 
-def _v14_12_walkforward_top1(df, n_train=100):
-    """Confronto RAW vs PLATT Top1 su un singolo campionato.
+def _v14_12_metrics(g, period_label):
+    """Metriche su un gruppo di selezioni >=35%."""
+    if g is None or g.empty:
+        return None
 
-    Il fit a ogni osservazione usa solo le precedenti N selezioni dello
-    stesso campionato e non usa mai l'esito della partita da predire.
-    """
+    y = np.asarray(g['top1_hit'].to_numpy(dtype=float)).reshape(-1)
+    p0 = np.clip(np.asarray(g['top1_prob_raw'].to_numpy(dtype=float)).reshape(-1), 1e-6, 1.0 - 1e-6)
+    p1 = np.clip(np.asarray(g['top1_prob_platt'].to_numpy(dtype=float)).reshape(-1), 1e-6, 1.0 - 1e-6)
+
+    return {
+        'Periodo': period_label,
+        'N selezioni >=35%': int(len(g)),
+        'N PLATT applicato': int(g['platt_applied'].sum()) if 'platt_applied' in g.columns else int(len(g)),
+        'Top1 hit %': 100.0 * float(y.mean()),
+        'RAW Prob. media %': 100.0 * float(p0.mean()),
+        'PLATT Prob. media %': 100.0 * float(p1.mean()),
+        'RAW Gap calibrazione pp': 100.0 * float(y.mean() - p0.mean()),
+        'PLATT Gap calibrazione pp': 100.0 * float(y.mean() - p1.mean()),
+        'RAW Brier': float(np.mean((p0 - y) ** 2)),
+        'PLATT Brier': float(np.mean((p1 - y) ** 2)),
+        'RAW Log Loss': float(-np.mean(y * np.log(p0) + (1.0 - y) * np.log(1.0 - p0))),
+        'PLATT Log Loss': float(-np.mean(y * np.log(p1) + (1.0 - y) * np.log(1.0 - p1))),
+        'Delta Brier pp': 100.0 * float(np.mean((p1 - y) ** 2) - np.mean((p0 - y) ** 2)),
+        'Delta Log Loss': float(
+            -np.mean(y * np.log(p1) + (1.0 - y) * np.log(1.0 - p1))
+            + np.mean(y * np.log(p0) + (1.0 - y) * np.log(1.0 - p0))
+        ),
+    }
+
+
+def _v14_12_walkforward_top1(df, n_train=100, prob_threshold=V14_12_PROB_THRESHOLD):
+    """Walk-forward robusto: fit sul passato, valutazione solo Top1 >=35%."""
     if df is None or df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
     x = df.copy()
     if 'data' in x.columns:
         x['data'] = pd.to_datetime(x['data'], errors='coerce')
-        x = x.sort_values('data').reset_index(drop=True)
+        x = x.sort_values(['data'], kind='mergesort').reset_index(drop=True)
+
     required = ['top1_prob', 'top1_hit']
     if any(c not in x.columns for c in required):
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
     x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
     x['top1_hit'] = pd.to_numeric(x['top1_hit'], errors='coerce')
-    x = x.dropna(subset=required).reset_index(drop=True)
+    x = x.dropna(subset=required).copy().reset_index(drop=True)
+    x['top1_hit'] = x['top1_hit'].astype(int)
 
     rows = []
+    train_limit = int(min(max(n_train, V14_12_MIN_TRAIN), V14_12_MAX_TRAIN))
+
     for i in range(len(x)):
-        p_raw = float(x.loc[i, 'top1_prob'])
-        y = int(x.loc[i, 'top1_hit'])
-        prior = x.iloc[:i][['top1_prob', 'top1_hit']]
-        model, coef, reason, n_eff = _v14_12_fit_platt_top1(prior, n_train=n_train)
-        p_platt = _v14_12_predict_platt_top1(p_raw, model) if model is not None else p_raw
-        rows.append({
-            **{k: x.loc[i, k] for k in ['data', 'casa', 'trasferta'] if k in x.columns},
-            'top1_hit': y,
-            'top1_prob_raw': p_raw,
-            'top1_prob_platt': p_platt,
-            'platt_applied': bool(model is not None),
-            'platt_coef': coef,
-            'platt_train_n': n_eff,
-            'platt_reason': reason,
-        })
+        p_raw = float(x.iloc[i]['top1_prob'])
+        if not np.isfinite(p_raw):
+            continue
+        y = int(x.iloc[i]['top1_hit'])
+
+        # La partita entra nella valutazione solo se supera la soglia 35%.
+        selected = p_raw >= float(prob_threshold)
+
+        prior = x.iloc[:i][['top1_prob', 'top1_hit']].copy()
+        model = None
+        coef = np.nan
+        reason = 'non selezionata < soglia'
+        n_eff = min(len(prior), train_limit)
+
+        if selected:
+            model, coef, reason, n_eff = _v14_12_fit_platt_top1(prior, n_train=train_limit)
+
+        p_platt = _v14_12_predict_platt_top1(p_raw, model) if selected else p_raw
+
+        # Dettaglio solo per l'universo selezionato >=35%, così il CSV è coerente
+        # con V14.11 e con il test di calibrazione che stiamo approfondendo.
+        if selected:
+            row = {
+                **{k: x.iloc[i][k] for k in ['data', 'casa', 'trasferta'] if k in x.columns},
+                'top1_hit': y,
+                'top1_prob_raw': p_raw,
+                'top1_prob_platt': p_platt,
+                'platt_applied': bool(model is not None),
+                'platt_coef': coef,
+                'platt_train_n': int(n_eff),
+                'platt_reason': reason,
+            }
+            rows.append(row)
 
     out = pd.DataFrame(rows)
     if out.empty:
         return out, pd.DataFrame(), pd.DataFrame()
 
-    # Per validare la calibrazione walk-forward, confrontiamo RAW e PLATT
-    # solo sulle osservazioni su cui PLATT è stato realmente applicato.
-    applied = out[out['platt_applied']].copy()
-    if applied.empty:
-        return out, pd.DataFrame(), pd.DataFrame()
+    # Le righe precedenti alla disponibilità di almeno 50 osservazioni restano
+    # nell'universo ma RAW=PLATT e sono marcate platt_applied=False.
+    summary_rows = []
+    all_metrics = _v14_12_metrics(out, 'Tutto lo storico OOS')
+    if all_metrics is not None:
+        summary_rows.append(all_metrics)
 
-    def _metrics(g, period_label):
-        y = g['top1_hit'].to_numpy(dtype=float)
-        p0 = np.clip(g['top1_prob_raw'].to_numpy(dtype=float), 1e-6, 1-1e-6)
-        p1 = np.clip(g['top1_prob_platt'].to_numpy(dtype=float), 1e-6, 1-1e-6)
-        return pd.DataFrame([
-            {
-                'Periodo': period_label,
-                'N': int(len(g)),
-                'RAW Top1 hit %': 100.0 * y.mean(),
-                'PLATT Top1 hit %': 100.0 * y.mean(),
-                'RAW Prob. media %': 100.0 * p0.mean(),
-                'PLATT Prob. media %': 100.0 * p1.mean(),
-                'RAW Gap calibrazione pp': 100.0 * (y.mean() - p0.mean()),
-                'PLATT Gap calibrazione pp': 100.0 * (y.mean() - p1.mean()),
-                'RAW Brier': float(np.mean((p0-y)**2)),
-                'PLATT Brier': float(np.mean((p1-y)**2)),
-                'RAW Log Loss': float(-np.mean(y*np.log(p0)+(1-y)*np.log(1-p0))),
-                'PLATT Log Loss': float(-np.mean(y*np.log(p1)+(1-y)*np.log(1-p1))),
-                'Delta Brier pp': 100.0 * (np.mean((p1-y)**2) - np.mean((p0-y)**2)),
-                'Delta Log Loss': float(-np.mean(y*np.log(p1)+(1-y)*np.log(1-p1)) + np.mean(y*np.log(p0)+(1-y)*np.log(1-p0))),
-            }
-        ])
-
-    summary_rows = [_metrics(applied, 'Tutto lo storico OOS')]
-    if 'data' in applied.columns and applied['data'].notna().any():
-        latest_year = int(pd.to_datetime(applied['data']).dt.year.max())
+    if 'data' in out.columns and out['data'].notna().any():
+        latest_year = int(pd.to_datetime(out['data'], errors='coerce').dt.year.max())
         cut = pd.Timestamp(year=latest_year, month=8, day=1)
-        curr = applied[pd.to_datetime(applied['data']) >= cut].copy()
+        curr = out[pd.to_datetime(out['data'], errors='coerce') >= cut].copy()
         if not curr.empty:
-            summary_rows.append(_metrics(curr, 'Stagione corrente OOS'))
-    summary = pd.concat(summary_rows, ignore_index=True)
+            current_metrics = _v14_12_metrics(curr, 'Stagione corrente OOS')
+            if current_metrics is not None:
+                summary_rows.append(current_metrics)
 
-    # Stabilità per 4 finestre temporali sulle sole osservazioni PLATT-applicate.
-    temporal = []
-    if len(applied) >= 20:
-        chunks = np.array_split(applied, 4)
+    summary = pd.DataFrame(summary_rows)
+
+    # Stabilità temporale: quattro finestre con split sugli INDICI, non np.array_split.
+    temporal_rows = []
+    n = len(out)
+    if n >= 20:
+        edges = np.linspace(0, n, 5, dtype=int)
         labels = ['Finestra 1 (più vecchia)', 'Finestra 2', 'Finestra 3', 'Finestra 4 (più recente)']
-        for lab, ch in zip(labels, chunks):
-            if len(ch):
-                temporal.append(_metrics(ch, lab))
-    temporal_df = pd.concat(temporal, ignore_index=True) if temporal else pd.DataFrame()
+        for j, lab in enumerate(labels):
+            a, b = int(edges[j]), int(edges[j + 1])
+            ch = out.iloc[a:b].copy()
+            if not ch.empty:
+                met = _v14_12_metrics(ch, lab)
+                if met is not None:
+                    temporal_rows.append(met)
 
+    temporal_df = pd.DataFrame(temporal_rows)
     return out, summary, temporal_df
 
 
 def mostra_v14_12_top1_platt_walkforward(rho, ewma_span, emivita):
     st.divider()
-    st.markdown('## 🧪 V14.12 — PLATT TOP1 WALK-FORWARD')
-    st.caption('Solo diagnostico: calibra la probabilità Top1 con le sole selezioni precedenti dello stesso campionato. Training massimo 100 selezioni, minimo 50. Nessuna modifica alle probabilità operative.')
-    with st.expander('Apri V14.12 — PLATT Top1 Walk-Forward', expanded=False):
-        ntrain = st.number_input('Training PLATT Top1 (massimo)', 50, 200, 100, 10, key='v14_12_train')
-        if st.button('🔬 ESEGUI V14.12 — PLATT TOP1 WALK-FORWARD', key='v14_12_run'):
+    st.markdown('## 🧪 V14.12-FIX — PLATT TOP1 WALK-FORWARD ≥35%')
+    st.caption(
+        'Solo diagnostico. La valutazione usa esclusivamente selezioni Top1 ≥35%. '
+        'Il fit è walk-forward per singolo campionato e usa solo osservazioni precedenti; '
+        'training massimo 100, minimo 50. Nessuna modifica alle probabilità operative.'
+    )
+
+    with st.expander('Apri V14.12-FIX — PLATT Top1 Walk-Forward ≥35%', expanded=False):
+        ntrain = st.number_input(
+            'Training PLATT Top1 (massimo)',
+            V14_12_MIN_TRAIN,
+            V14_12_MAX_TRAIN,
+            100,
+            10,
+            key='v14_12_fix_train'
+        )
+
+        if st.button('🔬 ESEGUI V14.12-FIX — PLATT TOP1 ≥35%', key='v14_12_fix_run'):
             summary_frames = []
             temporal_frames = []
             detail_frames = []
             errors = []
-            with st.spinner('Calcolo PLATT walk-forward Top1 sulle 5 leghe...'):
+
+            with st.spinner('Calcolo PLATT walk-forward Top1 ≥35% sulle 5 leghe...'):
                 for camp, info in CAMPIONATI_DOMESTICI.items():
                     try:
-                        _, det = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
+                        res = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
+                        if res is None:
+                            continue
+                        _, det = res
                         if det is None or det.empty:
                             continue
-                        wf, sm, tm = _v14_12_walkforward_top1(det, int(ntrain))
+
+                        wf, sm, tm = _v14_12_walkforward_top1(
+                            det,
+                            int(ntrain),
+                            V14_12_PROB_THRESHOLD
+                        )
+
                         if not sm.empty:
                             summary_frames.append(sm.assign(Campionato=camp))
                         if not tm.empty:
                             temporal_frames.append(tm.assign(Campionato=camp))
                         if not wf.empty:
                             detail_frames.append(wf.assign(Campionato=camp))
+
                     except Exception as e:
+                        # Mostra il tipo e il messaggio; non nasconde il punto
+                        # del nuovo blocco diagnostico dietro un errore generico.
                         errors.append((camp, f'{type(e).__name__}: {e}'))
 
             if summary_frames:
                 sdf = pd.concat(summary_frames, ignore_index=True)
-                st.markdown('### 1. RAW vs PLATT — aggregato per campionato')
-                st.dataframe(sdf.round(4), use_container_width=True, hide_index=True)
-                st.caption('Delta Brier pp e Delta Log Loss sono PLATT − RAW: valori negativi indicano miglioramento di PLATT.')
+                sdf = sdf[
+                    [
+                        'Campionato', 'Periodo', 'N selezioni >=35%', 'N PLATT applicato',
+                        'Top1 hit %', 'RAW Prob. media %', 'PLATT Prob. media %',
+                        'RAW Gap calibrazione pp', 'PLATT Gap calibrazione pp',
+                        'RAW Brier', 'PLATT Brier', 'RAW Log Loss', 'PLATT Log Loss',
+                        'Delta Brier pp', 'Delta Log Loss'
+                    ]
+                ]
 
-                agg = []
-                for periodo, g in sdf.groupby('Periodo'):
-                    def _wavg(col):
-                        return float(np.average(g[col], weights=g['N'])) if g['N'].sum() else np.nan
-                    agg.append({
+                st.markdown('### 1. RAW vs PLATT — per campionato')
+                st.dataframe(sdf.round(4), use_container_width=True, hide_index=True)
+                st.caption('Delta Brier pp e Delta Log Loss = PLATT − RAW. Valori negativi indicano miglioramento di PLATT.')
+
+                agg_rows = []
+                for periodo, g in sdf.groupby('Periodo', sort=False):
+                    weights = g['N selezioni >=35%'].astype(float)
+                    total_w = float(weights.sum())
+                    if total_w <= 0:
+                        continue
+
+                    def wavg(col):
+                        return float(np.average(g[col].astype(float), weights=weights))
+
+                    agg_rows.append({
                         'Periodo': periodo,
-                        'N': int(g['N'].sum()),
-                        'RAW Top1 hit %': _wavg('RAW Top1 hit %'),
-                        'PLATT Top1 hit %': _wavg('PLATT Top1 hit %'),
-                        'RAW Prob. media %': _wavg('RAW Prob. media %'),
-                        'PLATT Prob. media %': _wavg('PLATT Prob. media %'),
-                        'RAW Gap calibrazione pp': _wavg('RAW Gap calibrazione pp'),
-                        'PLATT Gap calibrazione pp': _wavg('PLATT Gap calibrazione pp'),
-                        'RAW Brier': _wavg('RAW Brier'),
-                        'PLATT Brier': _wavg('PLATT Brier'),
-                        'RAW Log Loss': _wavg('RAW Log Loss'),
-                        'PLATT Log Loss': _wavg('PLATT Log Loss'),
-                        'Delta Brier pp': _wavg('Delta Brier pp'),
-                        'Delta Log Loss': _wavg('Delta Log Loss'),
+                        'N selezioni >=35%': int(weights.sum()),
+                        'N PLATT applicato': int(g['N PLATT applicato'].sum()),
+                        'Top1 hit %': wavg('Top1 hit %'),
+                        'RAW Prob. media %': wavg('RAW Prob. media %'),
+                        'PLATT Prob. media %': wavg('PLATT Prob. media %'),
+                        'RAW Gap calibrazione pp': wavg('RAW Gap calibrazione pp'),
+                        'PLATT Gap calibrazione pp': wavg('PLATT Gap calibrazione pp'),
+                        'RAW Brier': wavg('RAW Brier'),
+                        'PLATT Brier': wavg('PLATT Brier'),
+                        'RAW Log Loss': wavg('RAW Log Loss'),
+                        'PLATT Log Loss': wavg('PLATT Log Loss'),
+                        'Delta Brier pp': wavg('Delta Brier pp'),
+                        'Delta Log Loss': wavg('Delta Log Loss'),
                     })
-                if agg:
+
+                if agg_rows:
                     st.markdown('### 2. RAW vs PLATT — aggregato tutte le leghe')
-                    st.dataframe(pd.DataFrame(agg).round(4), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(agg_rows).round(4), use_container_width=True, hide_index=True)
 
             if temporal_frames:
                 st.markdown('### 3. Stabilità temporale del confronto')
@@ -5228,15 +5332,19 @@ def mostra_v14_12_top1_platt_walkforward(rho, ewma_span, emivita):
 
             if detail_frames:
                 dd = pd.concat(detail_frames, ignore_index=True)
-                export_cols = ['Campionato','data','casa','trasferta','top1_hit','top1_prob_raw','top1_prob_platt','platt_applied','platt_coef','platt_train_n','platt_reason']
+                export_cols = [
+                    'Campionato', 'data', 'casa', 'trasferta', 'top1_hit',
+                    'top1_prob_raw', 'top1_prob_platt', 'platt_applied',
+                    'platt_coef', 'platt_train_n', 'platt_reason'
+                ]
                 export_cols = [c for c in export_cols if c in dd.columns]
                 st.markdown('### 4. Export dettaglio walk-forward')
                 st.download_button(
-                    '⬇️ Scarica V14.12 PLATT Top1 dettaglio CSV',
+                    '⬇️ Scarica V14.12-FIX PLATT Top1 dettaglio CSV',
                     data=dd[export_cols].to_csv(index=False).encode('utf-8'),
-                    file_name='V14_12_top1_platt_walkforward.csv',
+                    file_name='V14_12_FIX_top1_platt_walkforward_35pct.csv',
                     mime='text/csv',
-                    key='v14_12_dl'
+                    key='v14_12_fix_dl'
                 )
 
             if errors:
