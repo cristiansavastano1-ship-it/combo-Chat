@@ -1,5 +1,4 @@
 
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5354,3 +5353,195 @@ def mostra_v14_12_top1_platt_walkforward(rho, ewma_span, emivita):
 
 
 mostra_v14_12_top1_platt_walkforward(rho_val, ewma_span_val, emivita_val)
+
+# =====================================================================
+# 🧪 V14.13 — PLATT TOP1: BOOTSTRAP PAIRED + TEST DI SEGNO
+# Solo diagnostico. Quantifica l'incertezza della differenza RAW vs PLATT
+# sulle stesse selezioni OOS. Nessuna modifica alle probabilità operative.
+# =====================================================================
+
+V14_13_BOOTSTRAPS = 10000
+V14_13_SEED = 20260930
+
+
+def _v14_13_bootstrap_ci(delta_values, n_boot=V14_13_BOOTSTRAPS, seed=V14_13_SEED):
+    """Bootstrap CI percentile per una differenza paired osservata per match."""
+    arr = np.asarray(delta_values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    n = int(arr.size)
+    if n < 2:
+        return np.nan, np.nan, np.nan, n
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n, size=(int(n_boot), n))
+    means = arr[idx].mean(axis=1)
+    lo, hi = np.percentile(means, [2.5, 97.5])
+    return float(arr.mean()), float(lo), float(hi), n
+
+
+def _v14_13_sign_permutation_p(delta_values, n_perm=V14_13_BOOTSTRAPS, seed=V14_13_SEED):
+    """Paired random-sign permutation test della media, H0: differenza=0."""
+    arr = np.asarray(delta_values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    n = int(arr.size)
+    if n < 2:
+        return np.nan, n
+    observed = abs(float(arr.mean()))
+    rng = np.random.default_rng(seed + 17)
+    chunk = max(1, int(n_perm))
+    hits = 0
+    done = 0
+    while done < int(n_perm):
+        m = min(chunk, int(n_perm) - done)
+        signs = rng.choice(np.array([-1.0, 1.0]), size=(m, n))
+        perm = np.abs((signs * arr).mean(axis=1))
+        hits += int(np.sum(perm >= observed))
+        done += m
+    p = (hits + 1.0) / (float(n_perm) + 1.0)
+    return float(p), n
+
+
+def _v14_13_compare(g, periodo, n_boot=V14_13_BOOTSTRAPS, seed=V14_13_SEED):
+    if g is None or g.empty:
+        return None
+    y = np.asarray(g['top1_hit'].to_numpy(dtype=float)).reshape(-1)
+    raw = np.clip(np.asarray(g['top1_prob_raw'].to_numpy(dtype=float)).reshape(-1), 1e-6, 1.0 - 1e-6)
+    platt = np.clip(np.asarray(g['top1_prob_platt'].to_numpy(dtype=float)).reshape(-1), 1e-6, 1.0 - 1e-6)
+
+    d_brier = (platt - y) ** 2 - (raw - y) ** 2
+    d_ll = -(y * np.log(platt) + (1.0 - y) * np.log(1.0 - platt)) + (
+        y * np.log(raw) + (1.0 - y) * np.log(1.0 - raw)
+    )
+    # Calibrazione: gap = reale - probabilità; delta PLATT-RAW
+    d_gap = 100.0 * float(np.mean(y - platt) - np.mean(y - raw))
+
+    b_mean, b_lo, b_hi, n_b = _v14_13_bootstrap_ci(d_brier, n_boot=n_boot, seed=seed)
+    l_mean, l_lo, l_hi, n_l = _v14_13_bootstrap_ci(d_ll, n_boot=n_boot, seed=seed + 1)
+    p_b, _ = _v14_13_sign_permutation_p(d_brier, n_perm=n_boot, seed=seed + 2)
+    p_l, _ = _v14_13_sign_permutation_p(d_ll, n_perm=n_boot, seed=seed + 3)
+
+    return {
+        'Periodo': periodo,
+        'N': int(len(g)),
+        'N PLATT applicato': int(g['platt_applied'].sum()) if 'platt_applied' in g.columns else int(len(g)),
+        'Delta Brier medio pp': 100.0 * b_mean,
+        'IC95% Delta Brier low pp': 100.0 * b_lo,
+        'IC95% Delta Brier high pp': 100.0 * b_hi,
+        'p permutazione Brier': p_b,
+        'Delta Log Loss medio': l_mean,
+        'IC95% Delta Log Loss low': l_lo,
+        'IC95% Delta Log Loss high': l_hi,
+        'p permutazione Log Loss': p_l,
+        'Delta Gap calibrazione pp': d_gap,
+        'Prob. media RAW %': 100.0 * float(raw.mean()),
+        'Prob. media PLATT %': 100.0 * float(platt.mean()),
+    }
+
+
+def mostra_v14_13_platt_bootstrap(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.13 — PLATT TOP1: BOOTSTRAP PAIRED')
+    st.caption(
+        'Solo diagnostico. Usa le stesse selezioni OOS di V14.12-FIX e quantifica '
+        'l\'incertezza della differenza RAW vs PLATT con bootstrap paired e test '
+        'a randomizzazione dei segni. Nessuna modifica alle probabilità operative.'
+    )
+
+    with st.expander('Apri V14.13 — Bootstrap paired RAW vs PLATT', expanded=False):
+        ntrain = st.number_input(
+            'Training PLATT Top1 (massimo)',
+            V14_12_MIN_TRAIN,
+            V14_12_MAX_TRAIN,
+            100,
+            10,
+            key='v14_13_train'
+        )
+        nboot = st.number_input(
+            'Numero bootstrap/permutazioni',
+            2000,
+            50000,
+            V14_13_BOOTSTRAPS,
+            1000,
+            key='v14_13_boots'
+        )
+
+        if st.button('🔬 ESEGUI V14.13 — BOOTSTRAP PLATT TOP1', key='v14_13_run'):
+            summary_rows = []
+            by_league_rows = []
+            errors = []
+
+            with st.spinner('Calcolo V14.13 sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        res = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
+                        if res is None:
+                            continue
+                        _, det = res
+                        if det is None or det.empty:
+                            continue
+                        wf, _, _ = _v14_12_walkforward_top1(
+                            det,
+                            int(ntrain),
+                            V14_12_PROB_THRESHOLD
+                        )
+                        if wf.empty:
+                            continue
+
+                        # Aggregato storico
+                        met = _v14_13_compare(wf, 'Tutto lo storico OOS', n_boot=int(nboot), seed=V14_13_SEED)
+                        if met is not None:
+                            summary_rows.append(met)
+
+                        # Stagione corrente: stessa convenzione V14.12 (dal 1 agosto dell'anno massimo).
+                        if 'data' in wf.columns:
+                            dates = pd.to_datetime(wf['data'], errors='coerce')
+                            if dates.notna().any():
+                                latest_year = int(dates.dt.year.max())
+                                cut = pd.Timestamp(year=latest_year, month=8, day=1)
+                                curr = wf[dates >= cut].copy()
+                                metc = _v14_13_compare(curr, 'Stagione corrente OOS', n_boot=int(nboot), seed=V14_13_SEED + 100) if not curr.empty else None
+                                if metc is not None:
+                                    summary_rows.append(metc)
+
+                        by_league = _v14_13_compare(wf, 'Tutto lo storico OOS', n_boot=int(nboot), seed=V14_13_SEED + 200)
+                        if by_league is not None:
+                            by_league['Campionato'] = camp
+                            by_league_rows.append(by_league)
+                            # dettaglio corrente per lega
+                            if 'data' in wf.columns:
+                                dates = pd.to_datetime(wf['data'], errors='coerce')
+                                if dates.notna().any():
+                                    latest_year = int(dates.dt.year.max())
+                                    cut = pd.Timestamp(year=latest_year, month=8, day=1)
+                                    curr = wf[dates >= cut].copy()
+                                    curm = _v14_13_compare(curr, 'Stagione corrente OOS', n_boot=int(nboot), seed=V14_13_SEED + 300) if not curr.empty else None
+                                    if curm is not None:
+                                        curm['Campionato'] = camp
+                                        by_league_rows.append(curm)
+
+                    except Exception as e:
+                        errors.append((camp, f'{type(e).__name__}: {e}'))
+
+            if summary_rows:
+                sdf = pd.DataFrame(summary_rows)
+                st.markdown('### 1. Incertezza aggregata')
+                st.dataframe(sdf.round(4), use_container_width=True, hide_index=True)
+                st.caption(
+                    'Delta Brier e Delta Log Loss = PLATT − RAW. Intervalli al 95% ottenuti '
+                    'con bootstrap paired; p-value da randomizzazione dei segni. '
+                    'Valori negativi della delta indicano una riduzione della metrica.'
+                )
+                st.info(f'Bootstrap/permutazioni richiesti: {int(nboot):,}. Seed fisso: {V14_13_SEED}.')
+
+            if by_league_rows:
+                ldf = pd.DataFrame(by_league_rows)
+                st.markdown('### 2. Dettaglio per campionato')
+                st.dataframe(ldf.round(4), use_container_width=True, hide_index=True)
+
+            if errors:
+                st.warning('Campionati non completati:')
+                for nome, msg in errors:
+                    st.write(f'- **{nome}**: {msg}')
+
+
+mostra_v14_13_platt_bootstrap(rho_val, ewma_span_val, emivita_val)
+
