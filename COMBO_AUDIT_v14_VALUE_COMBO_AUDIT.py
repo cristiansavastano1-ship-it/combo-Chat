@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5982,3 +5983,247 @@ def mostra_v14_16_final_freeze(rho, ewma_span, emivita):
 
 
 mostra_v14_16_final_freeze(rho_val, ewma_span_val, emivita_val)
+
+
+# =====================================================================
+# 💰 V14.17 — FINAL ECONOMIC HOLDOUT: O/U 2.5 RAW vs PLATT (TRAIN=100)
+# Solo diagnostico. Ultimo test economico della calibrazione PLATT con quote
+# storiche realmente presenti nel dataset. Il blocco temporale e' lo stesso
+# holdout finale del 20% usato da V14.16. La selezione economica usa soglie
+# EV fissate ex ante (0%, 5%, 10%) e confronta RAW vs PLATT.
+# IMPORTANTISSIMO: le combo libere non hanno una quota bookmaker eseguibile
+# nel dataset; per questo NON viene inventato un ROI combo. Qui si misura
+# esclusivamente l'effetto economico di PLATT sul mercato O/U 2.5 quotato.
+# =====================================================================
+
+V14_17_TRAIN = 100
+V14_17_PROB_THRESHOLD = 0.35
+V14_17_HOLDOUT_FRAC = 0.20
+V14_17_EV_THRESHOLDS = [0, 5, 10]
+
+
+def _v14_17_stats_df(d):
+    if d is None or d.empty:
+        return {
+            'Bet': 0, 'Strike %': np.nan, 'Profit': 0.0, 'ROI %': np.nan,
+            'EV medio %': np.nan, 'Quota media': np.nan,
+        }
+    x = d.copy()
+    win = x['win'].astype(bool)
+    profit = np.where(win, x['quota'] - 1.0, -1.0)
+    return {
+        'Bet': int(len(x)),
+        'Strike %': 100.0 * float(win.mean()),
+        'Profit': float(np.sum(profit)),
+        'ROI %': 100.0 * float(np.mean(profit)),
+        'EV medio %': 100.0 * float(x['ev'].mean()),
+        'Quota media': float(x['quota'].mean()),
+    }
+
+
+def _v14_17_build_ou_holdout(id_fd, rho, ewma_span, emivita):
+    """Costruisce O/U 2.5 RAW + PLATT(100) sul medesimo holdout finale di V14.16."""
+    dati = carica_dati_campionato(id_fd)
+    if dati is None or dati.empty:
+        return None, pd.DataFrame(), None
+
+    # Usiamo lo stesso universo di date per il cutoff del final freeze.
+    combo_res = _v14_combo_leg(id_fd, rho, ewma_span, emivita, False)
+    if combo_res is None:
+        return None, pd.DataFrame(), None
+    _, combo_det = combo_res
+    cutoff, _ = _v14_15_holdout_cut(combo_det)
+    if cutoff is None:
+        return None, pd.DataFrame(), None
+
+    hist = _v14_build_ou_hist(dati, rho, ewma_span, emivita)
+    if len(hist) <= V14_17_TRAIN:
+        return None, pd.DataFrame(), cutoff
+
+    tutte = dati[dati['FTHG'].notna() & dati['FTAG'].notna()].reset_index(drop=True)
+    cols_over, cols_under = classifica_colonne_over_under(tutte.columns, '2.5')
+    if not cols_over or not cols_under:
+        return None, pd.DataFrame(), cutoff
+
+    rows = []
+    # Il train e' per campionato e usa le sole osservazioni precedenti.
+    for j, h in enumerate(hist):
+        if j < V14_17_TRAIN:
+            continue
+        if pd.isna(h['data']) or h['data'] < cutoff:
+            continue
+
+        train_df = pd.DataFrame([
+            {'p_raw': x['p_raw'], 'y_over': x['y_over']}
+            for x in hist[j-V14_17_TRAIN:j]
+        ])
+        cal, coef, reason = _v13_fit_platt_ou(train_df)
+        p_raw_over = float(np.clip(h['p_raw'], 0.001, 0.999))
+        p_platt_over = _v13_predict_platt_ou(p_raw_over, cal) if cal is not None else p_raw_over
+
+        qfair = _audit_quote_ou(h['row'], cols_over, cols_under)
+        qraw = quote_medie_grezze_ou(h['row'], cols_over, cols_under)
+        if qfair is None or qraw is None:
+            continue
+
+        p_market = qfair['p_market_norm_media_bookmaker']
+        actual = 'Over' if h['y_over'] else 'Under'
+        for strategy, p_over in [('RAW', p_raw_over), ('PLATT', p_platt_over)]:
+            scelta = 'Over' if p_over >= 0.5 else 'Under'
+            p_sel = float(p_over if scelta == 'Over' else (1.0 - p_over))
+            odds = float(qraw[scelta])
+            ev = p_sel * odds - 1.0
+            edge = p_sel - float(p_market[scelta])
+            rows.append({
+                'Campionato': next((k for k,v in CAMPIONATI_DOMESTICI.items() if v['id_fd'] == id_fd), id_fd),
+                'data': h['data'], 'casa': h['home'], 'trasferta': h['away'],
+                'strategy': strategy, 'scelta': scelta, 'prob': p_sel,
+                'prob_over_raw': p_raw_over, 'prob_over_platt': p_platt_over,
+                'quota': odds, 'p_market_fair': float(p_market[scelta]),
+                'edge': edge, 'ev': ev, 'esito': actual,
+                'win': scelta == actual,
+                'platt_applied': bool(cal is not None),
+                'platt_coef': float(coef) if cal is not None and np.isfinite(coef) else np.nan,
+                'platt_reason': reason,
+            })
+    detail = pd.DataFrame(rows)
+    return detail, detail.copy(), cutoff
+
+
+def _v14_17_common_comparison(raw, platt, ev_thr):
+    """Confronto paired sullo stesso match e sulla stessa scelta, se possibile."""
+    if raw is None or raw.empty or platt is None or platt.empty:
+        return None
+    keys = ['Campionato','data','casa','trasferta']
+    r = raw.copy()
+    p = platt.copy()
+    r = r.rename(columns={'scelta':'scelta_raw','quota':'quota_raw','ev':'ev_raw','win':'win_raw','prob':'prob_raw'})
+    p = p.rename(columns={'scelta':'scelta_platt','quota':'quota_platt','ev':'ev_platt','win':'win_platt','prob':'prob_platt'})
+    m = r.merge(p, on=keys, how='inner')
+    m = m[(m['ev_raw'] >= ev_thr) & (m['ev_platt'] >= ev_thr) & (m['scelta_raw'] == m['scelta_platt'])].copy()
+    if m.empty:
+        return None
+    raw_profit = np.where(m['win_raw'].astype(bool), m['quota_raw'] - 1.0, -1.0)
+    platt_profit = np.where(m['win_platt'].astype(bool), m['quota_platt'] - 1.0, -1.0)
+    return {
+        'EV minimo %': int(round(ev_thr * 100)),
+        'N comuni': int(len(m)),
+        'ROI RAW %': 100.0 * float(np.mean(raw_profit)),
+        'ROI PLATT %': 100.0 * float(np.mean(platt_profit)),
+        'Delta ROI pp': 100.0 * float(np.mean(platt_profit - raw_profit)),
+        'Prob. media RAW %': 100.0 * float(m['prob_raw'].mean()),
+        'Prob. media PLATT %': 100.0 * float(m['prob_platt'].mean()),
+    }
+
+
+def mostra_v14_17_final_economic_holdout(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 💰 V14.17 — FINAL ECONOMIC HOLDOUT PLATT O/U 2.5')
+    st.caption(
+        'Ultimo test economico diagnostico. Regola temporale congelata: holdout finale 20% per campionato, '
+        'PLATT walk-forward = 100 osservazioni precedenti dello stesso campionato. Usa solo quote O/U 2.5 '
+        'realmente presenti nei CSV; nessuna quota combo sintetica viene inventata.'
+    )
+
+    with st.expander('Apri V14.17 — Final Economic Holdout', expanded=False):
+        ev_thr_pct = st.selectbox(
+            'EV minimo per il confronto principale', V14_17_EV_THRESHOLDS,
+            index=1, key='v14_17_ev'
+        )
+        if st.button('💰 ESEGUI V14.17 — FINAL ECONOMIC HOLDOUT', key='v14_17_run'):
+            league_rows = []
+            common_rows = []
+            detail_rows = []
+            errors = []
+            with st.spinner('Esecuzione final economic holdout sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        det, _, cutoff = _v14_17_build_ou_holdout(
+                            info['id_fd'], rho, ewma_span, emivita
+                        )
+                        if det is None or det.empty or cutoff is None:
+                            continue
+                        raw = det[det['strategy'] == 'RAW'].copy()
+                        pl = det[det['strategy'] == 'PLATT'].copy()
+
+                        for strategy, g in [('RAW', raw), ('PLATT', pl)]:
+                            for thr_pct in V14_17_EV_THRESHOLDS:
+                                thr = thr_pct / 100.0
+                                s = _v14_17_stats_df(g[g['ev'] >= thr])
+                                league_rows.append({
+                                    'Campionato': camp,
+                                    'Cutoff holdout': cutoff.strftime('%Y-%m-%d'),
+                                    'Strategia': strategy,
+                                    'EV minimo %': thr_pct,
+                                    **s,
+                                })
+
+                        for thr_pct in V14_17_EV_THRESHOLDS:
+                            c = _v14_17_common_comparison(raw, pl, thr_pct / 100.0)
+                            if c:
+                                c['Campionato'] = camp
+                                common_rows.append(c)
+
+                        detail_rows.append(det.assign(Campionato=camp))
+                    except Exception as e:
+                        errors.append((camp, f'{type(e).__name__}: {e}'))
+
+            if league_rows:
+                ldf = pd.DataFrame(league_rows)
+                st.markdown('### 1. ROI per campionato e soglia EV')
+                st.dataframe(ldf.round(4), use_container_width=True, hide_index=True)
+
+                st.markdown('### 2. Aggregato — stesso universo per strategia')
+                agg_rows = []
+                for thr_pct in V14_17_EV_THRESHOLDS:
+                    for strategy in ['RAW','PLATT']:
+                        sub = ldf[(ldf['EV minimo %'] == thr_pct) & (ldf['Strategia'] == strategy)].copy()
+                        if sub.empty or sub['Bet'].sum() == 0:
+                            continue
+                        w = sub['Bet'].astype(float).to_numpy()
+                        agg = {
+                            'Strategia': strategy,
+                            'EV minimo %': thr_pct,
+                            'Bet': int(sub['Bet'].sum()),
+                            'Strike %': float(np.average(sub['Strike %'], weights=w)),
+                            'Profit': float(sub['Profit'].sum()),
+                            'ROI %': float(sub['Profit'].sum() / sub['Bet'].sum() * 100.0),
+                            'EV medio %': float(np.average(sub['EV medio %'], weights=w)),
+                            'Quota media': float(np.average(sub['Quota media'], weights=w)),
+                        }
+                        agg_rows.append(agg)
+                if agg_rows:
+                    st.dataframe(pd.DataFrame(agg_rows).round(4), use_container_width=True, hide_index=True)
+
+            if common_rows:
+                cdf = pd.DataFrame(common_rows)
+                st.markdown('### 3. Paired — stesso match e stessa scelta')
+                st.dataframe(cdf.round(4), use_container_width=True, hide_index=True)
+                st.caption('Questo confronto paired evita di attribuire a PLATT un vantaggio derivante soltanto dal cambio del campione o della selezione di lato.')
+
+            if detail_rows:
+                dd = pd.concat(detail_rows, ignore_index=True)
+                cols = ['Campionato','data','casa','trasferta','strategy','scelta','prob','quota','p_market_fair','edge','ev','esito','win','platt_applied','platt_coef','platt_reason']
+                cols = [c for c in cols if c in dd.columns]
+                st.markdown('### 4. Export dettaglio economico')
+                st.download_button(
+                    '⬇️ Scarica V14.17 final economic holdout CSV',
+                    data=dd[cols].to_csv(index=False).encode('utf-8'),
+                    file_name='V14_17_final_economic_holdout_ou25_platt100.csv',
+                    mime='text/csv',
+                    key='v14_17_dl'
+                )
+
+            st.info(
+                'Le combo libere 1X2 + Goal/NoGoal + O/U non hanno una quota bookmaker eseguibile nel dataset gratuito. '
+                'Questo test economico usa quindi esclusivamente O/U 2.5, dove il prezzo storico e\' osservabile direttamente. '
+                'Un ROI combo reale richiederebbe quote combo reali.'
+            )
+
+            if errors:
+                st.warning('Campionati non completati:')
+                for nome, msg in errors:
+                    st.write(f'- **{nome}**: {msg}')
+
+
+mostra_v14_17_final_economic_holdout(rho_val, ewma_span_val, emivita_val)
