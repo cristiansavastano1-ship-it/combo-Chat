@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -2096,6 +2095,36 @@ with st.sidebar:
         value=False,
         help="Mostra la diagnostica tecnica completa. Lascia disattivata per l'uso operativo."
     )
+
+
+# =====================================================================
+# 🚀 V15.1 — PULSANTE DI AVVIO OPERATIVO
+# Il modello e la regola V15 restano invariati. Questo blocco aggiunge
+# esclusivamente un comando esplicito per avviare l'interfaccia operativa.
+# =====================================================================
+if "v15_operativo_avviato" not in st.session_state:
+    st.session_state.v15_operativo_avviato = False
+
+st.divider()
+st.markdown("## 🚀 V15 — AVVIO OPERATIVO")
+st.caption(
+    "Premi il pulsante per avviare l'analisi delle partite. Dopo l'avvio "
+    "puoi scegliere campionato e partita; la regola V15 viene applicata "
+    "automaticamente alla Top1 Combo quando le condizioni del freeze sono soddisfatte."
+)
+
+col_start, col_status = st.columns([1, 2])
+with col_start:
+    if st.button("▶️ AVVIA V15 OPERATIVO", key="v15_start", type="primary"):
+        st.session_state.v15_operativo_avviato = True
+with col_status:
+    if st.session_state.v15_operativo_avviato:
+        st.success("✅ V15 operativo avviato")
+    else:
+        st.info("⏸️ V15 non ancora avviato")
+
+if not st.session_state.v15_operativo_avviato:
+    st.stop()
 
 scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)"], horizontal=True)
 
