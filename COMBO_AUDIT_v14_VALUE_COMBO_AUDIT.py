@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5851,3 +5850,135 @@ def mostra_v14_15_holdout_platt(rho, ewma_span, emivita):
 
 
 mostra_v14_15_holdout_platt(rho_val, ewma_span_val, emivita_val)
+
+
+# =====================================================================
+# 🧊 V14.16 — FINAL FREEZE AUDIT: PLATT TOP1 CON FINESTRA 100
+# Solo diagnostico. Nessuna ottimizzazione: soglia 35% e training=100
+# sono fissati ex ante sulla base dei test precedenti. Valuta il blocco
+# cronologico finale del 20% per ciascun campionato.
+# =====================================================================
+
+V14_16_TRAIN = 100
+V14_16_PROB_THRESHOLD = 0.35
+
+
+def _v14_16_metrics(h):
+    x = h.copy()
+    required = ['top1_hit', 'top1_prob_raw', 'top1_prob_platt']
+    if not all(c in x.columns for c in required):
+        return None
+    x['top1_hit'] = pd.to_numeric(x['top1_hit'], errors='coerce')
+    x['top1_prob_raw'] = pd.to_numeric(x['top1_prob_raw'], errors='coerce')
+    x['top1_prob_platt'] = pd.to_numeric(x['top1_prob_platt'], errors='coerce')
+    x = x.dropna(subset=required)
+    if x.empty:
+        return None
+    y = np.clip(x['top1_hit'].to_numpy(dtype=float), 0.0, 1.0)
+    raw = np.clip(x['top1_prob_raw'].to_numpy(dtype=float), 1e-6, 1.0 - 1e-6)
+    platt = np.clip(x['top1_prob_platt'].to_numpy(dtype=float), 1e-6, 1.0 - 1e-6)
+    return {
+        'N': int(len(x)),
+        'Top1 hit %': 100.0 * float(np.mean(y)),
+        'RAW Prob. media %': 100.0 * float(np.mean(raw)),
+        'PLATT Prob. media %': 100.0 * float(np.mean(platt)),
+        'RAW Gap calibrazione pp': 100.0 * float(np.mean(y - raw)),
+        'PLATT Gap calibrazione pp': 100.0 * float(np.mean(y - platt)),
+        'RAW Brier': float(np.mean((raw - y) ** 2)),
+        'PLATT Brier': float(np.mean((platt - y) ** 2)),
+        'RAW Log Loss': float(-np.mean(y*np.log(raw) + (1.0-y)*np.log(1.0-raw))),
+        'PLATT Log Loss': float(-np.mean(y*np.log(platt) + (1.0-y)*np.log(1.0-platt))),
+        'Delta Brier pp': 100.0 * float(np.mean((platt-y)**2 - (raw-y)**2)),
+        'Delta Log Loss': float(-np.mean(y*np.log(platt) + (1.0-y)*np.log(1.0-platt)) + np.mean(y*np.log(raw) + (1.0-y)*np.log(1.0-raw))),
+    }
+
+
+def mostra_v14_16_final_freeze(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧊 V14.16 — FINAL FREEZE AUDIT PLATT TOP1 (TRAIN=100)')
+    st.caption(
+        'Controllo finale diagnostico. Regole fissate: selezione Top1 >=35% e training walk-forward PLATT = 100 osservazioni precedenti dello stesso campionato. '
+        'Il blocco valutato è il 20% cronologico finale. Nessuna selezione tra parametri durante questo test e nessuna modifica alle probabilità operative.'
+    )
+
+    with st.expander('Apri V14.16 — Final Freeze Audit', expanded=False):
+        if st.button('🧊 ESEGUI V14.16 — FINAL FREEZE', key='v14_16_run'):
+            league_rows = []
+            all_holdout = []
+            errors = []
+            with st.spinner('Esecuzione final freeze sulle 5 leghe...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        res = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
+                        if res is None:
+                            continue
+                        _, det = res
+                        cutoff, holdout_matches = _v14_15_holdout_cut(det)
+                        if cutoff is None or holdout_matches.empty:
+                            continue
+                        wf, _, _ = _v14_12_walkforward_top1(det, V14_16_TRAIN, V14_16_PROB_THRESHOLD)
+                        if wf is None or wf.empty:
+                            continue
+                        wf['data'] = pd.to_datetime(wf['data'], errors='coerce')
+                        h = wf[wf['data'] >= cutoff].copy()
+                        if h.empty:
+                            continue
+                        m = _v14_16_metrics(h)
+                        if m is None:
+                            continue
+                        m['Campionato'] = camp
+                        m['Cutoff holdout'] = cutoff.strftime('%Y-%m-%d')
+                        m['N OOS holdout'] = int(len(holdout_matches))
+                        m['N PLATT applicato'] = int(h['platt_applied'].sum()) if 'platt_applied' in h.columns else int(len(h))
+                        league_rows.append(m)
+                        all_holdout.append(h.assign(Campionato=camp))
+                    except Exception as e:
+                        errors.append((camp, f'{type(e).__name__}: {e}'))
+
+            if league_rows:
+                ldf = pd.DataFrame(league_rows)
+                st.markdown('### 1. Risultato per campionato')
+                cols = [
+                    'Campionato','Cutoff holdout','N OOS holdout','N','N PLATT applicato',
+                    'Top1 hit %','RAW Prob. media %','PLATT Prob. media %',
+                    'RAW Gap calibrazione pp','PLATT Gap calibrazione pp','RAW Brier','PLATT Brier',
+                    'RAW Log Loss','PLATT Log Loss','Delta Brier pp','Delta Log Loss'
+                ]
+                st.dataframe(ldf[[c for c in cols if c in ldf.columns]].round(4), use_container_width=True, hide_index=True)
+
+                weights = ldf['N'].astype(float).to_numpy()
+                agg = {'Periodo':'Holdout cronologico finale','Finestra training':V14_16_TRAIN,'N':int(weights.sum()),'N PLATT applicato':int(ldf['N PLATT applicato'].sum())}
+                for c in ['Top1 hit %','RAW Prob. media %','PLATT Prob. media %','RAW Gap calibrazione pp','PLATT Gap calibrazione pp','RAW Brier','PLATT Brier','RAW Log Loss','PLATT Log Loss','Delta Brier pp','Delta Log Loss']:
+                    agg[c] = float(np.average(ldf[c].astype(float), weights=weights))
+                adf = pd.DataFrame([agg])
+                st.markdown('### 2. Risultato aggregato')
+                st.dataframe(adf.round(4), use_container_width=True, hide_index=True)
+
+                st.markdown('### 3. Regola congelata')
+                st.info(
+                    'Soglia Top1 = 35% · PLATT walk-forward = 100 osservazioni precedenti · stesso campionato · '
+                    'nessuna informazione futura · valutazione sul 20% cronologico finale.'
+                )
+                st.caption(
+                    'Questo pannello non seleziona né riottimizza il parametro: serve esclusivamente come controllo finale del comportamento della regola congelata.'
+                )
+
+                if all_holdout:
+                    dd = pd.concat(all_holdout, ignore_index=True)
+                    cols = ['Campionato','data','casa','trasferta','top1_hit','top1_prob_raw','top1_prob_platt','platt_applied','platt_train_n','platt_reason']
+                    cols = [c for c in cols if c in dd.columns]
+                    st.download_button(
+                        '⬇️ Scarica V14.16 final freeze CSV',
+                        data=dd[cols].to_csv(index=False).encode('utf-8'),
+                        file_name='V14_16_final_freeze_platt100_holdout.csv',
+                        mime='text/csv',
+                        key='v14_16_dl'
+                    )
+
+            if errors:
+                st.warning('Campionati non completati:')
+                for nome, msg in errors:
+                    st.write(f'- **{nome}**: {msg}')
+
+
+mostra_v14_16_final_freeze(rho_val, ewma_span_val, emivita_val)
