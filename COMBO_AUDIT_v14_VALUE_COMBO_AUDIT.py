@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5674,3 +5675,179 @@ def mostra_v14_14_training_window_sensitivity(rho, ewma_span, emivita):
 
 
 mostra_v14_14_training_window_sensitivity(rho_val, ewma_span_val, emivita_val)
+
+# =====================================================================
+# 🧪 V14.15 — HOLDOUT CRONOLOGICO: PLATT 75 VS 100
+# Solo diagnostico. Confronto predefinito tra le due finestre rimaste
+# plausibili dopo V14.14, su un blocco cronologico finale per campionato.
+# Nessuna modifica alle probabilità operative.
+# =====================================================================
+
+V14_15_WINDOWS = [75, 100]
+V14_15_HOLDOUT_FRAC = 0.20
+
+
+def _v14_15_holdout_metrics(df, period_label, train_window):
+    if df is None or df.empty:
+        return None
+    x = df.copy()
+    for c in ['top1_hit', 'top1_prob_raw', 'top1_prob_platt']:
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors='coerce')
+    x = x.dropna(subset=['top1_hit', 'top1_prob_raw', 'top1_prob_platt'])
+    if x.empty:
+        return None
+    y = x['top1_hit'].astype(float).to_numpy()
+    raw = np.clip(x['top1_prob_raw'].astype(float).to_numpy(), 1e-6, 1-1e-6)
+    platt = np.clip(x['top1_prob_platt'].astype(float).to_numpy(), 1e-6, 1-1e-6)
+    return {
+        'Finestra training': int(train_window),
+        'Periodo': period_label,
+        'N': int(len(x)),
+        'Top1 hit %': 100.0 * float(y.mean()),
+        'RAW Prob. media %': 100.0 * float(raw.mean()),
+        'PLATT Prob. media %': 100.0 * float(platt.mean()),
+        'RAW Gap calibrazione pp': 100.0 * float(y.mean() - raw.mean()),
+        'PLATT Gap calibrazione pp': 100.0 * float(y.mean() - platt.mean()),
+        'RAW Brier': float(np.mean((raw-y)**2)),
+        'PLATT Brier': float(np.mean((platt-y)**2)),
+        'RAW Log Loss': float(-np.mean(y*np.log(raw)+(1-y)*np.log(1-raw))),
+        'PLATT Log Loss': float(-np.mean(y*np.log(platt)+(1-y)*np.log(1-platt))),
+        'Delta Brier pp': 100.0 * float(np.mean((platt-y)**2) - np.mean((raw-y)**2)),
+        'Delta Log Loss': float(-np.mean(y*np.log(platt)+(1-y)*np.log(1-platt)) + np.mean(y*np.log(raw)+(1-y)*np.log(1-raw))),
+        'N PLATT applicato': int(x['platt_applied'].sum()) if 'platt_applied' in x.columns else int(len(x)),
+    }
+
+
+def _v14_15_holdout_cut(det):
+    if det is None or det.empty or 'data' not in det.columns:
+        return None, pd.DataFrame()
+    x = det.copy()
+    x['data'] = pd.to_datetime(x['data'], errors='coerce')
+    x = x.dropna(subset=['data']).sort_values('data').reset_index(drop=True)
+    n = len(x)
+    if n < 20:
+        return None, pd.DataFrame()
+    split = max(1, int(np.floor(n * (1.0 - V14_15_HOLDOUT_FRAC))))
+    split = min(split, n-1)
+    cutoff = x.loc[split, 'data']
+    return cutoff, x[x['data'] >= cutoff].copy()
+
+
+def mostra_v14_15_holdout_platt(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🧪 V14.15 — HOLDOUT CRONOLOGICO PLATT 75 VS 100')
+    st.caption(
+        'Solo diagnostico. Confronta esclusivamente le finestre di training 75 e 100 '
+        'su un blocco cronologico finale del 20% delle partite OOS di ciascun campionato. '
+        'Le predizioni restano walk-forward e usano solo osservazioni precedenti. Nessuna modifica operativa.'
+    )
+
+    with st.expander('Apri V14.15 — Holdout 75 vs 100', expanded=False):
+        if st.button('🔬 ESEGUI V14.15 — HOLDOUT PLATT 75 VS 100', key='v14_15_run'):
+            detail_rows = []
+            agg_rows = []
+            league_rows = []
+            errors = []
+
+            with st.spinner('Calcolo holdout cronologico per 75 e 100...'):
+                for camp, info in CAMPIONATI_DOMESTICI.items():
+                    try:
+                        res = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
+                        if res is None:
+                            continue
+                        _, det = res
+                        cutoff, holdout_matches = _v14_15_holdout_cut(det)
+                        if cutoff is None or holdout_matches.empty:
+                            continue
+
+                        for ntrain in V14_15_WINDOWS:
+                            wf, _, _ = _v14_12_walkforward_top1(
+                                det,
+                                int(ntrain),
+                                V14_12_PROB_THRESHOLD
+                            )
+                            if wf is None or wf.empty:
+                                continue
+                            wf['data'] = pd.to_datetime(wf['data'], errors='coerce')
+                            h = wf[wf['data'] >= cutoff].copy()
+                            if h.empty:
+                                continue
+
+                            m = _v14_15_holdout_metrics(h, 'Holdout cronologico finale', ntrain)
+                            if m is None:
+                                continue
+                            m['Campionato'] = camp
+                            m['Cutoff holdout'] = cutoff.strftime('%Y-%m-%d')
+                            m['N OOS holdout'] = int(len(holdout_matches))
+                            league_rows.append(m)
+                            detail_rows.append(h.assign(Campionato=camp, **{'Finestra training': int(ntrain)}))
+
+                    except Exception as e:
+                        errors.append((camp, f'{type(e).__name__}: {e}'))
+
+            if league_rows:
+                ldf = pd.DataFrame(league_rows)
+                st.markdown('### 1. Holdout per campionato')
+                cols = [
+                    'Campionato','Cutoff holdout','N OOS holdout','Finestra training','N',
+                    'N PLATT applicato','Top1 hit %','RAW Prob. media %','PLATT Prob. media %',
+                    'RAW Gap calibrazione pp','PLATT Gap calibrazione pp','RAW Brier','PLATT Brier',
+                    'RAW Log Loss','PLATT Log Loss','Delta Brier pp','Delta Log Loss'
+                ]
+                st.dataframe(ldf[[c for c in cols if c in ldf.columns]].round(4), use_container_width=True, hide_index=True)
+
+                for periodo in ['Holdout cronologico finale']:
+                    for ntrain in V14_15_WINDOWS:
+                        sub = ldf[(ldf['Periodo'] == periodo) & (ldf['Finestra training'] == ntrain)].copy()
+                        if sub.empty:
+                            continue
+                        weights = sub['N'].astype(float).to_numpy()
+                        row = {
+                            'Periodo': periodo,
+                            'Finestra training': ntrain,
+                            'N': int(weights.sum()),
+                            'N PLATT applicato': int(sub['N PLATT applicato'].sum()),
+                        }
+                        for c in ['Top1 hit %','RAW Prob. media %','PLATT Prob. media %','RAW Gap calibrazione pp','PLATT Gap calibrazione pp','RAW Brier','PLATT Brier','RAW Log Loss','PLATT Log Loss','Delta Brier pp','Delta Log Loss']:
+                            row[c] = float(np.average(sub[c].astype(float), weights=weights))
+                        agg_rows.append(row)
+
+                if agg_rows:
+                    adf = pd.DataFrame(agg_rows)
+                    st.markdown('### 2. Holdout aggregato')
+                    st.dataframe(adf.round(4), use_container_width=True, hide_index=True)
+                    st.caption('Le due finestre 75 e 100 vengono confrontate senza cercare una nuova soglia. Il confronto serve a verificare robustezza temporale.')
+
+                if len(agg_rows) == 2:
+                    a = agg_rows[0]; b = agg_rows[1]
+                    st.markdown('### 3. Differenza 100 − 75 sullo stesso holdout')
+                    diff = pd.DataFrame([{
+                        'Delta Top1 hit pp': a['Top1 hit %'] - b['Top1 hit %'],
+                        'Delta PLATT Prob. media pp': a['PLATT Prob. media %'] - b['PLATT Prob. media %'],
+                        'Delta PLATT Gap pp': a['PLATT Gap calibrazione pp'] - b['PLATT Gap calibrazione pp'],
+                        'Delta PLATT Brier': a['PLATT Brier'] - b['PLATT Brier'],
+                        'Delta PLATT Log Loss': a['PLATT Log Loss'] - b['PLATT Log Loss'],
+                    }], index=['100 − 75'])
+                    st.dataframe(diff.round(6), use_container_width=True)
+
+            if detail_rows:
+                dd = pd.concat(detail_rows, ignore_index=True)
+                cols = ['Campionato','data','casa','trasferta','top1_hit','top1_prob_raw','top1_prob_platt','platt_applied','Finestra training']
+                cols = [c for c in cols if c in dd.columns]
+                st.markdown('### 4. Export dettaglio holdout')
+                st.download_button(
+                    '⬇️ Scarica V14.15 holdout CSV',
+                    data=dd[cols].to_csv(index=False).encode('utf-8'),
+                    file_name='V14_15_holdout_platt_75_vs_100.csv',
+                    mime='text/csv',
+                    key='v14_15_dl'
+                )
+
+            if errors:
+                st.warning('Campionati non completati:')
+                for nome, msg in errors:
+                    st.write(f'- **{nome}**: {msg}')
+
+
+mostra_v14_15_holdout_platt(rho_val, ewma_span_val, emivita_val)
