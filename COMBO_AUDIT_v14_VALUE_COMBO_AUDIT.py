@@ -1897,9 +1897,177 @@ def mostra_sezione_v5_calibrazione_ev(dati, campionato, rho_val, ewma_span_val, 
             st.download_button('⬇️ Scarica dettaglio V5 CSV',data=out.to_csv(index=False).encode('utf-8'),file_name='v5_calibrazione_ev.csv',mime='text/csv',key='v5_dl')
 
 
-st.caption("Versione operativa V13.6 — modello V11 completo + PLATT solo O/U 2.5 con salvaguardia monotona")
 
-st.info("Uso operativo: il modello completo resta invariato; V13 applica PLATT esclusivamente a O/U 2.5 e solo con dati precedenti alla partita selezionata.")
+# =====================================================================
+# 🧊 V15 — OPERATIVO: PLATT TOP1 COMBO CON REGOLA CONGELATA
+# Freeze validato nei test V14:
+#   - soglia di attivazione sulla Top1 RAW: >= 35%
+#   - training PLATT: 100 osservazioni precedenti
+#   - stesso campionato
+#   - walk-forward, nessuna informazione futura
+#   - salvaguardia monotona: pendenza > 0; altrimenti si mantiene RAW
+# Importante: PLATT calibra la probabilità dell'evento Top1, non ricostruisce
+# le altre 11 probabilità e non modifica il ranking delle combo.
+# =====================================================================
+V15_TOP1_THRESHOLD = 0.35
+V15_TOP1_TRAIN = 100
+V15_TOP1_MIN_TRAIN = 50
+V15_TOP1_MAX_TRAIN = 100
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _v15_build_top1_history(id_fd, rho, ewma_span, emivita):
+    """Costruisce la storia OOS della Top1 Combo RAW per un singolo campionato."""
+    try:
+        dati_hist = carica_dati_campionato(id_fd)
+        if dati_hist is None or dati_hist.empty:
+            return pd.DataFrame()
+        tutte = dati_hist[dati_hist['FTHG'].notna() & dati_hist['FTAG'].notna()].reset_index(drop=True)
+        rows = []
+        for i in range(15, len(tutte)):
+            partita = tutte.iloc[i]
+            try:
+                m = calcola_modello_completo(
+                    tutte.iloc[:i],
+                    partita['HomeTeam'], partita['AwayTeam'],
+                    rho, ewma_span, emivita, pd.DataFrame(),
+                    data_riferimento=partita.get('Date_parsed')
+                )
+                if m is None or 'griglia' not in m:
+                    continue
+                probs = {}
+                for segno in ['1', 'X', '2']:
+                    for gg in ['Goal', 'NoGoal']:
+                        for tipo in ['Over', 'Under']:
+                            key = f'{segno}_{gg}_{tipo}'
+                            probs[key] = float(calcola_combo_libera(
+                                m['griglia'], segno=segno, soglia_gol=2.5,
+                                tipo_soglia=tipo, gol_nogol=gg
+                            )) / 100.0
+                if not probs:
+                    continue
+                top1_key, top1_prob = max(probs.items(), key=lambda kv: kv[1])
+                esito = ('1' if float(partita['FTHG']) > float(partita['FTAG'])
+                         else ('2' if float(partita['FTHG']) < float(partita['FTAG']) else 'X'))
+                gg_true = 'Goal' if float(partita['FTHG']) > 0 and float(partita['FTAG']) > 0 else 'NoGoal'
+                tt_true = 'Over' if float(partita['FTHG']) + float(partita['FTAG']) > 2.5 else 'Under'
+                true_key = f'{esito}_{gg_true}_{tt_true}'
+                rows.append({
+                    'data': partita.get('Date_parsed'),
+                    'top1_prob': float(np.clip(top1_prob, 1e-6, 1.0 - 1e-6)),
+                    'top1_hit': int(top1_key == true_key),
+                })
+            except Exception:
+                continue
+        if not rows:
+            return pd.DataFrame()
+        h = pd.DataFrame(rows)
+        h['data'] = pd.to_datetime(h['data'], errors='coerce')
+        h['top1_prob'] = pd.to_numeric(h['top1_prob'], errors='coerce')
+        h['top1_hit'] = pd.to_numeric(h['top1_hit'], errors='coerce')
+        h = h.dropna(subset=['top1_prob', 'top1_hit'])
+        return h.sort_values('data', kind='mergesort').reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _v15_logit(p):
+    p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+    return float(np.log(p / (1.0 - p)))
+
+
+def _v15_fit_platt_top1(hist_df, n_train=V15_TOP1_TRAIN):
+    """Fit Platt sulla Top1 con sole osservazioni precedenti e guardia monotona."""
+    if hist_df is None or hist_df.empty:
+        return None, np.nan, 'nessun training', 0
+    x = hist_df.copy()
+    required = ['top1_prob', 'top1_hit']
+    if any(c not in x.columns for c in required):
+        return None, np.nan, 'colonne mancanti', 0
+    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
+    x['top1_hit'] = pd.to_numeric(x['top1_hit'], errors='coerce')
+    x = x.dropna(subset=required).copy()
+    x = x[x['top1_prob'].between(1e-6, 1.0 - 1e-6)].copy()
+    x['top1_hit'] = x['top1_hit'].astype(int)
+    limit = int(min(max(n_train, V15_TOP1_MIN_TRAIN), V15_TOP1_MAX_TRAIN))
+    x = x.tail(limit).reset_index(drop=True)
+    n = len(x)
+    if n < V15_TOP1_MIN_TRAIN:
+        return None, np.nan, 'campione insufficiente', n
+    y = x['top1_hit'].to_numpy(dtype=int).reshape(-1)
+    if np.unique(y).size < 2:
+        return None, np.nan, 'un solo esito presente nel training', n
+    z = np.asarray([_v15_logit(v) for v in x['top1_prob'].to_numpy(dtype=float)], dtype=float).reshape(-1, 1)
+    model = LogisticRegression(solver='lbfgs', C=1e6, max_iter=1000)
+    model.fit(z, y)
+    coef_arr = np.asarray(model.coef_, dtype=float).reshape(-1)
+    coef = float(coef_arr[0]) if coef_arr.size else np.nan
+    if not np.isfinite(coef) or coef <= 0.0:
+        return None, coef, 'fit non monotono: pendenza non positiva', n
+    return model, coef, 'applicabile', n
+
+
+def _v15_predict_platt_top1(p_raw, model):
+    p_raw = float(np.clip(p_raw, 1e-6, 1.0 - 1e-6))
+    if model is None:
+        return p_raw
+    z = np.asarray([[_v15_logit(p_raw)]], dtype=float)
+    proba = np.asarray(model.predict_proba(z), dtype=float).reshape(-1)
+    if proba.size < 2:
+        return p_raw
+    return float(np.clip(proba[1], 1e-6, 1.0 - 1e-6))
+
+
+def _v15_operational_top1_platt(id_fd, rho, ewma_span, emivita, modello, data_riferimento):
+    """Applica il freeze V15 alla sola probabilità della Top1 Combo."""
+    probs = {}
+    if modello is None or 'griglia' not in modello:
+        return None
+    for segno in ['1', 'X', '2']:
+        for gg in ['Goal', 'NoGoal']:
+            for tipo in ['Over', 'Under']:
+                key = f'{segno}_{gg}_{tipo}'
+                try:
+                    probs[key] = float(calcola_combo_libera(
+                        modello['griglia'], segno=segno, soglia_gol=2.5,
+                        tipo_soglia=tipo, gol_nogol=gg
+                    )) / 100.0
+                except Exception:
+                    continue
+    if not probs:
+        return None
+    top1_key, p_raw = max(probs.items(), key=lambda kv: kv[1])
+    info = {
+        'top1_key': top1_key,
+        'top1_raw': float(np.clip(p_raw, 1e-6, 1.0 - 1e-6)),
+        'threshold': V15_TOP1_THRESHOLD,
+        'selected': bool(p_raw >= V15_TOP1_THRESHOLD),
+        'platt_applied': False,
+        'platt_prob': float(np.clip(p_raw, 1e-6, 1.0 - 1e-6)),
+        'coef': np.nan,
+        'train_n': 0,
+        'reason': 'Top1 RAW < 35%'
+    }
+    if p_raw < V15_TOP1_THRESHOLD:
+        return info
+
+    hist = _v15_build_top1_history(id_fd, rho, ewma_span, emivita)
+    if data_riferimento is not None and pd.notna(data_riferimento) and not hist.empty:
+        hist = hist[hist['data'] < pd.to_datetime(data_riferimento)].copy()
+
+    model, coef, reason, n_eff = _v15_fit_platt_top1(hist[['top1_prob','top1_hit']] if not hist.empty else hist, V15_TOP1_TRAIN)
+    info['train_n'] = int(n_eff)
+    info['coef'] = coef
+    info['reason'] = reason
+    if model is not None:
+        info['platt_prob'] = _v15_predict_platt_top1(p_raw, model)
+        info['platt_applied'] = True
+    return info
+
+
+st.caption("Versione operativa V15 — modello V11 completo + PLATT O/U 2.5 + PLATT Top1 Combo (freeze: 35% / 100 osservazioni)")
+
+st.info("Uso operativo: il modello completo resta invariato. V13 calibra O/U 2.5; V15 calibra la probabilità della Top1 Combo con PLATT walk-forward (100 osservazioni precedenti dello stesso campionato) solo quando la Top1 RAW è ≥35%. Nessuna informazione futura.")
 
 # Parametri del modello fissati ai valori di default validati — non più
 # esposti nell'interfaccia: erano controlli tecnici che richiedevano di
@@ -2379,6 +2547,39 @@ else:
         if calib_1x2_info:
             st.caption(f"🎯 Probabilità 1X2 corrette con calibrazione (allenata su "
                        f"{calib_1x2_info['n_osservazioni']} osservazioni, {calib_1x2_info['timestamp']}).")
+
+        # V15 operativo: PLATT Top1 Combo con regola congelata.
+        v15_top1_info = None
+        if not is_coppa:
+            try:
+                v15_top1_info = _v15_operational_top1_platt(
+                    id_fd, rho_val, ewma_span_val, emivita_val, modello,
+                    data_rif_sel if pd.notna(data_rif_sel) else None
+                )
+                if v15_top1_info is not None and v15_top1_info.get('selected'):
+                    p_raw_pct = 100.0 * v15_top1_info['top1_raw']
+                    p_final_pct = 100.0 * v15_top1_info['platt_prob']
+                    if v15_top1_info.get('platt_applied'):
+                        st.success(
+                            f"🧊 **V15 TOP1 COMBO ATTIVA** — {v15_top1_info['top1_key']} · "
+                            f"RAW {p_raw_pct:.1f}% → PLATT {p_final_pct:.1f}% · "
+                            f"training: {v15_top1_info['train_n']} osservazioni · "
+                            f"pendenza: {v15_top1_info['coef']:.4f}."
+                        )
+                    else:
+                        st.warning(
+                            f"⚠️ **V15 TOP1 ≥35%, ma PLATT non applicato** — {v15_top1_info['top1_key']} · "
+                            f"RAW {p_raw_pct:.1f}% · training: {v15_top1_info['train_n']} · "
+                            f"motivo: {v15_top1_info['reason']}. Resta la probabilità RAW."
+                        )
+                elif v15_top1_info is not None:
+                    st.info(
+                        f"ℹ️ **V15 TOP1 COMBO non attiva** — {v15_top1_info['top1_key']} · "
+                        f"probabilità RAW {100.0*v15_top1_info['top1_raw']:.1f}% < soglia 35%."
+                    )
+            except Exception as _v15_err:
+                st.warning(f"⚠️ V15 PLATT Top1 Combo non applicato per errore tecnico: {type(_v15_err).__name__}: {_v15_err}")
+
         if platt_v13_info and platt_v13_info.get('stato') == 'applicato':
             st.info(
                 f"🎯 **V13 PLATT O/U 2.5 applicato** — training walk-forward: {platt_v13_info['n_train']} partite · "
@@ -2554,6 +2755,16 @@ else:
 
         combo_affidabili = {k: v for k, v in tutte_le_combo.items() if v["prob"] >= SOGLIA_MIN_PROB_COMBO}
         top4_combo = dict(sorted(combo_affidabili.items(), key=lambda x: x[1]["prob"], reverse=True)[:4])
+
+        # Etichetta esplicita sulla Top1 RAW usata dal freeze V15; il ranking delle
+        # 4 combo rimane quello già presente nell'interfaccia.
+        if v15_top1_info is not None and v15_top1_info.get('selected'):
+            st.caption(
+                f"🧊 Freeze V15: Top1 RAW {100.0*v15_top1_info['top1_raw']:.1f}% ≥ 35% · "
+                f"probabilità operativa Top1 = {100.0*v15_top1_info['platt_prob']:.1f}%"
+                if v15_top1_info.get('platt_applied') else
+                f"🧊 Freeze V15: Top1 RAW {100.0*v15_top1_info['top1_raw']:.1f}% ≥ 35% · PLATT non applicato ({v15_top1_info.get('reason','')})"
+            )
 
         if dati_scarsi:
             st.warning("⚠️ Combo calcolate su dati limitati per una delle due squadre (vedi avviso sopra) "
@@ -5982,248 +6193,20 @@ def mostra_v14_16_final_freeze(rho, ewma_span, emivita):
                     st.write(f'- **{nome}**: {msg}')
 
 
-mostra_v14_16_final_freeze(rho_val, ewma_span_val, emivita_val)
-
-
 # =====================================================================
-# 💰 V14.17 — FINAL ECONOMIC HOLDOUT: O/U 2.5 RAW vs PLATT (TRAIN=100)
-# Solo diagnostico. Ultimo test economico della calibrazione PLATT con quote
-# storiche realmente presenti nel dataset. Il blocco temporale e' lo stesso
-# holdout finale del 20% usato da V14.16. La selezione economica usa soglie
-# EV fissate ex ante (0%, 5%, 10%) e confronta RAW vs PLATT.
-# IMPORTANTISSIMO: le combo libere non hanno una quota bookmaker eseguibile
-# nel dataset; per questo NON viene inventato un ROI combo. Qui si misura
-# esclusivamente l'effetto economico di PLATT sul mercato O/U 2.5 quotato.
+# 🧊 V15 — OPERATIVE FREEZE SUMMARY
+# Solo riepilogo della regola attiva; non riottimizza e non altera i parametri.
 # =====================================================================
-
-V14_17_TRAIN = 100
-V14_17_PROB_THRESHOLD = 0.35
-V14_17_HOLDOUT_FRAC = 0.20
-V14_17_EV_THRESHOLDS = [0, 5, 10]
-
-
-def _v14_17_stats_df(d):
-    if d is None or d.empty:
-        return {
-            'Bet': 0, 'Strike %': np.nan, 'Profit': 0.0, 'ROI %': np.nan,
-            'EV medio %': np.nan, 'Quota media': np.nan,
-        }
-    x = d.copy()
-    win = x['win'].astype(bool)
-    profit = np.where(win, x['quota'] - 1.0, -1.0)
-    return {
-        'Bet': int(len(x)),
-        'Strike %': 100.0 * float(win.mean()),
-        'Profit': float(np.sum(profit)),
-        'ROI %': 100.0 * float(np.mean(profit)),
-        'EV medio %': 100.0 * float(x['ev'].mean()),
-        'Quota media': float(x['quota'].mean()),
-    }
-
-
-def _v14_17_build_ou_holdout(id_fd, rho, ewma_span, emivita):
-    """Costruisce O/U 2.5 RAW + PLATT(100) sul medesimo holdout finale di V14.16."""
-    dati = carica_dati_campionato(id_fd)
-    if dati is None or dati.empty:
-        return None, pd.DataFrame(), None
-
-    # Usiamo lo stesso universo di date per il cutoff del final freeze.
-    combo_res = _v14_combo_leg(id_fd, rho, ewma_span, emivita, False)
-    if combo_res is None:
-        return None, pd.DataFrame(), None
-    _, combo_det = combo_res
-    cutoff, _ = _v14_15_holdout_cut(combo_det)
-    if cutoff is None:
-        return None, pd.DataFrame(), None
-
-    hist = _v14_build_ou_hist(dati, rho, ewma_span, emivita)
-    if len(hist) <= V14_17_TRAIN:
-        return None, pd.DataFrame(), cutoff
-
-    tutte = dati[dati['FTHG'].notna() & dati['FTAG'].notna()].reset_index(drop=True)
-    cols_over, cols_under = classifica_colonne_over_under(tutte.columns, '2.5')
-    if not cols_over or not cols_under:
-        return None, pd.DataFrame(), cutoff
-
-    rows = []
-    # Il train e' per campionato e usa le sole osservazioni precedenti.
-    for j, h in enumerate(hist):
-        if j < V14_17_TRAIN:
-            continue
-        if pd.isna(h['data']) or h['data'] < cutoff:
-            continue
-
-        train_df = pd.DataFrame([
-            {'p_raw': x['p_raw'], 'y_over': x['y_over']}
-            for x in hist[j-V14_17_TRAIN:j]
-        ])
-        cal, coef, reason = _v13_fit_platt_ou(train_df)
-        p_raw_over = float(np.clip(h['p_raw'], 0.001, 0.999))
-        p_platt_over = _v13_predict_platt_ou(p_raw_over, cal) if cal is not None else p_raw_over
-
-        qfair = _audit_quote_ou(h['row'], cols_over, cols_under)
-        qraw = quote_medie_grezze_ou(h['row'], cols_over, cols_under)
-        if qfair is None or qraw is None:
-            continue
-
-        p_market = qfair['p_market_norm_media_bookmaker']
-        actual = 'Over' if h['y_over'] else 'Under'
-        for strategy, p_over in [('RAW', p_raw_over), ('PLATT', p_platt_over)]:
-            scelta = 'Over' if p_over >= 0.5 else 'Under'
-            p_sel = float(p_over if scelta == 'Over' else (1.0 - p_over))
-            odds = float(qraw[scelta])
-            ev = p_sel * odds - 1.0
-            edge = p_sel - float(p_market[scelta])
-            rows.append({
-                'Campionato': next((k for k,v in CAMPIONATI_DOMESTICI.items() if v['id_fd'] == id_fd), id_fd),
-                'data': h['data'], 'casa': h['home'], 'trasferta': h['away'],
-                'strategy': strategy, 'scelta': scelta, 'prob': p_sel,
-                'prob_over_raw': p_raw_over, 'prob_over_platt': p_platt_over,
-                'quota': odds, 'p_market_fair': float(p_market[scelta]),
-                'edge': edge, 'ev': ev, 'esito': actual,
-                'win': scelta == actual,
-                'platt_applied': bool(cal is not None),
-                'platt_coef': float(coef) if cal is not None and np.isfinite(coef) else np.nan,
-                'platt_reason': reason,
-            })
-    detail = pd.DataFrame(rows)
-    return detail, detail.copy(), cutoff
-
-
-def _v14_17_common_comparison(raw, platt, ev_thr):
-    """Confronto paired sullo stesso match e sulla stessa scelta, se possibile."""
-    if raw is None or raw.empty or platt is None or platt.empty:
-        return None
-    keys = ['Campionato','data','casa','trasferta']
-    r = raw.copy()
-    p = platt.copy()
-    r = r.rename(columns={'scelta':'scelta_raw','quota':'quota_raw','ev':'ev_raw','win':'win_raw','prob':'prob_raw'})
-    p = p.rename(columns={'scelta':'scelta_platt','quota':'quota_platt','ev':'ev_platt','win':'win_platt','prob':'prob_platt'})
-    m = r.merge(p, on=keys, how='inner')
-    m = m[(m['ev_raw'] >= ev_thr) & (m['ev_platt'] >= ev_thr) & (m['scelta_raw'] == m['scelta_platt'])].copy()
-    if m.empty:
-        return None
-    raw_profit = np.where(m['win_raw'].astype(bool), m['quota_raw'] - 1.0, -1.0)
-    platt_profit = np.where(m['win_platt'].astype(bool), m['quota_platt'] - 1.0, -1.0)
-    return {
-        'EV minimo %': int(round(ev_thr * 100)),
-        'N comuni': int(len(m)),
-        'ROI RAW %': 100.0 * float(np.mean(raw_profit)),
-        'ROI PLATT %': 100.0 * float(np.mean(platt_profit)),
-        'Delta ROI pp': 100.0 * float(np.mean(platt_profit - raw_profit)),
-        'Prob. media RAW %': 100.0 * float(m['prob_raw'].mean()),
-        'Prob. media PLATT %': 100.0 * float(m['prob_platt'].mean()),
-    }
-
-
-def mostra_v14_17_final_economic_holdout(rho, ewma_span, emivita):
+def mostra_v15_operational_freeze_summary():
     st.divider()
-    st.markdown('## 💰 V14.17 — FINAL ECONOMIC HOLDOUT PLATT O/U 2.5')
-    st.caption(
-        'Ultimo test economico diagnostico. Regola temporale congelata: holdout finale 20% per campionato, '
-        'PLATT walk-forward = 100 osservazioni precedenti dello stesso campionato. Usa solo quote O/U 2.5 '
-        'realmente presenti nei CSV; nessuna quota combo sintetica viene inventata.'
+    st.markdown('## 🧊 V15 — REGOLA OPERATIVA CONGELATA')
+    st.info(
+        'Top1 Combo RAW ≥ 35% → PLATT walk-forward = 100 osservazioni precedenti '
+        'dello stesso campionato, con salvaguardia monotona (pendenza > 0). '
+        'La calibrazione modifica la probabilità della Top1, non il ranking delle altre combo. '
+        'Nessuna informazione futura.'
     )
 
-    with st.expander('Apri V14.17 — Final Economic Holdout', expanded=False):
-        ev_thr_pct = st.selectbox(
-            'EV minimo per il confronto principale', V14_17_EV_THRESHOLDS,
-            index=1, key='v14_17_ev'
-        )
-        if st.button('💰 ESEGUI V14.17 — FINAL ECONOMIC HOLDOUT', key='v14_17_run'):
-            league_rows = []
-            common_rows = []
-            detail_rows = []
-            errors = []
-            with st.spinner('Esecuzione final economic holdout sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        det, _, cutoff = _v14_17_build_ou_holdout(
-                            info['id_fd'], rho, ewma_span, emivita
-                        )
-                        if det is None or det.empty or cutoff is None:
-                            continue
-                        raw = det[det['strategy'] == 'RAW'].copy()
-                        pl = det[det['strategy'] == 'PLATT'].copy()
 
-                        for strategy, g in [('RAW', raw), ('PLATT', pl)]:
-                            for thr_pct in V14_17_EV_THRESHOLDS:
-                                thr = thr_pct / 100.0
-                                s = _v14_17_stats_df(g[g['ev'] >= thr])
-                                league_rows.append({
-                                    'Campionato': camp,
-                                    'Cutoff holdout': cutoff.strftime('%Y-%m-%d'),
-                                    'Strategia': strategy,
-                                    'EV minimo %': thr_pct,
-                                    **s,
-                                })
-
-                        for thr_pct in V14_17_EV_THRESHOLDS:
-                            c = _v14_17_common_comparison(raw, pl, thr_pct / 100.0)
-                            if c:
-                                c['Campionato'] = camp
-                                common_rows.append(c)
-
-                        detail_rows.append(det.assign(Campionato=camp))
-                    except Exception as e:
-                        errors.append((camp, f'{type(e).__name__}: {e}'))
-
-            if league_rows:
-                ldf = pd.DataFrame(league_rows)
-                st.markdown('### 1. ROI per campionato e soglia EV')
-                st.dataframe(ldf.round(4), use_container_width=True, hide_index=True)
-
-                st.markdown('### 2. Aggregato — stesso universo per strategia')
-                agg_rows = []
-                for thr_pct in V14_17_EV_THRESHOLDS:
-                    for strategy in ['RAW','PLATT']:
-                        sub = ldf[(ldf['EV minimo %'] == thr_pct) & (ldf['Strategia'] == strategy)].copy()
-                        if sub.empty or sub['Bet'].sum() == 0:
-                            continue
-                        w = sub['Bet'].astype(float).to_numpy()
-                        agg = {
-                            'Strategia': strategy,
-                            'EV minimo %': thr_pct,
-                            'Bet': int(sub['Bet'].sum()),
-                            'Strike %': float(np.average(sub['Strike %'], weights=w)),
-                            'Profit': float(sub['Profit'].sum()),
-                            'ROI %': float(sub['Profit'].sum() / sub['Bet'].sum() * 100.0),
-                            'EV medio %': float(np.average(sub['EV medio %'], weights=w)),
-                            'Quota media': float(np.average(sub['Quota media'], weights=w)),
-                        }
-                        agg_rows.append(agg)
-                if agg_rows:
-                    st.dataframe(pd.DataFrame(agg_rows).round(4), use_container_width=True, hide_index=True)
-
-            if common_rows:
-                cdf = pd.DataFrame(common_rows)
-                st.markdown('### 3. Paired — stesso match e stessa scelta')
-                st.dataframe(cdf.round(4), use_container_width=True, hide_index=True)
-                st.caption('Questo confronto paired evita di attribuire a PLATT un vantaggio derivante soltanto dal cambio del campione o della selezione di lato.')
-
-            if detail_rows:
-                dd = pd.concat(detail_rows, ignore_index=True)
-                cols = ['Campionato','data','casa','trasferta','strategy','scelta','prob','quota','p_market_fair','edge','ev','esito','win','platt_applied','platt_coef','platt_reason']
-                cols = [c for c in cols if c in dd.columns]
-                st.markdown('### 4. Export dettaglio economico')
-                st.download_button(
-                    '⬇️ Scarica V14.17 final economic holdout CSV',
-                    data=dd[cols].to_csv(index=False).encode('utf-8'),
-                    file_name='V14_17_final_economic_holdout_ou25_platt100.csv',
-                    mime='text/csv',
-                    key='v14_17_dl'
-                )
-
-            st.info(
-                'Le combo libere 1X2 + Goal/NoGoal + O/U non hanno una quota bookmaker eseguibile nel dataset gratuito. '
-                'Questo test economico usa quindi esclusivamente O/U 2.5, dove il prezzo storico e\' osservabile direttamente. '
-                'Un ROI combo reale richiederebbe quote combo reali.'
-            )
-
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome, msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-mostra_v14_17_final_economic_holdout(rho_val, ewma_span_val, emivita_val)
+mostra_v15_operational_freeze_summary()
+mostra_v14_16_final_freeze(rho_val, ewma_span_val, emivita_val)
