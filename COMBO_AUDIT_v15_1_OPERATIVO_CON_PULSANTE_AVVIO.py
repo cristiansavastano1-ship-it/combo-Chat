@@ -2064,6 +2064,124 @@ def _v15_operational_top1_platt(id_fd, rho, ewma_span, emivita, modello, data_ri
     return info
 
 
+
+# =====================================================================
+# 📊 V15.2 — MONITORAGGIO AUTOMATICO
+# Derivato da V15.1: non modifica alcuna regola del modello.
+# Registra una riga per partita e aggiorna automaticamente l'esito quando
+# il risultato reale è disponibile nel dataset.
+# =====================================================================
+V15_MONITOR_FILE = "V15_1_MONITORAGGIO.csv"
+
+
+def _v15_actual_combo_key(home_goals, away_goals):
+    """Restituisce la combo realmente verificata dall'esito finale."""
+    try:
+        hg = float(home_goals)
+        ag = float(away_goals)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(hg) or not np.isfinite(ag):
+        return None
+    segno = '1' if hg > ag else ('2' if hg < ag else 'X')
+    gg = 'Goal' if (hg > 0 and ag > 0) else 'NoGoal'
+    tipo = 'Over' if (hg + ag) > 2.5 else 'Under'
+    return f'{segno}_{gg}_{tipo}'
+
+
+def _v15_register_monitoring(campionato_nome, partita, v15_info, file_path=V15_MONITOR_FILE):
+    """Salva/aggiorna automaticamente il monitoraggio V15 senza toccare la logica V15."""
+    if v15_info is None or partita is None:
+        return None
+
+    home = str(partita.get('HomeTeam', ''))
+    away = str(partita.get('AwayTeam', ''))
+    data_match = partita.get('Date_parsed', partita.get('Date'))
+    try:
+        data_match_ts = pd.to_datetime(data_match, errors='coerce', dayfirst=True)
+    except Exception:
+        data_match_ts = pd.NaT
+
+    if pd.isna(data_match_ts):
+        data_key = str(data_match) if data_match is not None else ''
+        data_out = data_key
+    else:
+        data_key = data_match_ts.strftime('%Y-%m-%d')
+        data_out = data_match_ts.strftime('%Y-%m-%d')
+
+    # Il risultato reale viene letto solo se presente: per una partita futura
+    # resta vuoto e verrà aggiornato automaticamente quando sarà disponibile.
+    hg = partita.get('FTHG')
+    ag = partita.get('FTAG')
+    actual_combo = _v15_actual_combo_key(hg, ag)
+    result_available = actual_combo is not None
+    top1_key = v15_info.get('top1_key', '')
+    top1_hit = '' if not result_available else ('SI' if top1_key == actual_combo else 'NO')
+
+    row = {
+        'data': data_out,
+        'campionato': str(campionato_nome),
+        'partita': f'{home} vs {away}',
+        'casa': home,
+        'trasferta': away,
+        'top1_combo': top1_key,
+        'raw_pct': round(100.0 * float(v15_info.get('top1_raw', np.nan)), 4),
+        'v15_attiva': 'SI' if v15_info.get('selected') else 'NO',
+        'platt_applicato': 'SI' if v15_info.get('platt_applied') else 'NO',
+        'platt_pct': round(100.0 * float(v15_info.get('platt_prob', np.nan)), 4),
+        'pendenza': round(float(v15_info.get('coef', np.nan)), 6) if np.isfinite(v15_info.get('coef', np.nan)) else np.nan,
+        'training': int(v15_info.get('train_n', 0)),
+        'motivo': str(v15_info.get('reason', '')),
+        'esito_reale_combo': actual_combo or '',
+        'top1_centrata': top1_hit,
+        'gol_casa': hg if result_available else '',
+        'gol_trasferta': ag if result_available else '',
+    }
+
+    columns = list(row.keys())
+    try:
+        if Path(file_path).exists():
+            storico = pd.read_csv(file_path, encoding='utf-8-sig')
+        else:
+            storico = pd.DataFrame(columns=columns)
+    except Exception:
+        storico = pd.DataFrame(columns=columns)
+
+    for col in columns:
+        if col not in storico.columns:
+            storico[col] = ''
+    storico = storico[columns].copy()
+
+    # Chiave stabile: stessa partita = aggiornamento, non duplicato.
+    if not storico.empty:
+        match_mask = (
+            storico['data'].astype(str).eq(data_key)
+            & storico['campionato'].astype(str).eq(str(campionato_nome))
+            & storico['casa'].astype(str).eq(home)
+            & storico['trasferta'].astype(str).eq(away)
+        )
+    else:
+        match_mask = pd.Series(dtype=bool)
+
+    if len(match_mask) and bool(match_mask.any()):
+        idx = storico.index[match_mask][0]
+        for col, value in row.items():
+            # Se il risultato non è ancora disponibile, non sovrascrivere
+            # un eventuale risultato già registrato.
+            if col in ('esito_reale_combo', 'top1_centrata', 'gol_casa', 'gol_trasferta'):
+                if result_available:
+                    storico.at[idx, col] = value
+            else:
+                storico.at[idx, col] = value
+    else:
+        storico = pd.concat([storico, pd.DataFrame([row])], ignore_index=True)
+
+    try:
+        storico.to_csv(file_path, index=False, encoding='utf-8-sig')
+    except Exception:
+        return None
+    return storico
+
 st.caption("Versione operativa V15 — modello V11 completo + PLATT O/U 2.5 + PLATT Top1 Combo (freeze: 35% / 100 osservazioni)")
 
 st.info("Uso operativo: il modello completo resta invariato. V13 calibra O/U 2.5; V15 calibra la probabilità della Top1 Combo con PLATT walk-forward (100 osservazioni precedenti dello stesso campionato) solo quando la Top1 RAW è ≥35%. Nessuna informazione futura.")
@@ -2608,6 +2726,27 @@ else:
                     )
             except Exception as _v15_err:
                 st.warning(f"⚠️ V15 PLATT Top1 Combo non applicato per errore tecnico: {type(_v15_err).__name__}: {_v15_err}")
+
+        # V15.2: registra automaticamente il risultato V15.1.
+        if v15_top1_info is not None:
+            _v15_monitor_df = _v15_register_monitoring(campionato, partita_sel, v15_top1_info)
+            if _v15_monitor_df is not None:
+                with st.expander("📊 Monitoraggio automatico V15.1", expanded=False):
+                    st.metric("Partite registrate", len(_v15_monitor_df))
+                    if 'v15_attiva' in _v15_monitor_df.columns:
+                        attive = int((_v15_monitor_df['v15_attiva'].astype(str) == 'SI').sum())
+                        st.caption(f"V15 attive registrate: {attive}")
+                    st.dataframe(_v15_monitor_df.tail(20), use_container_width=True, hide_index=True)
+                    try:
+                        st.download_button(
+                            "⬇️ Scarica registro V15.1 CSV",
+                            data=_v15_monitor_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig'),
+                            file_name=V15_MONITOR_FILE,
+                            mime="text/csv",
+                            key="v15_monitor_download"
+                        )
+                    except Exception:
+                        pass
 
         if platt_v13_info and platt_v13_info.get('stato') == 'applicato':
             st.info(
