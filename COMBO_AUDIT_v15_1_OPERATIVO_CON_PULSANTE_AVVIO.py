@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,6 +8,7 @@ import time
 import os
 import pickle
 from datetime import datetime, date
+from pathlib import Path
 from scipy.stats import poisson
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
@@ -2182,6 +2184,160 @@ def _v15_register_monitoring(campionato_nome, partita, v15_info, file_path=V15_M
         return None
     return storico
 
+# =====================================================================
+# 🚀 V15.3 — VALIDAZIONE STORICA AUTOMATICA V15.1
+# Derivata da V15.2. Non modifica la regola V15: esegue solo una
+# validazione walk-forward su tutto lo storico disponibile dei 5 campionati.
+# Per ogni partita usa esclusivamente le osservazioni precedenti dello
+# stesso campionato; la riga corrente non entra mai nel training.
+# =====================================================================
+def _v15_safe_logloss(y, p):
+    p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+    return -(float(y) * np.log(p) + (1.0 - float(y)) * np.log(1.0 - p))
+
+
+def _v15_batch_one_league(id_fd, campionato_nome, rho, ewma_span, emivita):
+    """Valida V15 in walk-forward su tutto lo storico di un campionato."""
+    hist = _v15_build_top1_history(id_fd, rho, ewma_span, emivita)
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    h = hist.copy().sort_values('data', kind='mergesort').reset_index(drop=True)
+    rows = []
+    for j, r in h.iterrows():
+        raw = float(r['top1_prob'])
+        hit = int(r['top1_hit'])
+        active = raw >= V15_TOP1_THRESHOLD
+        platt = raw
+        coef = np.nan
+        train_n = 0
+        reason = 'Top1 RAW < 35%'
+        applied = False
+        if active:
+            train = h.iloc[:j][['top1_prob', 'top1_hit']].copy()
+            model, coef, reason, train_n = _v15_fit_platt_top1(train, V15_TOP1_TRAIN)
+            if model is not None:
+                platt = _v15_predict_platt_top1(raw, model)
+                applied = True
+        rows.append({
+            'data': r['data'],
+            'campionato': campionato_nome,
+            'raw': raw,
+            'platt': platt,
+            'hit': hit,
+            'attiva': active,
+            'applicato': applied,
+            'pendenza': coef,
+            'training': train_n,
+            'motivo': reason,
+        })
+    return pd.DataFrame(rows)
+
+
+def _v15_batch_summary(df):
+    if df is None or df.empty:
+        return {}, pd.DataFrame()
+    x = df.copy()
+    n = len(x)
+    active = x[x['attiva']]
+    applied = x[x['applicato']]
+    rejected = active[~active['applicato']]
+
+    def metrics(z, prob_col):
+        if z.empty:
+            return {'N': 0, 'Hit %': np.nan, 'Prob media %': np.nan, 'Brier': np.nan, 'LogLoss': np.nan}
+        p = z[prob_col].astype(float).clip(1e-6, 1-1e-6)
+        y = z['hit'].astype(float)
+        return {
+            'N': int(len(z)),
+            'Hit %': float(y.mean()*100.0),
+            'Prob media %': float(p.mean()*100.0),
+            'Brier': float(np.mean((p-y)**2)),
+            'LogLoss': float(np.mean([_v15_safe_logloss(yy, pp) for yy, pp in zip(y, p)])),
+        }
+
+    overall = {
+        'Partite valutate': n,
+        'V15 attive': int(len(active)),
+        'PLATT applicato': int(len(applied)),
+        'PLATT rifiutato/non applicato': int(len(rejected)),
+        'Copertura V15 %': float(len(active)/n*100.0) if n else np.nan,
+        'Pendenza <= 0': int(((active['pendenza'].notna()) & (active['pendenza'] <= 0)).sum()),
+        'Training < 100': int(((active['training'] > 0) & (active['training'] < 100)).sum()),
+    }
+    raw_m = metrics(applied, 'raw')
+    platt_m = metrics(applied, 'platt')
+    for k,v in raw_m.items(): overall[f'RAW {k}'] = v
+    for k,v in platt_m.items(): overall[f'PLATT {k}'] = v
+    overall['Delta Brier PLATT-RAW'] = platt_m['Brier'] - raw_m['Brier'] if pd.notna(platt_m['Brier']) and pd.notna(raw_m['Brier']) else np.nan
+    overall['Delta LogLoss PLATT-RAW'] = platt_m['LogLoss'] - raw_m['LogLoss'] if pd.notna(platt_m['LogLoss']) and pd.notna(raw_m['LogLoss']) else np.nan
+
+    league_rows=[]
+    for camp, g in x.groupby('campionato', sort=True):
+        a=g[g['attiva']]
+        ap=g[g['applicato']]
+        rm=metrics(ap,'raw'); pm=metrics(ap,'platt')
+        league_rows.append({
+            'Campionato': camp,
+            'Partite': len(g),
+            'V15 attive': len(a),
+            'PLATT applicato': len(ap),
+            'PLATT non applicato': len(a)-len(ap),
+            'Hit %': pm['Hit %'],
+            'RAW Brier': rm['Brier'], 'PLATT Brier': pm['Brier'],
+            'Delta Brier': pm['Brier']-rm['Brier'] if pd.notna(pm['Brier']) and pd.notna(rm['Brier']) else np.nan,
+            'RAW LogLoss': rm['LogLoss'], 'PLATT LogLoss': pm['LogLoss'],
+            'Delta LogLoss': pm['LogLoss']-rm['LogLoss'] if pd.notna(pm['LogLoss']) and pd.notna(rm['LogLoss']) else np.nan,
+        })
+    return overall, pd.DataFrame(league_rows)
+
+
+def mostra_v15_3_batch(rho, ewma_span, emivita):
+    st.divider()
+    st.markdown('## 🚀 V15.3 — VALIDAZIONE STORICA AUTOMATICA')
+    st.caption('Un solo pulsante valida V15 su tutto lo storico disponibile dei 5 campionati. Walk-forward rigoroso: solo osservazioni precedenti dello stesso campionato, massimo 100.')
+    if st.button('🚀 ESEGUI VALIDAZIONE V15 SU TUTTO LO STORICO', key='v15_3_batch_run', type='primary'):
+        all_frames=[]; errors=[]
+        prog=st.progress(0.0, text='Avvio validazione V15...')
+        camps=list(CAMPIONATI_DOMESTICI.items())
+        for idx,(camp,info) in enumerate(camps):
+            prog.progress(idx/len(camps), text=f'{idx+1}/{len(camps)} — {camp}')
+            try:
+                d=_v15_batch_one_league(info['id_fd'], camp, rho, ewma_span, emivita)
+                if d is not None and not d.empty:
+                    all_frames.append(d)
+            except Exception as e:
+                errors.append((camp, f'{type(e).__name__}: {e}'))
+        prog.progress(1.0, text='Validazione completata')
+        if not all_frames:
+            st.error('❌ Nessun dato storico valutabile.')
+            if errors: st.dataframe(pd.DataFrame(errors, columns=['Campionato','Errore']), hide_index=True)
+            return
+        all_df=pd.concat(all_frames, ignore_index=True).sort_values(['data','campionato']).reset_index(drop=True)
+        overall, by_league=_v15_batch_summary(all_df)
+        st.success(f"✅ V15.3 completata: {overall['Partite valutate']} partite walk-forward valutate.")
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric('Partite', int(overall['Partite valutate']))
+        c2.metric('V15 attive', int(overall['V15 attive']))
+        c3.metric('PLATT applicato', int(overall['PLATT applicato']))
+        c4.metric('PLATT non applicato', int(overall['PLATT rifiutato/non applicato']))
+        st.markdown('### Risultato aggregato — solo casi con PLATT applicato')
+        res=pd.DataFrame([
+            {'Metrica':'Hit %','RAW':overall['RAW Hit %'],'PLATT':overall['PLATT Hit %'],'Delta':overall['PLATT Hit %']-overall['RAW Hit %']},
+            {'Metrica':'Probabilità media %','RAW':overall['RAW Prob media %'],'PLATT':overall['PLATT Prob media %'],'Delta':overall['PLATT Prob media %']-overall['RAW Prob media %']},
+            {'Metrica':'Brier','RAW':overall['RAW Brier'],'PLATT':overall['PLATT Brier'],'Delta':overall['Delta Brier PLATT-RAW']},
+            {'Metrica':'LogLoss','RAW':overall['RAW LogLoss'],'PLATT':overall['PLATT LogLoss'],'Delta':overall['Delta LogLoss PLATT-RAW']},
+        ])
+        st.dataframe(res.round(6), use_container_width=True, hide_index=True)
+        st.markdown('### Per campionato')
+        st.dataframe(by_league.round(6), use_container_width=True, hide_index=True)
+        st.caption(f"Copertura V15: {overall['Copertura V15 %']:.1f}% · Pendenza <=0 osservata: {overall['Pendenza <= 0']} · Training <100: {overall['Training < 100']}")
+        csv=all_df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button('⬇️ Scarica risultati completi V15.3 CSV', data=csv, file_name='V15_3_VALIDAZIONE_STORICA.csv', mime='text/csv', key='v15_3_csv')
+        if errors:
+            st.warning('Alcuni campionati hanno restituito errori:')
+            st.dataframe(pd.DataFrame(errors, columns=['Campionato','Errore']), use_container_width=True, hide_index=True)
+
+
 st.caption("Versione operativa V15 — modello V11 completo + PLATT O/U 2.5 + PLATT Top1 Combo (freeze: 35% / 100 osservazioni)")
 
 st.info("Uso operativo: il modello completo resta invariato. V13 calibra O/U 2.5; V15 calibra la probabilità della Top1 Combo con PLATT walk-forward (100 osservazioni precedenti dello stesso campionato) solo quando la Top1 RAW è ≥35%. Nessuna informazione futura.")
@@ -2192,6 +2348,8 @@ st.info("Uso operativo: il modello completo resta invariato. V13 calibra O/U 2.5
 rho_val = -0.10        # correzione Dixon-Coles (valore tipico da letteratura)
 ewma_span_val = 6      # finestra della forma recente
 emivita_val = 180      # decadimento temporale in giorni
+
+mostra_v15_3_batch(rho_val, ewma_span_val, emivita_val)
 
 with st.sidebar:
     st.header("⚙️ Configurazione & API")
