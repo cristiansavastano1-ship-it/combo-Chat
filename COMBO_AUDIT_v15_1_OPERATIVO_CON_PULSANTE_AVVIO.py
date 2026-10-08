@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -1321,9 +1320,50 @@ else:
             df["Probabilità (%)"] = df["Probabilità (%)"].astype(str) + "%"
             return df
 
-        st.markdown("### 🏆 Esito Finale (1X2)")
-        df_1x2 = crea_tabella({"1 (Casa)": modello['prob_1'], "X (Pareggio)": modello['prob_X'], "2 (Trasferta)": modello['prob_2']}, "Segno")
+        # =====================================================================
+        # 🎯 RIEPILOGO OPERATIVO — 1X2 + DOPPIA CHANCE
+        # Solo presentazione: non modifica nessuna probabilità o logica del modello.
+        # La doppia chance deriva direttamente dalle probabilità 1X2 correnti.
+        # =====================================================================
+        p1 = float(modello['prob_1'])
+        px = float(modello['prob_X'])
+        p2 = float(modello['prob_2'])
+        probabilita_1x2 = {"1": p1, "X": px, "2": p2}
+        segno_top = max(probabilita_1x2, key=probabilita_1x2.get)
+
+        doppia_chance = {
+            "1X": p1 + px,
+            "X2": px + p2,
+            "12": p1 + p2,
+        }
+        doppia_chance_top = max(doppia_chance, key=doppia_chance.get)
+
+        st.markdown("### 🎯 PRONOSTICO OPERATIVO")
+        col_ris, col_dc = st.columns(2)
+        with col_ris:
+            st.markdown("#### 🏆 RISULTATO 1X2")
+            st.markdown(
+                f'<div style="padding:16px 12px;border-radius:12px;border:2px solid #2e7d32;">'
+                f'<div style="font-size:14px;opacity:.8;">Segno più probabile</div>'
+                f'<div style="font-size:42px;font-weight:800;line-height:1.05;">{segno_top}</div>'
+                f'<div style="font-size:18px;font-weight:600;">{probabilita_1x2[segno_top]:.1f}%</div>'
+                f"</div>", unsafe_allow_html=True
+            )
+        with col_dc:
+            st.markdown("#### 🛡️ DOPPIA CHANCE")
+            st.markdown(
+                f'<div style="padding:16px 12px;border-radius:12px;border:2px solid #1565c0;">'
+                f'<div style="font-size:14px;opacity:.8;">Doppia chance più probabile</div>'
+                f'<div style="font-size:42px;font-weight:800;line-height:1.05;">{doppia_chance_top}</div>'
+                f'<div style="font-size:18px;font-weight:600;">{doppia_chance[doppia_chance_top]:.1f}%</div>'
+                f"</div>", unsafe_allow_html=True
+            )
+
+        df_1x2 = crea_tabella({"1 (Casa)": p1, "X (Pareggio)": px, "2 (Trasferta)": p2}, "Segno")
         st.dataframe(df_1x2, use_container_width=True, hide_index=True)
+
+        df_doppia_chance = crea_tabella(doppia_chance, "Doppia Chance")
+        st.dataframe(df_doppia_chance, use_container_width=True, hide_index=True)
 
         quote, quote_ou_25 = None, None  # usate più sotto per la stima combo approssimata (Punto C)
 
