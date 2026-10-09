@@ -11,7 +11,7 @@ from scipy.stats import poisson
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 
-st.set_page_config(page_title="COMBO — V15.1 CLEAN FIX", page_icon="⚽", layout="centered")
+st.set_page_config(page_title="COMBO — V15.2 Operativo Prossime Partite", page_icon="⚽", layout="centered")
 
 AUDIT_SCORE_MAX = 12
 EPS_PROB = 1e-9
@@ -413,16 +413,35 @@ def calcola_combo_libera(griglia, segno=None, soglia_gol=None, tipo_soglia=None,
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def carica_fixture_future(id_fd):
-    df, _ = scarica_csv_robusto("https://football-data.co.uk/fixtures.csv")
-    if df is not None:
-        fx = df.copy()
-        fx.columns = fx.columns.str.strip()
-        if 'Div' in fx.columns:
-            fx = fx[fx['Div'] == id_fd].copy()
-            fx['Date_parsed'] = pd.to_datetime(fx['Date'], errors='coerce', dayfirst=True)
-            oggi = pd.Timestamp(date.today())
-            return fx[fx['Date_parsed'] >= oggi].sort_values('Date_parsed').reset_index(drop=True)
-    return pd.DataFrame()
+    """Scarica e normalizza le sole fixture future del campionato richiesto.
+
+    Fonte gratuita football-data.co.uk. Se la fonte non è raggiungibile,
+    restituisce un DataFrame vuoto: non genera partite o risultati artificiali.
+    """
+    df, errore = scarica_csv_robusto("https://football-data.co.uk/fixtures.csv")
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    fx = df.copy()
+    fx.columns = [str(c).replace('\ufeff', '').strip() for c in fx.columns]
+    colonne_richieste = {'Div', 'Date', 'HomeTeam', 'AwayTeam'}
+    if not colonne_richieste.issubset(set(fx.columns)):
+        return pd.DataFrame()
+
+    fx['Div'] = fx['Div'].astype(str).str.strip()
+    fx = fx[fx['Div'].eq(str(id_fd))].copy()
+    if fx.empty:
+        return pd.DataFrame()
+
+    fx['Date_parsed'] = pd.to_datetime(fx['Date'], errors='coerce', dayfirst=True)
+    fx = fx.dropna(subset=['Date_parsed', 'HomeTeam', 'AwayTeam'])
+    fx = fx[(fx['HomeTeam'].astype(str).str.strip() != '') &
+            (fx['AwayTeam'].astype(str).str.strip() != '')]
+    oggi = pd.Timestamp(date.today()).normalize()
+    fx = fx[fx['Date_parsed'].dt.normalize() >= oggi]
+    return fx.sort_values(['Date_parsed', 'HomeTeam']).drop_duplicates(
+        subset=['Date_parsed', 'HomeTeam', 'AwayTeam']
+    ).reset_index(drop=True)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1052,7 +1071,7 @@ def _v15_operational_top1_platt(id_fd, rho, ewma_span, emivita, modello, data_ri
     return info
 
 
-st.caption("Versione operativa V15 — modello V11 completo + PLATT O/U 2.5 + PLATT Top1 Combo (freeze: 35% / 100 osservazioni)")
+st.caption("Versione operativa V15.2 — modello V11 completo + PLATT O/U 2.5 + PLATT Top1 Combo (freeze: 35% / 100 osservazioni)")
 
 st.info("Uso operativo: il modello completo resta invariato. V13 calibra O/U 2.5; V15 calibra la probabilità della Top1 Combo con PLATT walk-forward (100 osservazioni precedenti dello stesso campionato) solo quando la Top1 RAW è ≥35%. Nessuna informazione futura.")
 
@@ -1124,16 +1143,32 @@ if scelta_categoria == "Campionati Nazionali (Gratuiti)":
         st.error("Impossibile scaricare i dati. Riprova tra poco.")
         st.stop()
 
+    # Le prossime partite sono la scelta predefinita; le storiche restano
+    # disponibili solo come modalità separata per controlli e confronti.
+    modalita_partite = st.radio(
+        "📅 Quali partite vuoi analizzare?",
+        ["Prossime partite", "Ultime partite giocate (controllo)"],
+        horizontal=True,
+        key="modalita_partite_domestiche",
+    )
     opzioni_partite, mappa_partite = [], []
-    if not fixture_future.empty:
-        for _, r in fixture_future.iterrows():
-            opzioni_partite.append(f"FUTURA ({r.get('Date','?')}): {r.get('HomeTeam','?')} vs {r.get('AwayTeam','?')}")
+    if modalita_partite == "Prossime partite":
+        if not fixture_future.empty:
+            for _, r in fixture_future.iterrows():
+                data_label = r['Date_parsed'].strftime('%d/%m/%Y') if pd.notna(r.get('Date_parsed')) else str(r.get('Date', '?'))
+                opzioni_partite.append(f"📅 {data_label} — {r.get('HomeTeam','?')} vs {r.get('AwayTeam','?')}")
+                mappa_partite.append(r.to_dict())
+        else:
+            st.warning(
+                "Non risultano fixture future per questo campionato nella fonte gratuita. "
+                "Puoi riprovare più tardi oppure scegliere le ultime partite giocate per un controllo."
+            )
+    else:
+        storiche = dati[dati['FTHG'].notna()].tail(15).sort_values('Date_parsed', ascending=False)
+        for _, r in storiche.iterrows():
+            data_label = r['Date_parsed'].strftime('%d/%m/%Y') if pd.notna(r.get('Date_parsed')) else str(r.get('Date', '?'))
+            opzioni_partite.append(f"🕘 {data_label} — {r.get('HomeTeam','?')} vs {r.get('AwayTeam','?')}")
             mappa_partite.append(r.to_dict())
-
-    storiche = dati[dati['FTHG'].notna()].tail(15)
-    for _, r in storiche.iterrows():
-        opzioni_partite.append(f"RECENTE ({r.get('Date','?')}): {r.get('HomeTeam','?')} vs {r.get('AwayTeam','?')}")
-        mappa_partite.append(r.to_dict())
     df_globale = pd.DataFrame()
     is_coppa = False
 
@@ -1165,21 +1200,34 @@ else:
         st.stop()
 
     dati_storico = dati[dati['Status'] == 'FINISHED'].copy()
-    dati_future = dati[dati['Status'] != 'FINISHED'].copy()
-
+    oggi_ts = pd.Timestamp(date.today())
+    dati_future = dati[(dati['Status'].isin(['SCHEDULED', 'TIMED'])) &
+                       (dati['Date_parsed'] >= oggi_ts)].copy()
+    modalita_partite_coppe = st.radio(
+        "📅 Quali partite vuoi analizzare?",
+        ["Prossime partite", "Ultime partite giocate (controllo)"],
+        horizontal=True,
+        key="modalita_partite_coppe",
+    )
     opzioni_partite, mappa_partite = [], []
-    for _, r in dati_future.iterrows():
-        opzioni_partite.append(f"FUTURA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
-        mappa_partite.append(r.to_dict())
-    for _, r in dati_storico.tail(10).iterrows():
-        opzioni_partite.append(f"GIOCATA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
-        mappa_partite.append(r.to_dict())
+    if modalita_partite_coppe == "Prossime partite":
+        for _, r in dati_future.sort_values('Date_parsed').iterrows():
+            data_label = r['Date_parsed'].strftime('%d/%m/%Y') if pd.notna(r.get('Date_parsed')) else str(r.get('Date', '?'))
+            opzioni_partite.append(f"📅 {data_label} — {r['HomeTeam']} vs {r['AwayTeam']}")
+            mappa_partite.append(r.to_dict())
+        if not opzioni_partite:
+            st.warning("Nessuna partita futura programmata restituita dall'API per questa coppa.")
+    else:
+        for _, r in dati_storico.sort_values('Date_parsed', ascending=False).head(10).iterrows():
+            data_label = r['Date_parsed'].strftime('%d/%m/%Y') if pd.notna(r.get('Date_parsed')) else str(r.get('Date', '?'))
+            opzioni_partite.append(f"🕘 {data_label} — {r['HomeTeam']} vs {r['AwayTeam']}")
+            mappa_partite.append(r.to_dict())
     is_coppa = True
 
 if not opzioni_partite:
-    st.warning("Nessuna partita disponibile al momento.")
+    st.warning("Nessuna partita disponibile nella modalità selezionata. Prova a cambiare campionato o modalità.")
 else:
-    scelta = st.selectbox("Seleziona Partita", opzioni_partite)
+    scelta = st.selectbox("⚽ Seleziona la partita da analizzare", opzioni_partite)
     idx_sel = opzioni_partite.index(scelta)
     partita_sel = mappa_partite[idx_sel]
 
@@ -1339,6 +1387,11 @@ else:
         doppia_chance_top = max(doppia_chance, key=doppia_chance.get)
 
         st.markdown("### 🎯 PRONOSTICO OPERATIVO")
+        st.caption("Il segno singolo è scelto confrontando le tre probabilità del modello; la X è selezionabile esattamente come 1 e 2.")
+        c_prob1, c_probX, c_prob2 = st.columns(3)
+        c_prob1.metric("SEGNO 1", f"{p1:.1f}%")
+        c_probX.metric("SEGNO X · PAREGGIO", f"{px:.1f}%")
+        c_prob2.metric("SEGNO 2", f"{p2:.1f}%")
         col_ris, col_dc = st.columns(2)
         with col_ris:
             st.markdown("#### 🏆 RISULTATO 1X2")
