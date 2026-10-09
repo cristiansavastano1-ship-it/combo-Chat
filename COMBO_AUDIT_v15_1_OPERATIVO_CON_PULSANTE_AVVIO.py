@@ -1183,6 +1183,127 @@ else:
         st.dataframe(_tab_prossime, use_container_width=True, hide_index=True)
         st.download_button("📥 Scarica calendario filtrato (CSV)", _tab_prossime.to_csv(index=False).encode("utf-8-sig"), file_name="combo_prossime_partite.csv", mime="text/csv", key="download_prossime_tutte")
 
+# =====================================================================
+# V15.4 — PRONOSTICI AUTOMATICI PER IL CALENDARIO FUTURO
+# Richiama il motore esistente in modalità walk-forward: per ogni partita
+# usa esclusivamente risultati antecedenti alla data della fixture.
+# Non modifica V11/V13/V15 né salva/modifica calibratori.
+# =====================================================================
+st.markdown("## 🤖 Pronostici automatici — prossime partite")
+st.caption("Calcola 1/X/2 e doppia chance per le fixture filtrate. Ogni stima usa risultati precedenti alla partita; le percentuali 1X2 sono RAW, salvo calibrazione 1X2 opzionale già selezionata nella barra laterale.")
+
+if not _df_prossime_tutte.empty:
+    _df_batch_base = _df_prossime_tutte.copy()
+    _df_batch_base["Data"] = pd.to_datetime(_df_batch_base["Data"], errors="coerce")
+    _oggi_batch = pd.Timestamp(date.today()).normalize()
+    _periodo_batch = st.radio("Periodo per i pronostici", ["Oggi", "Domani", "Prossimi 7 giorni", "Prossimi 30 giorni", "Tutte le date disponibili"], index=2, horizontal=True, key="periodo_pronostici_batch")
+    if _periodo_batch == "Oggi":
+        _inizio_batch = _oggi_batch; _fine_batch = _oggi_batch
+    elif _periodo_batch == "Domani":
+        _inizio_batch = _oggi_batch + pd.Timedelta(days=1); _fine_batch = _inizio_batch
+    elif _periodo_batch == "Prossimi 7 giorni":
+        _inizio_batch = _oggi_batch; _fine_batch = _oggi_batch + pd.Timedelta(days=6)
+    elif _periodo_batch == "Prossimi 30 giorni":
+        _inizio_batch = _oggi_batch; _fine_batch = _oggi_batch + pd.Timedelta(days=29)
+    else:
+        _inizio_batch = _oggi_batch; _fine_batch = _df_batch_base["Data"].max().normalize()
+    _df_batch_base = _df_batch_base[
+        (_df_batch_base["Data"].dt.normalize() >= _inizio_batch) &
+        (_df_batch_base["Data"].dt.normalize() <= _fine_batch)
+    ].copy()
+    _leghe_batch = ["Tutti i campionati"] + sorted(_df_batch_base["Campionato"].dropna().unique().tolist())
+    _lega_batch_sel = st.selectbox("Campionato per i pronostici", _leghe_batch, key="lega_pronostici_batch")
+    if _lega_batch_sel != "Tutti i campionati":
+        _df_batch_base = _df_batch_base[_df_batch_base["Campionato"] == _lega_batch_sel]
+    _limite_batch = st.selectbox("Numero massimo di partite da calcolare", [10, 20, 30, 50, 100], index=2, key="limite_pronostici_batch")
+    _df_batch_base = _df_batch_base.sort_values(["Data", "Campionato", "Casa"]).head(_limite_batch)
+    st.caption(f"Partite selezionate per il calcolo: {len(_df_batch_base)}. Il calcolo parte solo quando premi il pulsante.")
+    if st.button("⚽ CALCOLA PRONOSTICI DELLE PARTITE VISUALIZZATE", type="primary", key="calcola_batch_pronostici"):
+        _righe_pronostici = []
+        _cache_dati_lega = {}
+        _globale_batch = carica_tutti_i_campionati()
+        _progress_batch = st.progress(0, text="Preparazione dei dati storici...")
+        _errori_batch = 0
+        _tot_batch = max(1, len(_df_batch_base))
+        for _idx_batch, (_idx_riga_batch, _fx_batch) in enumerate(_df_batch_base.iterrows(), start=1):
+            try:
+                _nome_lega_batch = _fx_batch["Campionato"]
+                _id_lega_batch = str(_fx_batch["_id_fd"])
+                if _id_lega_batch not in _cache_dati_lega:
+                    _cache_dati_lega[_id_lega_batch] = carica_dati_campionato(_id_lega_batch)
+                _dati_lega_batch = _cache_dati_lega[_id_lega_batch]
+                _data_fx_batch = pd.to_datetime(_fx_batch["Data"], errors="coerce")
+                if _dati_lega_batch is None or _dati_lega_batch.empty or pd.isna(_data_fx_batch):
+                    raise ValueError("Dati storici o data partita non disponibili")
+                _storico_batch = _dati_lega_batch[
+                    _dati_lega_batch["Date_parsed"] < _data_fx_batch
+                ].copy()
+                _globale_storico_batch = _globale_batch.copy()
+                if not _globale_storico_batch.empty:
+                    _globale_storico_batch = _globale_storico_batch[
+                        _globale_storico_batch["Date_parsed"] < _data_fx_batch
+                    ].copy()
+                _mod_batch = calcola_modello_completo(
+                    _storico_batch, str(_fx_batch["Casa"]), str(_fx_batch["Trasferta"]),
+                    rho_val, ewma_span_val, emivita_val, _globale_storico_batch,
+                    data_riferimento=_data_fx_batch
+                )
+                if _mod_batch is None:
+                    raise ValueError("Il modello non ha prodotto una stima")
+                _p1b = float(_mod_batch["prob_1"]); _pxb = float(_mod_batch["prob_X"]); _p2b = float(_mod_batch["prob_2"])
+                _info_cal_batch = None
+                if usa_calibrazione:
+                    try:
+                        _info_cal_batch = carica_calibratore(_id_lega_batch, "1x2")
+                        if _info_cal_batch:
+                            _mod_batch = applica_calibrazione_1x2(_mod_batch, _info_cal_batch["calibratore"])
+                            _p1b = float(_mod_batch["prob_1"]); _pxb = float(_mod_batch["prob_X"]); _p2b = float(_mod_batch["prob_2"])
+                    except Exception:
+                        _info_cal_batch = None
+                _prob_segni_batch = {"1": _p1b, "X": _pxb, "2": _p2b}
+                _segno_batch = max(_prob_segni_batch, key=_prob_segni_batch.get)
+                _dc_batch = {"1X": _p1b + _pxb, "X2": _pxb + _p2b, "12": _p1b + _p2b}
+                _dc_top_batch = max(_dc_batch, key=_dc_batch.get)
+                _n_casa_batch = int(_mod_batch.get("n_casa", 0)); _n_trasf_batch = int(_mod_batch.get("n_trasf", 0))
+                _qualita_batch = "Dati limitati" if min(_n_casa_batch, _n_trasf_batch) < 5 else "Dati squadra ≥5"
+                _righe_pronostici.append({
+                    "Data": _data_fx_batch.strftime("%d/%m/%Y"), "Campionato": _nome_lega_batch,
+                    "Partita": f'{_fx_batch["Casa"]} - {_fx_batch["Trasferta"]}',
+                    "1 (%)": round(_p1b, 1), "X (%)": round(_pxb, 1), "2 (%)": round(_p2b, 1),
+                    "Segno più probabile": _segno_batch, "Prob. segno (%)": round(_prob_segni_batch[_segno_batch], 1),
+                    "Doppia chance": _dc_top_batch, "Prob. DC (%)": round(_dc_batch[_dc_top_batch], 1),
+                    "Partite casa": _n_casa_batch, "Partite trasferta": _n_trasf_batch,
+                    "Indicatore dati": _qualita_batch,
+                    "Calibrazione 1X2": "Applicata" if _info_cal_batch else "RAW",
+                })
+            except Exception as _err_batch:
+                _errori_batch += 1
+                _righe_pronostici.append({
+                    "Data": pd.to_datetime(_fx_batch["Data"]).strftime("%d/%m/%Y") if pd.notna(_fx_batch["Data"]) else "",
+                    "Campionato": _fx_batch.get("Campionato", ""),
+                    "Partita": f'{_fx_batch.get("Casa", "")} - {_fx_batch.get("Trasferta", "")}',
+                    "1 (%)": None, "X (%)": None, "2 (%)": None,
+                    "Segno più probabile": "N/D", "Prob. segno (%)": None,
+                    "Doppia chance": "N/D", "Prob. DC (%)": None,
+                    "Partite casa": None, "Partite trasferta": None,
+                    "Indicatore dati": f"Non calcolato: {type(_err_batch).__name__}",
+                    "Calibrazione 1X2": "N/D",
+                })
+            _progress_batch.progress(_idx_batch / _tot_batch, text=f"Analisi partite: {_idx_batch}/{_tot_batch}")
+        _progress_batch.empty()
+        _df_risultati_batch = pd.DataFrame(_righe_pronostici)
+        st.session_state["combo_pronostici_batch_v154"] = _df_risultati_batch
+        st.session_state["combo_pronostici_batch_v154_data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+        st.success(f"Calcolo terminato: {len(_righe_pronostici) - _errori_batch} pronostici calcolati; {_errori_batch} non disponibili.")
+
+    if "combo_pronostici_batch_v154" in st.session_state:
+        _df_risultati_batch = st.session_state["combo_pronostici_batch_v154"]
+        st.caption("Ultimo calcolo: " + st.session_state.get("combo_pronostici_batch_v154_data", "n/d") + ". Le righe N/D indicano dati insufficienti o un errore di elaborazione: non sono pronostici.")
+        st.dataframe(_df_risultati_batch, use_container_width=True, hide_index=True)
+        st.download_button("📥 Scarica pronostici in CSV", _df_risultati_batch.to_csv(index=False).encode("utf-8-sig"), file_name="combo_pronostici_v15_4.csv", mime="text/csv", key="download_pronostici_batch_v154")
+else:
+    st.info("Non ci sono fixture future disponibili da analizzare automaticamente in questo momento.")
+
 st.divider()
 scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)"], horizontal=True)
 
