@@ -1128,6 +1128,62 @@ with col_status:
 if not st.session_state.v15_operativo_avviato:
     st.stop()
 
+# =====================================================================
+# V15.3 — PANORAMICA UNIFICATA DELLE PROSSIME PARTITE
+# Mostra in un'unica tabella tutte le fixture future reperibili dalle fonti
+# gratuite nazionali; i filtri non modificano il modello di previsione.
+# =====================================================================
+st.markdown("## 📅 Panoramica prossime partite — tutti i campionati")
+st.caption("Elenco aggregato delle fixture future disponibili. Seleziona qui periodo e campionato per trovare gli incontri; l'analisi dettagliata si avvia nella sezione sottostante.")
+
+with st.spinner("Raccolta calendario dei campionati nazionali disponibili..."):
+    _fixture_rows = []
+    for _nome_lega, _info_lega in CAMPIONATI_DOMESTICI.items():
+        _df_fx = carica_fixture_future(_info_lega["id_fd"])
+        if _df_fx is not None and not _df_fx.empty:
+            for _, _r_fx in _df_fx.iterrows():
+                _fixture_rows.append({
+                    "Data": _r_fx.get("Date_parsed"),
+                    "Campionato": _nome_lega,
+                    "Casa": _r_fx.get("HomeTeam", ""),
+                    "Trasferta": _r_fx.get("AwayTeam", ""),
+                    "_id_fd": _info_lega["id_fd"],
+                })
+
+_df_prossime_tutte = pd.DataFrame(_fixture_rows)
+if _df_prossime_tutte.empty:
+    st.info("La fonte gratuita non restituisce in questo momento fixture future per i campionati nazionali. Puoi comunque usare la selezione di campionato più sotto o riprovare più tardi.")
+else:
+    _df_prossime_tutte["Data"] = pd.to_datetime(_df_prossime_tutte["Data"], errors="coerce")
+    _oggi_filtro = pd.Timestamp(date.today()).normalize()
+    _periodo = st.radio("🗓️ Periodo", ["Oggi", "Domani", "Prossimi 7 giorni", "Prossimi 30 giorni", "Tutte le date disponibili"], index=2, horizontal=True, key="filtro_periodo_prossime_tutte")
+    _lega_options = ["Tutti i campionati"] + sorted(_df_prossime_tutte["Campionato"].dropna().unique().tolist())
+    _lega_filtro = st.selectbox("🏆 Filtra campionato", _lega_options, key="filtro_lega_prossime_tutte")
+    if _periodo == "Oggi":
+        _fine_periodo = _oggi_filtro
+    elif _periodo == "Domani":
+        _oggi_filtro = _oggi_filtro + pd.Timedelta(days=1)
+        _fine_periodo = _oggi_filtro
+    elif _periodo == "Prossimi 7 giorni":
+        _fine_periodo = _oggi_filtro + pd.Timedelta(days=6)
+    elif _periodo == "Prossimi 30 giorni":
+        _fine_periodo = _oggi_filtro + pd.Timedelta(days=29)
+    else:
+        _fine_periodo = _df_prossime_tutte["Data"].max().normalize()
+    _df_vis = _df_prossime_tutte[(_df_prossime_tutte["Data"].dt.normalize() >= _oggi_filtro) & (_df_prossime_tutte["Data"].dt.normalize() <= _fine_periodo)].copy()
+    if _lega_filtro != "Tutti i campionati":
+        _df_vis = _df_vis[_df_vis["Campionato"] == _lega_filtro]
+    _df_vis = _df_vis.sort_values(["Data", "Campionato", "Casa"], na_position="last")
+    if _df_vis.empty:
+        st.warning("Nessuna partita trovata con questi filtri. Prova un periodo più ampio o tutti i campionati.")
+    else:
+        _df_vis["Data e ora/data"] = _df_vis["Data"].dt.strftime("%d/%m/%Y")
+        _tab_prossime = _df_vis[["Data e ora/data", "Campionato", "Casa", "Trasferta"]].reset_index(drop=True)
+        st.metric("Partite trovate", len(_tab_prossime))
+        st.dataframe(_tab_prossime, use_container_width=True, hide_index=True)
+        st.download_button("📥 Scarica calendario filtrato (CSV)", _tab_prossime.to_csv(index=False).encode("utf-8-sig"), file_name="combo_prossime_partite.csv", mime="text/csv", key="download_prossime_tutte")
+
+st.divider()
 scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)"], horizontal=True)
 
 if scelta_categoria == "Campionati Nazionali (Gratuiti)":
