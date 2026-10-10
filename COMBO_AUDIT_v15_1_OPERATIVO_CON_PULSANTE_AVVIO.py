@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,74 +11,10 @@ from scipy.stats import poisson
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 
-st.set_page_config(page_title="COMBO — V15.5 Archivio Pronostici", page_icon="⚽", layout="centered")
+st.set_page_config(page_title="COMBO — V15.2 Operativo Prossime Partite", page_icon="⚽", layout="centered")
 
 AUDIT_SCORE_MAX = 12
 EPS_PROB = 1e-9
-
-# V15.5: archivio locale delle previsioni. Su hosting effimeri il file può
-# essere perso al riavvio/redeploy: scaricare periodicamente il CSV di backup.
-ARCHIVIO_PRONOSTICI_PATH = os.environ.get("COMBO_ARCHIVIO_PRONOSTICI", "combo_archivio_pronostici.csv")
-COLONNE_ARCHIVIO = [
-    "Data partita", "Campionato", "Partita", "1 (%)", "X (%)", "2 (%)",
-    "Segno più probabile", "Prob. segno (%)", "Doppia chance", "Prob. DC (%)",
-    "Partite casa", "Partite trasferta", "Indicatore dati", "Calibrazione 1X2",
-    "Data registrazione", "Risultato finale", "Segno effettivo", "1X2 corretto",
-    "Doppia chance corretta", "Stato verifica"
-]
-
-def carica_archivio_pronostici():
-    """Carica archivio locale; se assente restituisce una tabella vuota."""
-    try:
-        if os.path.exists(ARCHIVIO_PRONOSTICI_PATH):
-            df_arch = pd.read_csv(ARCHIVIO_PRONOSTICI_PATH, encoding="utf-8-sig")
-            for col in COLONNE_ARCHIVIO:
-                if col not in df_arch.columns:
-                    df_arch[col] = ""
-            return df_arch[COLONNE_ARCHIVIO]
-    except Exception:
-        pass
-    return pd.DataFrame(columns=COLONNE_ARCHIVIO)
-
-def salva_nuovi_pronostici(df_nuovi):
-    """Aggiunge solo partite non ancora archiviate; non sovrascrive previsioni storiche."""
-    archivio = carica_archivio_pronostici()
-    if df_nuovi is None or df_nuovi.empty:
-        return archivio, 0
-    nuovi = []
-    esistenti = set((str(r.get("Data partita", "")), str(r.get("Campionato", "")), str(r.get("Partita", "")))
-                    for _, r in archivio.iterrows())
-    adesso = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    for _, r in df_nuovi.iterrows():
-        segno = str(r.get("Segno più probabile", "N/D"))
-        if segno == "N/D":
-            continue
-        data_partita = str(r.get("Data", ""))
-        lega = str(r.get("Campionato", ""))
-        partita = str(r.get("Partita", ""))
-        chiave = (data_partita, lega, partita)
-        if chiave in esistenti:
-            continue
-        esistenti.add(chiave)
-        nuova = {col: "" for col in COLONNE_ARCHIVIO}
-        nuova.update({
-            "Data partita": data_partita, "Campionato": lega, "Partita": partita,
-            "1 (%)": r.get("1 (%)", ""), "X (%)": r.get("X (%)", ""), "2 (%)": r.get("2 (%)", ""),
-            "Segno più probabile": segno, "Prob. segno (%)": r.get("Prob. segno (%)", ""),
-            "Doppia chance": r.get("Doppia chance", ""), "Prob. DC (%)": r.get("Prob. DC (%)", ""),
-            "Partite casa": r.get("Partite casa", ""), "Partite trasferta": r.get("Partite trasferta", ""),
-            "Indicatore dati": r.get("Indicatore dati", ""), "Calibrazione 1X2": r.get("Calibrazione 1X2", ""),
-            "Data registrazione": adesso, "Risultato finale": "", "Segno effettivo": "",
-            "1X2 corretto": "", "Doppia chance corretta": "", "Stato verifica": "In attesa risultato"
-        })
-        nuovi.append(nuova)
-    if nuovi:
-        archivio = pd.concat([archivio, pd.DataFrame(nuovi)], ignore_index=True)
-        try:
-            archivio.to_csv(ARCHIVIO_PRONOSTICI_PATH, index=False, encoding="utf-8-sig")
-        except Exception as exc:
-            raise OSError(f"Impossibile scrivere l'archivio: {exc}")
-    return archivio, len(nuovi)
 
 CAMPIONATI_DOMESTICI = {
     "Italia - Serie A": {"id_fd": "I1"},
@@ -1357,41 +1292,17 @@ if not _df_prossime_tutte.empty:
             _progress_batch.progress(_idx_batch / _tot_batch, text=f"Analisi partite: {_idx_batch}/{_tot_batch}")
         _progress_batch.empty()
         _df_risultati_batch = pd.DataFrame(_righe_pronostici)
-        st.session_state["combo_pronostici_batch_v155"] = _df_risultati_batch
-        st.session_state["combo_pronostici_batch_v155_data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-        try:
-            _archivio_salvato, _nuovi_archivi = salva_nuovi_pronostici(_df_risultati_batch)
-            st.success(f"Calcolo terminato: {len(_righe_pronostici) - _errori_batch} pronostici calcolati; {_errori_batch} non disponibili. Archivio aggiornato: {_nuovi_archivi} nuove partite salvate.")
-        except Exception as _err_archivio:
-            st.warning(f"Pronostici calcolati, ma archivio non salvato: {_err_archivio}. Scarica il CSV dei pronostici come backup.")
+        st.session_state["combo_pronostici_batch_v154"] = _df_risultati_batch
+        st.session_state["combo_pronostici_batch_v154_data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+        st.success(f"Calcolo terminato: {len(_righe_pronostici) - _errori_batch} pronostici calcolati; {_errori_batch} non disponibili.")
 
-    if "combo_pronostici_batch_v155" in st.session_state:
-        _df_risultati_batch = st.session_state["combo_pronostici_batch_v155"]
-        st.caption("Ultimo calcolo: " + st.session_state.get("combo_pronostici_batch_v155_data", "n/d") + ". Le righe N/D indicano dati insufficienti o un errore di elaborazione: non sono pronostici.")
+    if "combo_pronostici_batch_v154" in st.session_state:
+        _df_risultati_batch = st.session_state["combo_pronostici_batch_v154"]
+        st.caption("Ultimo calcolo: " + st.session_state.get("combo_pronostici_batch_v154_data", "n/d") + ". Le righe N/D indicano dati insufficienti o un errore di elaborazione: non sono pronostici.")
         st.dataframe(_df_risultati_batch, use_container_width=True, hide_index=True)
-        st.download_button("📥 Scarica pronostici in CSV", _df_risultati_batch.to_csv(index=False).encode("utf-8-sig"), file_name="combo_pronostici_v15_5.csv", mime="text/csv", key="download_pronostici_batch_v155")
+        st.download_button("📥 Scarica pronostici in CSV", _df_risultati_batch.to_csv(index=False).encode("utf-8-sig"), file_name="combo_pronostici_v15_4.csv", mime="text/csv", key="download_pronostici_batch_v154")
 else:
     st.info("Non ci sono fixture future disponibili da analizzare automaticamente in questo momento.")
-
-
-# =====================================================================
-# V15.5 — ARCHIVIO E CONTROLLO STORICO DEI PRONOSTICI
-# Le previsioni salvate sono immutabili: una seconda analisi della stessa
-# partita non sovrascrive la prima registrazione.
-# =====================================================================
-st.markdown("## 💾 Archivio e verifica dei pronostici")
-st.caption("Le previsioni calcolate vengono salvate localmente una sola volta per partita. Il risultato finale resta vuoto finché non viene verificato: non vengono inventati risultati né aggiornati automaticamente da fonti non verificate.")
-_archivo_ui = carica_archivio_pronostici()
-if _archivio_ui.empty:
-    st.info("Archivio ancora vuoto. Calcola i pronostici automatici per salvare le prime partite.")
-else:
-    _c1, _c2, _c3 = st.columns(3)
-    _c1.metric("Pronostici archiviati", len(_archivio_ui))
-    _c2.metric("In attesa del risultato", int((_archivio_ui["Stato verifica"] == "In attesa risultato").sum()))
-    _c3.metric("Verificati", int((_archivio_ui["Stato verifica"] == "Verificato").sum()))
-    st.dataframe(_archivio_ui, use_container_width=True, hide_index=True)
-    st.download_button("📥 Scarica backup completo archivio CSV", _archivio_ui.to_csv(index=False).encode("utf-8-sig"), file_name="combo_archivio_pronostici_v15_5.csv", mime="text/csv", key="download_archivio_pronostici_v155")
-    st.warning("Backup consigliato: alcuni hosting gratuiti possono cancellare i file locali dopo riavvii o nuovi deploy. Conserva il CSV scaricato.")
 
 st.divider()
 scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)"], horizontal=True)
