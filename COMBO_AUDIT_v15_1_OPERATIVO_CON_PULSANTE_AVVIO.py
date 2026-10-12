@@ -11,7 +11,7 @@ from scipy.stats import poisson
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 
-st.set_page_config(page_title="COMBO — V15.2 Operativo Prossime Partite", page_icon="⚽", layout="centered")
+st.set_page_config(page_title="COMBO — V15.7 Validazione Affidabilità", page_icon="⚽", layout="centered")
 
 AUDIT_SCORE_MAX = 12
 EPS_PROB = 1e-9
@@ -1184,13 +1184,14 @@ else:
         st.download_button("📥 Scarica calendario filtrato (CSV)", _tab_prossime.to_csv(index=False).encode("utf-8-sig"), file_name="combo_prossime_partite.csv", mime="text/csv", key="download_prossime_tutte")
 
 # =====================================================================
-# V15.4 — PRONOSTICI AUTOMATICI PER IL CALENDARIO FUTURO
+# V15.6 — INDICATORE PRELIMINARE DI AFFIDABILITÀ PRONOSTICI
 # Richiama il motore esistente in modalità walk-forward: per ogni partita
 # usa esclusivamente risultati antecedenti alla data della fixture.
 # Non modifica V11/V13/V15 né salva/modifica calibratori.
 # =====================================================================
 st.markdown("## 🤖 Pronostici automatici — prossime partite")
 st.caption("Calcola 1/X/2 e doppia chance per le fixture filtrate. Ogni stima usa risultati precedenti alla partita; le percentuali 1X2 sono RAW, salvo calibrazione 1X2 opzionale già selezionata nella barra laterale.")
+st.info("🧭 L'indicatore di affidabilità è una prima stima prudenziale basata sul numero di partite disponibili per entrambe le squadre e sulla distanza tra la probabilità del segno più probabile e quella del secondo segno. Non è una garanzia di esito e non è ancora una misura validata sui risultati storici.")
 
 if not _df_prossime_tutte.empty:
     _df_batch_base = _df_prossime_tutte.copy()
@@ -1265,7 +1266,19 @@ if not _df_prossime_tutte.empty:
                 _dc_batch = {"1X": _p1b + _pxb, "X2": _pxb + _p2b, "12": _p1b + _p2b}
                 _dc_top_batch = max(_dc_batch, key=_dc_batch.get)
                 _n_casa_batch = int(_mod_batch.get("n_casa", 0)); _n_trasf_batch = int(_mod_batch.get("n_trasf", 0))
-                _qualita_batch = "Dati limitati" if min(_n_casa_batch, _n_trasf_batch) < 5 else "Dati squadra ≥5"
+                _min_storico_batch = min(_n_casa_batch, _n_trasf_batch)
+                _qualita_batch = "Dati limitati" if _min_storico_batch < 5 else "Dati squadra ≥5"
+                _prob_ordinate_batch = sorted(_prob_segni_batch.values(), reverse=True)
+                _distacco_batch = (_prob_ordinate_batch[0] - _prob_ordinate_batch[1]) * 100
+                _punti_campione_batch = 0 if _min_storico_batch < 5 else (1 if _min_storico_batch < 8 else 2)
+                _punti_segnale_batch = 0 if _distacco_batch < 5 else (1 if _distacco_batch < 10 else 2)
+                _punteggio_affidabilita_batch = _punti_campione_batch + _punti_segnale_batch
+                if _punteggio_affidabilita_batch <= 1:
+                    _affidabilita_batch = "Bassa"
+                elif _punteggio_affidabilita_batch <= 3:
+                    _affidabilita_batch = "Media"
+                else:
+                    _affidabilita_batch = "Alta"
                 _righe_pronostici.append({
                     "Data": _data_fx_batch.strftime("%d/%m/%Y"), "Campionato": _nome_lega_batch,
                     "Partita": f'{_fx_batch["Casa"]} - {_fx_batch["Trasferta"]}',
@@ -1274,6 +1287,8 @@ if not _df_prossime_tutte.empty:
                     "Doppia chance": _dc_top_batch, "Prob. DC (%)": round(_dc_batch[_dc_top_batch], 1),
                     "Partite casa": _n_casa_batch, "Partite trasferta": _n_trasf_batch,
                     "Indicatore dati": _qualita_batch,
+                    "Distacco 1°-2° segno (pp)": round(_distacco_batch, 1),
+                    "Affidabilità preliminare": _affidabilita_batch,
                     "Calibrazione 1X2": "Applicata" if _info_cal_batch else "RAW",
                 })
             except Exception as _err_batch:
@@ -1287,6 +1302,8 @@ if not _df_prossime_tutte.empty:
                     "Doppia chance": "N/D", "Prob. DC (%)": None,
                     "Partite casa": None, "Partite trasferta": None,
                     "Indicatore dati": f"Non calcolato: {type(_err_batch).__name__}",
+                    "Distacco 1°-2° segno (pp)": None,
+                    "Affidabilità preliminare": "N/D",
                     "Calibrazione 1X2": "N/D",
                 })
             _progress_batch.progress(_idx_batch / _tot_batch, text=f"Analisi partite: {_idx_batch}/{_tot_batch}")
@@ -1300,9 +1317,177 @@ if not _df_prossime_tutte.empty:
         _df_risultati_batch = st.session_state["combo_pronostici_batch_v154"]
         st.caption("Ultimo calcolo: " + st.session_state.get("combo_pronostici_batch_v154_data", "n/d") + ". Le righe N/D indicano dati insufficienti o un errore di elaborazione: non sono pronostici.")
         st.dataframe(_df_risultati_batch, use_container_width=True, hide_index=True)
-        st.download_button("📥 Scarica pronostici in CSV", _df_risultati_batch.to_csv(index=False).encode("utf-8-sig"), file_name="combo_pronostici_v15_4.csv", mime="text/csv", key="download_pronostici_batch_v154")
+        st.download_button("📥 Scarica pronostici in CSV", _df_risultati_batch.to_csv(index=False).encode("utf-8-sig"), file_name="combo_pronostici_v15_6.csv", mime="text/csv", key="download_pronostici_batch_v154")
 else:
     st.info("Non ci sono fixture future disponibili da analizzare automaticamente in questo momento.")
+
+# =====================================================================
+# V15.7 — VALIDAZIONE STORICA WALK-FORWARD DELL’INDICATORE DI AFFIDABILITÀ
+# Ogni pronostico storico viene calcolato usando esclusivamente partite con
+# data strettamente precedente alla partita target. La validazione è RAW:
+# non allena né modifica calibratori e non cambia il modello operativo.
+# =====================================================================
+st.divider()
+st.markdown("## 🧪 V15.7 — Verifica storica dell’indicatore di affidabilità")
+st.caption("Test walk-forward su risultati reali dei campionati disponibili. Per ogni partita il modello vede soltanto lo storico precedente; le partite della stessa data non vengono incluse.")
+st.warning("Questa è una verifica retrospettiva del criterio, non una garanzia di risultati futuri. I punteggi Brier e Log Loss valutano le probabilità 1X2: valori più bassi sono migliori.")
+
+_col_valid1, _col_valid2 = st.columns(2)
+with _col_valid1:
+    _lega_validazione = st.selectbox(
+        "Campionato per la verifica storica",
+        list(CAMPIONATI_DOMESTICI.keys()),
+        key="v157_lega_validazione"
+    )
+with _col_valid2:
+    _n_validazione = st.selectbox(
+        "Numero massimo di partite storiche da testare",
+        [100, 200, 300, "Tutte (più lento)"],
+        index=1,
+        key="v157_n_validazione"
+    )
+
+if st.button("🔬 AVVIA VALIDAZIONE WALK-FORWARD", type="primary", key="avvia_validazione_v157"):
+    _id_validazione = CAMPIONATI_DOMESTICI[_lega_validazione]["id_fd"]
+    with st.spinner("Scarico lo storico e calcolo le previsioni cronologiche. Può richiedere qualche minuto..."):
+        _dati_validazione = carica_dati_campionato(_id_validazione)
+        _globale_validazione = carica_tutti_i_campionati()
+        _ris_validazione = []
+        _errori_validazione = 0
+
+        if _dati_validazione is None or _dati_validazione.empty:
+            st.session_state.pop("v157_risultati_validazione", None)
+            st.error("Non è stato possibile caricare lo storico reale per questo campionato. Riprova più tardi.")
+        else:
+            _storico_validazione = _dati_validazione.copy()
+            _storico_validazione["FTHG"] = pd.to_numeric(_storico_validazione.get("FTHG"), errors="coerce")
+            _storico_validazione["FTAG"] = pd.to_numeric(_storico_validazione.get("FTAG"), errors="coerce")
+            _storico_validazione = _storico_validazione.dropna(subset=["Date_parsed", "FTHG", "FTAG"])
+            _storico_validazione = _storico_validazione.sort_values("Date_parsed").reset_index(drop=True)
+            if _n_validazione != "Tutte (più lento)":
+                _storico_validazione = _storico_validazione.tail(int(_n_validazione)).reset_index(drop=True)
+
+            _tot_validazione = len(_storico_validazione)
+            _progresso_validazione = st.progress(0, text="Preparazione verifica storica...")
+            for _i_validazione, _r_validazione in _storico_validazione.iterrows():
+                try:
+                    _data_target_validazione = pd.to_datetime(_r_validazione["Date_parsed"], errors="coerce")
+                    if pd.isna(_data_target_validazione):
+                        continue
+                    # Regola anti-look-ahead: strettamente prima della data target.
+                    _prec_validazione = _dati_validazione[
+                        (_dati_validazione["Date_parsed"] < _data_target_validazione)
+                    ].copy()
+                    _prec_validazione["FTHG"] = pd.to_numeric(_prec_validazione.get("FTHG"), errors="coerce")
+                    _prec_validazione["FTAG"] = pd.to_numeric(_prec_validazione.get("FTAG"), errors="coerce")
+                    _prec_validazione = _prec_validazione.dropna(subset=["FTHG", "FTAG"])
+                    if len(_prec_validazione) < 15:
+                        continue
+
+                    _glob_prec_validazione = _globale_validazione.copy()
+                    if not _glob_prec_validazione.empty and "Date_parsed" in _glob_prec_validazione.columns:
+                        _glob_prec_validazione = _glob_prec_validazione[
+                            _glob_prec_validazione["Date_parsed"] < _data_target_validazione
+                        ].copy()
+
+                    _m_validazione = calcola_modello_completo(
+                        _prec_validazione,
+                        str(_r_validazione["HomeTeam"]),
+                        str(_r_validazione["AwayTeam"]),
+                        rho_val, ewma_span_val, emivita_val,
+                        _glob_prec_validazione,
+                        data_riferimento=_data_target_validazione
+                    )
+                    if _m_validazione is None:
+                        continue
+
+                    _p_validazione = {
+                        "1": float(_m_validazione["prob_1"]),
+                        "X": float(_m_validazione["prob_X"]),
+                        "2": float(_m_validazione["prob_2"]),
+                    }
+                    _somma_validazione = sum(_p_validazione.values())
+                    if _somma_validazione <= 0:
+                        continue
+                    _p_validazione = {k: max(0.0, v / _somma_validazione) for k, v in _p_validazione.items()}
+                    _ordinati_validazione = sorted(_p_validazione.values(), reverse=True)
+                    _segno_pred_validazione = max(_p_validazione, key=_p_validazione.get)
+                    _distacco_validazione = (_ordinati_validazione[0] - _ordinati_validazione[1]) * 100
+                    _n_casa_validazione = int(_m_validazione.get("n_casa", 0))
+                    _n_trasf_validazione = int(_m_validazione.get("n_trasf", 0))
+                    _min_n_validazione = min(_n_casa_validazione, _n_trasf_validazione)
+                    _punti_campione_validazione = 0 if _min_n_validazione < 5 else (1 if _min_n_validazione < 8 else 2)
+                    _punti_gap_validazione = 0 if _distacco_validazione < 5 else (1 if _distacco_validazione < 10 else 2)
+                    _tot_punti_validazione = _punti_campione_validazione + _punti_gap_validazione
+                    if _tot_punti_validazione <= 1:
+                        _livello_validazione = "Bassa"
+                    elif _tot_punti_validazione <= 3:
+                        _livello_validazione = "Media"
+                    else:
+                        _livello_validazione = "Alta"
+
+                    _hg_validazione = float(_r_validazione["FTHG"])
+                    _ag_validazione = float(_r_validazione["FTAG"])
+                    _esito_validazione = "1" if _hg_validazione > _ag_validazione else ("2" if _hg_validazione < _ag_validazione else "X")
+                    _brier_validazione = sum(((_p_validazione[k] - (1.0 if k == _esito_validazione else 0.0)) ** 2) for k in ["1", "X", "2"])
+                    _p_esito_validazione = min(1.0, max(1e-15, _p_validazione[_esito_validazione]))
+                    _ris_validazione.append({
+                        "Data": _data_target_validazione.strftime("%d/%m/%Y"),
+                        "Casa": str(_r_validazione["HomeTeam"]),
+                        "Trasferta": str(_r_validazione["AwayTeam"]),
+                        "P(1) %": round(_p_validazione["1"] * 100, 2),
+                        "P(X) %": round(_p_validazione["X"] * 100, 2),
+                        "P(2) %": round(_p_validazione["2"] * 100, 2),
+                        "Segno previsto": _segno_pred_validazione,
+                        "Probabilità segno %": round(_p_validazione[_segno_pred_validazione] * 100, 2),
+                        "Esito reale": _esito_validazione,
+                        "Corretto": int(_segno_pred_validazione == _esito_validazione),
+                        "Partite casa": _n_casa_validazione,
+                        "Partite trasferta": _n_trasf_validazione,
+                        "Distacco pp": round(_distacco_validazione, 2),
+                        "Affidabilità": _livello_validazione,
+                        "Brier 1X2": _brier_validazione,
+                        "Log Loss": -np.log(_p_esito_validazione),
+                        "Storico usato fino al": _prec_validazione["Date_parsed"].max().strftime("%d/%m/%Y") if not _prec_validazione.empty else "",
+                    })
+                except Exception:
+                    _errori_validazione += 1
+                if _tot_validazione:
+                    _progresso_validazione.progress((_i_validazione + 1) / _tot_validazione, text=f"Verifica cronologica: {_i_validazione + 1}/{_tot_validazione}")
+            _progresso_validazione.empty()
+            _df_validazione_finale = pd.DataFrame(_ris_validazione)
+            st.session_state["v157_risultati_validazione"] = _df_validazione_finale
+            st.session_state["v157_data_validazione"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+            st.session_state["v157_errori_validazione"] = _errori_validazione
+
+if "v157_risultati_validazione" in st.session_state:
+    _df_validazione_finale = st.session_state["v157_risultati_validazione"]
+    st.caption("Ultima verifica: " + st.session_state.get("v157_data_validazione", "n/d") + ". Le probabilità sono RAW e non vengono usate per addestrare calibratori.")
+    if _df_validazione_finale.empty:
+        st.warning("Nessuna previsione storica valida: controlla la disponibilità dei risultati e riprova con un campione più ampio.")
+    else:
+        _riepilogo_livelli = []
+        for _livello_riepilogo in ["Bassa", "Media", "Alta"]:
+            _sotto_riepilogo = _df_validazione_finale[_df_validazione_finale["Affidabilità"] == _livello_riepilogo]
+            if _sotto_riepilogo.empty:
+                _riepilogo_livelli.append({"Affidabilità": _livello_riepilogo, "Partite": 0, "Segni corretti %": None, "Prob. segno media %": None, "Brier medio": None, "Log Loss medio": None})
+            else:
+                _riepilogo_livelli.append({
+                    "Affidabilità": _livello_riepilogo,
+                    "Partite": len(_sotto_riepilogo),
+                    "Segni corretti %": round(_sotto_riepilogo["Corretto"].mean() * 100, 2),
+                    "Prob. segno media %": round(_sotto_riepilogo["Probabilità segno %"].mean(), 2),
+                    "Brier medio": round(_sotto_riepilogo["Brier 1X2"].mean(), 4),
+                    "Log Loss medio": round(_sotto_riepilogo["Log Loss"].mean(), 4),
+                })
+        st.markdown("### Risultati per livello di affidabilità")
+        st.dataframe(pd.DataFrame(_riepilogo_livelli), use_container_width=True, hide_index=True)
+        st.metric("Previsioni storiche valutate", len(_df_validazione_finale))
+        st.metric("Errori tecnici saltati", st.session_state.get("v157_errori_validazione", 0))
+        st.caption("L’indicatore mostra un segnale utile solo se, su un campione adeguato, i gruppi con affidabilità più alta risultano coerentemente migliori. Se l’ordine non cresce, non modifichiamo le soglie senza ulteriori test.")
+        st.markdown("### Dettaglio delle previsioni storiche")
+        st.dataframe(_df_validazione_finale, use_container_width=True, hide_index=True)
+        st.download_button("📥 Scarica risultati della validazione (CSV)", _df_validazione_finale.to_csv(index=False).encode("utf-8-sig"), file_name="combo_v15_7_validazione_affidabilita.csv", mime="text/csv", key="download_validazione_v157")
 
 st.divider()
 scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)"], horizontal=True)
