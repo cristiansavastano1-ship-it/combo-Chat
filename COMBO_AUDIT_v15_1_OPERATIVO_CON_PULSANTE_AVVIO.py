@@ -1,3 +1,4 @@
+
 import math
 import pandas as pd
 import numpy as np
@@ -118,6 +119,7 @@ tab_calendario, tab_classifica, tab_value, tab_grafici, tab_ai_schedine, tab_val
 ])
 
 # --- FUNZIONI DI SUPPORTO & MODELLAZIONE ---
+# V4: lambda attacco/difesa con split casa-trasferta e prior di 5 partite verso la media di lega.
 @str_lit.cache_data(ttl=3600)
 def scarica_dati_club(chiave, league_code):
     if not chiave: return None
@@ -170,9 +172,104 @@ def calcola_statistiche_avanzate_match(sq_casa, sq_trasf, statistiche_squadre):
         "Fuorigioco Attesi": (offside_c, offside_t)
     }
 
+
+def stima_lambda_attacco_difesa(storico_precedente, sq_casa, sq_trasferta,
+                                prior_strength=5.0, fallback_casa=1.4, fallback_trasferta=1.1):
+    """Stima le lambda usando attacco/difesa e split casa/trasferta.
+
+    storico_precedente: lista di record normalizzati con casa, trasferta,
+    gol_casa, gol_trasferta. Usa una regolarizzazione verso le medie del
+    campionato, equivalente a prior_strength partite, per limitare stime
+    estreme quando una squadra ha pochi precedenti.
+    """
+    validi = []
+    for x in storico_precedente:
+        try:
+            gc, gt = int(x["gol_casa"]), int(x["gol_trasferta"])
+            if gc >= 0 and gt >= 0:
+                validi.append({
+                    "casa": str(x["casa"]), "trasferta": str(x["trasferta"]),
+                    "gol_casa": gc, "gol_trasferta": gt
+                })
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if not validi:
+        return float(fallback_casa), float(fallback_trasferta)
+
+    media_casa = max(0.2, float(np.mean([x["gol_casa"] for x in validi])))
+    media_trasferta = max(0.2, float(np.mean([x["gol_trasferta"] for x in validi])))
+
+    # Dati separati per sede: GF = gol fatti, GS = gol subiti.
+    casa_dati = [x for x in validi if x["casa"] == sq_casa]
+    trasf_dati = [x for x in validi if x["trasferta"] == sq_trasferta]
+
+    casa_gf = sum(x["gol_casa"] for x in casa_dati)
+    casa_gs = sum(x["gol_trasferta"] for x in casa_dati)
+    trasf_gf = sum(x["gol_trasferta"] for x in trasf_dati)
+    trasf_gs = sum(x["gol_casa"] for x in trasf_dati)
+    n_casa, n_trasf = len(casa_dati), len(trasf_dati)
+    prior = max(0.0, float(prior_strength))
+
+    # Medie regolarizzate: pochi incontri pesano meno delle medie di lega.
+    gf_casa = (casa_gf + prior * media_casa) / (n_casa + prior) if n_casa + prior > 0 else media_casa
+    gs_casa = (casa_gs + prior * media_trasferta) / (n_casa + prior) if n_casa + prior > 0 else media_trasferta
+    gf_trasf = (trasf_gf + prior * media_trasferta) / (n_trasf + prior) if n_trasf + prior > 0 else media_trasferta
+    gs_trasf = (trasf_gs + prior * media_casa) / (n_trasf + prior) if n_trasf + prior > 0 else media_casa
+
+    # Forza offensiva e vulnerabilità difensiva rispetto alla media di lega.
+    forza_att_casa = gf_casa / media_casa
+    debolezza_dif_trasf = gs_trasf / media_casa
+    forza_att_trasf = gf_trasf / media_trasferta
+    debolezza_dif_casa = gs_casa / media_trasferta
+
+    lam_c = media_casa * forza_att_casa * debolezza_dif_trasf
+    lam_t = media_trasferta * forza_att_trasf * debolezza_dif_casa
+
+    # Limiti di stabilità per evitare lambda implausibili con campioni piccoli.
+    lam_c = float(np.clip(lam_c, 0.15, 4.5))
+    lam_t = float(np.clip(lam_t, 0.15, 4.5))
+    return lam_c, lam_t
+
+def storico_api_pre_partita(matches_list, competizione, data_limite):
+    """Converte le partite API concluse prima della data target in storico normalizzato."""
+    try:
+        limite = pd.to_datetime(data_limite, utc=True).date()
+    except Exception:
+        limite = pd.Timestamp.now(tz="UTC").date()
+    storico = []
+    for m in matches_list:
+        if str(m.get("status", "")).upper() != "FINISHED":
+            continue
+        if competizione and m.get("Competizione", "Torneo") != competizione:
+            continue
+        score = (m.get("score") or {}).get("fullTime") or {}
+        gc, gt, data = score.get("home"), score.get("away"), m.get("utcDate")
+        if gc is None or gt is None or not data:
+            continue
+        try:
+            dt = pd.to_datetime(data, utc=True)
+            if dt.date() >= limite:
+                continue
+            storico.append({
+                "data": dt, "competizione": m.get("Competizione", "Torneo"),
+                "casa": m.get("homeTeam", {}).get("name", "Casa"),
+                "trasferta": m.get("awayTeam", {}).get("name", "Trasferta"),
+                "gol_casa": int(gc), "gol_trasferta": int(gt)
+            })
+        except (TypeError, ValueError):
+            continue
+    return storico
+
 # --- AUDIT WALK-FORWARD: PAREGGI (X) E GOAL / NO GOAL ---
-def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=8):
-    """Valuta probabilità storiche usando esclusivamente partite precedenti alla data analizzata."""
+def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=5):
+    """Audit walk-forward usando la stessa logica Poisson del pronostico operativo.
+
+    Per ogni partita usa solo risultati precedenti della stessa competizione.
+    Le lambda derivano da attacco/difesa, split casa/trasferta e medie di lega
+    regolarizzate. La matrice 0..max_gol viene normalizzata prima di calcolare
+    1X2 e Goal/No Goal.
+    """
     partite = []
     for m in matches_list:
         status = str(m.get("status", "")).upper()
@@ -196,46 +293,37 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=8):
     storico = []
     righe = []
 
-    def media(valori, fallback):
-        return float(np.mean(valori)) if valori else float(fallback)
-
-    def media_ridotta(valori, fallback, peso_prior=5.0):
-        # Shrinkage verso la media del campionato per evitare medie estreme con pochi dati.
-        n = len(valori)
-        return (sum(valori) + peso_prior * fallback) / (n + peso_prior) if n else float(fallback)
-
     def poisson_vector(lam):
-        lam = max(0.05, min(float(lam), 5.0))
-        vals = np.array([math.exp(-lam) * (lam ** k) / math.factorial(k) for k in range(max_gol + 1)], dtype=float)
-        s = vals.sum()
-        return vals / s if s > 0 else np.eye(1, max_gol + 1, 0).ravel()
+        # Stessa matrice dei pronostici live: risultati da 0 a 5 gol.
+        lam = max(0.01, float(lam))
+        vals = np.array([
+            math.exp(-lam) * (lam ** k) / math.factorial(k)
+            for k in range(max_gol + 1)
+        ], dtype=float)
+        return vals
 
     for partita in partite:
-        # Non usare mai la partita corrente né risultati successivi per stimare le probabilità.
-        precedenti = [x for x in storico if x["competizione"] == partita["competizione"] and x["data"].date() < partita["data"].date()]
+        # Escludiamo tutte le partite della stessa data: scelta conservativa anti-leakage.
+        precedenti = [x for x in storico
+                      if x["competizione"] == partita["competizione"]
+                      and x["data"].date() < partita["data"].date()]
         if len(precedenti) >= min_storico:
-            media_casa_lega = media([x["gol_casa"] for x in precedenti], 1.40)
-            media_trasf_lega = media([x["gol_trasferta"] for x in precedenti], 1.10)
+            casa, trasf = partita["casa"], partita["trasferta"]
+            # Nuovo modello: attacco/difesa, split casa/trasferta e
+            # regolarizzazione verso le medie della competizione.
+            lam_c, lam_t = stima_lambda_attacco_difesa(
+                precedenti, casa, trasf, prior_strength=5.0
+            )
 
-            casa = partita["casa"]
-            trasf = partita["trasferta"]
-            casa_casa = [x for x in precedenti if x["casa"] == casa]
-            casa_trasf = [x for x in precedenti if x["trasferta"] == casa]
-            trasf_casa = [x for x in precedenti if x["casa"] == trasf]
-            trasf_trasf = [x for x in precedenti if x["trasferta"] == trasf]
-
-            gf_c = media_ridotta([x["gol_casa"] for x in casa_casa], media_casa_lega)
-            gs_c = media_ridotta([x["gol_trasferta"] for x in casa_casa], media_trasf_lega)
-            gf_t = media_ridotta([x["gol_trasferta"] for x in trasf_trasf], media_trasf_lega)
-            gs_t = media_ridotta([x["gol_casa"] for x in trasf_trasf], media_casa_lega)
-
-            # Modello Poisson semplice e trasparente: attacco/defesa casa e trasferta.
-            lam_c = gf_c * gs_t / max(0.25, media_casa_lega)
-            lam_t = gf_t * gs_c / max(0.25, media_trasf_lega)
             ph = poisson_vector(lam_c)
             pa = poisson_vector(lam_t)
             matrice = np.outer(ph, pa)
-            matrice /= max(matrice.sum(), 1e-12)
+            totale = float(matrice.sum())
+            if totale <= 0:
+                storico.append(partita)
+                continue
+            matrice /= totale  # normalizzazione unica per tutti i mercati
+
             p1 = float(np.tril(matrice, -1).sum())
             px = float(np.trace(matrice))
             p2 = float(np.triu(matrice, 1).sum())
@@ -245,6 +333,7 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=8):
             reale_nogoal = int(partita["gol_casa"] == 0 or partita["gol_trasferta"] == 0)
             probs = {"1": p1, "X": px, "2": p2}
             previsto = max(probs, key=probs.get)
+            posizione_x = 1 + sum(probs[k] > px for k in ("1", "2"))
             brier_1x2 = sum((probs[k] - (1.0 if esito == k else 0.0)) ** 2 for k in ("1", "X", "2"))
             p_esito = max(1e-12, probs[esito])
             p_ng_real = p_nogoal if reale_nogoal else p_goal
@@ -254,12 +343,14 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=8):
                 "P(1) %": 100*p1, "P(X) %": 100*px, "P(2) %": 100*p2,
                 "Segno previsto": previsto, "Esito reale": esito,
                 "X prevista come segno": int(previsto == "X"),
+                "Posizione X": posizione_x,
                 "P(No Goal) %": 100*p_nogoal, "No Goal favorito": int(p_nogoal > p_goal),
                 "No Goal reale": reale_nogoal,
                 "Brier 1X2": brier_1x2, "Log Loss 1X2": -math.log(p_esito),
                 "Brier Goal/No Goal": (p_nogoal - reale_nogoal) ** 2,
                 "Log Loss Goal/No Goal": -math.log(max(1e-12, p_ng_real)),
                 "Storico pre-partita": len(precedenti),
+                "Lambda casa": lam_c, "Lambda trasferta": lam_t,
             })
         storico.append(partita)
 
@@ -340,8 +431,12 @@ with tab_calendario:
     if "match_attivo" in str_lit.session_state:
         m = str_lit.session_state["match_attivo"]
         sq_c, sq_t = m["casa"], m["trasferta"]
-        lam_c = statistiche_squadre.get(sq_c, {}).get("media_gf", 1.4)
-        lam_t = statistiche_squadre.get(sq_t, {}).get("media_gf", 1.1)
+        comp_match = m.get("Competizione", campionato_scelto)
+        data_match = m.get("data", pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d"))
+        storico_live = storico_api_pre_partita(matches_raw, comp_match, data_match)
+        lam_c, lam_t = stima_lambda_attacco_difesa(
+            storico_live, sq_c, sq_t, prior_strength=5.0
+        )
 
         p_c, p_p, p_t = 0.0, 0.0, 0.0
         prob_under_over = {0.5: 0.0, 1.5: 0.0, 2.5: 0.0, 3.5: 0.0, 4.5: 0.0}
@@ -366,8 +461,11 @@ with tab_calendario:
                     prob_btts_yes += prob
 
         tot = p_c + p_p + p_t
-        p_c, p_p, p_t = (p_c/tot)*100, (p_p/tot)*100, (p_t/tot)*100
+        # La matrice considera i punteggi 0..5: normalizziamo anche BTTS,
+        # altrimenti la massa Poisson oltre 5 gol viene conteggiata erroneamente come No Goal.
+        prob_btts_yes = prob_btts_yes / tot if tot > 0 else 0.0
         prob_btts_no = 1.0 - prob_btts_yes
+        p_c, p_p, p_t = (p_c/tot)*100, (p_p/tot)*100, (p_t/tot)*100
 
         stats_match = calcola_statistiche_avanzate_match(sq_c, sq_t, statistiche_squadre)
 
@@ -633,7 +731,7 @@ with tab_audit:
     str_lit.subheader("🛡️ Audit statistico: Pareggio X e Goal / No Goal")
     str_lit.caption(
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
-        "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
+        "risultati precedenti della stessa competizione. Le lambda considerano attacco, difesa, casa/trasferta e regolarizzazione verso la media di lega; nessuna percentuale viene forzata."
     )
     df_audit = crea_audit_walk_forward(matches_raw)
     if df_audit.empty:
@@ -677,6 +775,40 @@ with tab_audit:
             barmode="group", template="plotly_dark", title="Calibrazione empirica — modello contro risultati reali"
         )
         str_lit.plotly_chart(fig_audit, use_container_width=True)
+
+        # Diagnostica aggiuntiva: frequenza reale dentro fasce di probabilità.
+        str_lit.markdown("#### 🔬 Calibrazione per fasce di probabilità")
+        fasce = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100.000001]
+        etichette = ["0–10%", "10–20%", "20–30%", "30–40%", "40–50%", "50–60%", "60–70%", "70–80%", "80–90%", "90–100%"]
+
+        df_x_bin = df_audit[["P(X) %", "Esito reale"]].copy()
+        df_x_bin["X reale"] = (df_x_bin["Esito reale"] == "X").astype(int)
+        df_x_bin["Fascia probabilità"] = pd.cut(df_x_bin["P(X) %"].clip(0, 100), bins=fasce, labels=etichette, right=True, include_lowest=True)
+        cal_x = df_x_bin.groupby("Fascia probabilità", observed=False).agg(
+            Partite=("X reale", "size"), **{"Probabilità media (%)": ("P(X) %", "mean"), "Frequenza reale (%)": ("X reale", lambda x: 100*x.mean())}
+        ).reset_index()
+        cal_x = cal_x[cal_x["Partite"] > 0].copy()
+        cal_x["Scarto (pp)"] = cal_x["Probabilità media (%)"] - cal_x["Frequenza reale (%)"]
+        str_lit.caption("Pareggio X: la frequenza reale in tabella è la quota di pareggi osservati dentro ciascuna fascia P(X).")
+        str_lit.dataframe(cal_x.round(2), use_container_width=True, hide_index=True)
+
+
+        df_ng_bin = df_audit[["P(No Goal) %", "No Goal reale"]].copy()
+        df_ng_bin["Fascia probabilità"] = pd.cut(df_ng_bin["P(No Goal) %"].clip(0, 100), bins=fasce, labels=etichette, right=True, include_lowest=True)
+        cal_ng = df_ng_bin.groupby("Fascia probabilità", observed=False).agg(
+            Partite=("No Goal reale", "size"), **{"Probabilità media (%)": ("P(No Goal) %", "mean"), "Frequenza reale (%)": ("No Goal reale", lambda x: 100*x.mean())}
+        ).reset_index()
+        cal_ng = cal_ng[cal_ng["Partite"] > 0].copy()
+        cal_ng["Scarto (pp)"] = cal_ng["Probabilità media (%)"] - cal_ng["Frequenza reale (%)"]
+        str_lit.caption("Goal / No Goal: frequenza reale = partite in cui almeno una delle due squadre non ha segnato.")
+        str_lit.dataframe(cal_ng.round(2), use_container_width=True, hide_index=True)
+
+        str_lit.markdown("#### 🧭 Perché il segno X viene scelto poco? ")
+        posizione_x = df_audit["Posizione X"].value_counts().reindex([1, 2, 3], fill_value=0)
+        x1, x2, x3 = str_lit.columns(3)
+        x1.metric("X al 1° posto", f"{posizione_x.loc[1]}", f"{posizione_x.loc[1]/n*100:.1f}% delle partite")
+        x2.metric("X al 2° posto", f"{posizione_x.loc[2]}", f"{posizione_x.loc[2]/n*100:.1f}% delle partite")
+        x3.metric("X al 3° posto", f"{posizione_x.loc[3]}", f"{posizione_x.loc[3]/n*100:.1f}% delle partite")
 
         scarto_x = prob_x_media - freq_x_reale
         scarto_ng = prob_ng_media - freq_ng_reale
