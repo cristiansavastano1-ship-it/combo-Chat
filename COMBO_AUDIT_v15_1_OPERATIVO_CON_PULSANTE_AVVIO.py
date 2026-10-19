@@ -1,5 +1,4 @@
 
-
 import math
 import pandas as pd
 import numpy as np
@@ -719,6 +718,46 @@ with tab_audit:
         x1.metric("X al 1° posto", f"{posizione_x.loc[1]}", f"{posizione_x.loc[1]/n*100:.1f}% delle partite")
         x2.metric("X al 2° posto", f"{posizione_x.loc[2]}", f"{posizione_x.loc[2]/n*100:.1f}% delle partite")
         x3.metric("X al 3° posto", f"{posizione_x.loc[3]}", f"{posizione_x.loc[3]/n*100:.1f}% delle partite")
+
+        # V4: diagnostica della X per equilibrio tra probabilità di vittoria casa/trasferta.
+        # Solo analisi: non modifica probabilità operative, lambda o pronostici.
+        str_lit.markdown("#### ⚖️ Diagnostica X in base all'equilibrio tra P(1) e P(2)")
+        str_lit.caption(
+            "Le partite sono raggruppate in base alla differenza assoluta tra P(1) e P(2). "
+            "È una diagnostica retrospettiva: non modifica il modello."
+        )
+        df_eq = df_audit.copy()
+        df_eq["Differenza P(1)-P(2) (pp)"] = (df_eq["P(1) %"] - df_eq["P(2) %"]).abs()
+        df_eq["X reale (0/1)"] = (df_eq["Esito reale"] == "X").astype(int)
+        df_eq["P(X) (0-1)"] = (df_eq["P(X) %"] / 100.0).clip(0.0, 1.0)
+        df_eq["Brier X"] = (df_eq["P(X) (0-1)"] - df_eq["X reale (0/1)"]) ** 2
+        df_eq["Gruppo equilibrio"] = pd.cut(
+            df_eq["Differenza P(1)-P(2) (pp)"],
+            bins=[-0.000001, 10, 25, float("inf")],
+            labels=["Equilibrate (≤10 pp)", "Favorita moderata (>10–25 pp)", "Favorita netta (>25 pp)"],
+            right=True,
+            include_lowest=True,
+        )
+        riepilogo_eq = df_eq.groupby("Gruppo equilibrio", observed=False).agg(
+            Partite=("X reale (0/1)", "size"),
+            **{
+                "Differenza media P(1)-P(2) (pp)": ("Differenza P(1)-P(2) (pp)", "mean"),
+                "P(X) media (%)": ("P(X) %", "mean"),
+                "Pareggi reali (%)": ("X reale (0/1)", lambda x: 100 * x.mean()),
+                "Brier X": ("Brier X", "mean"),
+            },
+        ).reset_index()
+        riepilogo_eq["Scarto P(X) - pareggi reali (pp)"] = (
+            riepilogo_eq["P(X) media (%)"] - riepilogo_eq["Pareggi reali (%)"]
+        )
+        riepilogo_eq["X al 1° posto (%)"] = riepilogo_eq["Gruppo equilibrio"].map(
+            df_eq.groupby("Gruppo equilibrio", observed=False)["Posizione X"].apply(lambda x: 100 * (x == 1).mean())
+        )
+        str_lit.dataframe(riepilogo_eq.round(2), use_container_width=True, hide_index=True)
+        str_lit.caption(
+            "Brier X = errore quadratico tra P(X) e l'esito pareggio (0/1); più basso è meglio. "
+            "I gruppi con poche partite vanno interpretati con cautela."
+        )
 
         scarto_x = prob_x_media - freq_x_reale
         scarto_ng = prob_ng_media - freq_ng_reale
