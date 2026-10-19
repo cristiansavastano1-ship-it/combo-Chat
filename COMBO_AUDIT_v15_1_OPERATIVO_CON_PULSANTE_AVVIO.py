@@ -1,4 +1,5 @@
 
+
 import math
 import pandas as pd
 import numpy as np
@@ -119,7 +120,6 @@ tab_calendario, tab_classifica, tab_value, tab_grafici, tab_ai_schedine, tab_val
 ])
 
 # --- FUNZIONI DI SUPPORTO & MODELLAZIONE ---
-# V4: lambda attacco/difesa con split casa-trasferta e prior di 5 partite verso la media di lega.
 @str_lit.cache_data(ttl=3600)
 def scarica_dati_club(chiave, league_code):
     if not chiave: return None
@@ -172,103 +172,14 @@ def calcola_statistiche_avanzate_match(sq_casa, sq_trasf, statistiche_squadre):
         "Fuorigioco Attesi": (offside_c, offside_t)
     }
 
-
-def stima_lambda_attacco_difesa(storico_precedente, sq_casa, sq_trasferta,
-                                prior_strength=5.0, fallback_casa=1.4, fallback_trasferta=1.1):
-    """Stima le lambda usando attacco/difesa e split casa/trasferta.
-
-    storico_precedente: lista di record normalizzati con casa, trasferta,
-    gol_casa, gol_trasferta. Usa una regolarizzazione verso le medie del
-    campionato, equivalente a prior_strength partite, per limitare stime
-    estreme quando una squadra ha pochi precedenti.
-    """
-    validi = []
-    for x in storico_precedente:
-        try:
-            gc, gt = int(x["gol_casa"]), int(x["gol_trasferta"])
-            if gc >= 0 and gt >= 0:
-                validi.append({
-                    "casa": str(x["casa"]), "trasferta": str(x["trasferta"]),
-                    "gol_casa": gc, "gol_trasferta": gt
-                })
-        except (KeyError, TypeError, ValueError):
-            continue
-
-    if not validi:
-        return float(fallback_casa), float(fallback_trasferta)
-
-    media_casa = max(0.2, float(np.mean([x["gol_casa"] for x in validi])))
-    media_trasferta = max(0.2, float(np.mean([x["gol_trasferta"] for x in validi])))
-
-    # Dati separati per sede: GF = gol fatti, GS = gol subiti.
-    casa_dati = [x for x in validi if x["casa"] == sq_casa]
-    trasf_dati = [x for x in validi if x["trasferta"] == sq_trasferta]
-
-    casa_gf = sum(x["gol_casa"] for x in casa_dati)
-    casa_gs = sum(x["gol_trasferta"] for x in casa_dati)
-    trasf_gf = sum(x["gol_trasferta"] for x in trasf_dati)
-    trasf_gs = sum(x["gol_casa"] for x in trasf_dati)
-    n_casa, n_trasf = len(casa_dati), len(trasf_dati)
-    prior = max(0.0, float(prior_strength))
-
-    # Medie regolarizzate: pochi incontri pesano meno delle medie di lega.
-    gf_casa = (casa_gf + prior * media_casa) / (n_casa + prior) if n_casa + prior > 0 else media_casa
-    gs_casa = (casa_gs + prior * media_trasferta) / (n_casa + prior) if n_casa + prior > 0 else media_trasferta
-    gf_trasf = (trasf_gf + prior * media_trasferta) / (n_trasf + prior) if n_trasf + prior > 0 else media_trasferta
-    gs_trasf = (trasf_gs + prior * media_casa) / (n_trasf + prior) if n_trasf + prior > 0 else media_casa
-
-    # Forza offensiva e vulnerabilità difensiva rispetto alla media di lega.
-    forza_att_casa = gf_casa / media_casa
-    debolezza_dif_trasf = gs_trasf / media_casa
-    forza_att_trasf = gf_trasf / media_trasferta
-    debolezza_dif_casa = gs_casa / media_trasferta
-
-    lam_c = media_casa * forza_att_casa * debolezza_dif_trasf
-    lam_t = media_trasferta * forza_att_trasf * debolezza_dif_casa
-
-    # Limiti di stabilità per evitare lambda implausibili con campioni piccoli.
-    lam_c = float(np.clip(lam_c, 0.15, 4.5))
-    lam_t = float(np.clip(lam_t, 0.15, 4.5))
-    return lam_c, lam_t
-
-def storico_api_pre_partita(matches_list, competizione, data_limite):
-    """Converte le partite API concluse prima della data target in storico normalizzato."""
-    try:
-        limite = pd.to_datetime(data_limite, utc=True).date()
-    except Exception:
-        limite = pd.Timestamp.now(tz="UTC").date()
-    storico = []
-    for m in matches_list:
-        if str(m.get("status", "")).upper() != "FINISHED":
-            continue
-        if competizione and m.get("Competizione", "Torneo") != competizione:
-            continue
-        score = (m.get("score") or {}).get("fullTime") or {}
-        gc, gt, data = score.get("home"), score.get("away"), m.get("utcDate")
-        if gc is None or gt is None or not data:
-            continue
-        try:
-            dt = pd.to_datetime(data, utc=True)
-            if dt.date() >= limite:
-                continue
-            storico.append({
-                "data": dt, "competizione": m.get("Competizione", "Torneo"),
-                "casa": m.get("homeTeam", {}).get("name", "Casa"),
-                "trasferta": m.get("awayTeam", {}).get("name", "Trasferta"),
-                "gol_casa": int(gc), "gol_trasferta": int(gt)
-            })
-        except (TypeError, ValueError):
-            continue
-    return storico
-
 # --- AUDIT WALK-FORWARD: PAREGGI (X) E GOAL / NO GOAL ---
 def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=5):
     """Audit walk-forward usando la stessa logica Poisson del pronostico operativo.
 
     Per ogni partita usa solo risultati precedenti della stessa competizione.
-    Le lambda derivano da attacco/difesa, split casa/trasferta e medie di lega
-    regolarizzate. La matrice 0..max_gol viene normalizzata prima di calcolare
-    1X2 e Goal/No Goal.
+    Le lambda sono le medie gol fatti per squadra, coerenti con il modello live
+    (media_gf della classifica); la matrice 0..5 viene normalizzata prima di
+    calcolare 1X2 e Goal/No Goal.
     """
     partite = []
     for m in matches_list:
@@ -309,11 +220,14 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=5):
                       and x["data"].date() < partita["data"].date()]
         if len(precedenti) >= min_storico:
             casa, trasf = partita["casa"], partita["trasferta"]
-            # Nuovo modello: attacco/difesa, split casa/trasferta e
-            # regolarizzazione verso le medie della competizione.
-            lam_c, lam_t = stima_lambda_attacco_difesa(
-                precedenti, casa, trasf, prior_strength=5.0
-            )
+            # Media gol fatti per squadra in tutte le precedenti partite,
+            # corrispondente a goalsFor / playedGames usato dal modello live.
+            gf_c = [x["gol_casa"] for x in precedenti if x["casa"] == casa]
+            gf_c += [x["gol_trasferta"] for x in precedenti if x["trasferta"] == casa]
+            gf_t = [x["gol_casa"] for x in precedenti if x["casa"] == trasf]
+            gf_t += [x["gol_trasferta"] for x in precedenti if x["trasferta"] == trasf]
+            lam_c = float(np.mean(gf_c)) if gf_c else 1.4
+            lam_t = float(np.mean(gf_t)) if gf_t else 1.1
 
             ph = poisson_vector(lam_c)
             pa = poisson_vector(lam_t)
@@ -431,12 +345,8 @@ with tab_calendario:
     if "match_attivo" in str_lit.session_state:
         m = str_lit.session_state["match_attivo"]
         sq_c, sq_t = m["casa"], m["trasferta"]
-        comp_match = m.get("Competizione", campionato_scelto)
-        data_match = m.get("data", pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d"))
-        storico_live = storico_api_pre_partita(matches_raw, comp_match, data_match)
-        lam_c, lam_t = stima_lambda_attacco_difesa(
-            storico_live, sq_c, sq_t, prior_strength=5.0
-        )
+        lam_c = statistiche_squadre.get(sq_c, {}).get("media_gf", 1.4)
+        lam_t = statistiche_squadre.get(sq_t, {}).get("media_gf", 1.1)
 
         p_c, p_p, p_t = 0.0, 0.0, 0.0
         prob_under_over = {0.5: 0.0, 1.5: 0.0, 2.5: 0.0, 3.5: 0.0, 4.5: 0.0}
@@ -731,7 +641,7 @@ with tab_audit:
     str_lit.subheader("🛡️ Audit statistico: Pareggio X e Goal / No Goal")
     str_lit.caption(
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
-        "risultati precedenti della stessa competizione. Le lambda considerano attacco, difesa, casa/trasferta e regolarizzazione verso la media di lega; nessuna percentuale viene forzata."
+        "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
     )
     df_audit = crea_audit_walk_forward(matches_raw)
     if df_audit.empty:
