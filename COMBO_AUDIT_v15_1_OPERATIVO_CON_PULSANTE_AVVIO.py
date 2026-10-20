@@ -1,4 +1,3 @@
-
 import math
 import pandas as pd
 import numpy as np
@@ -758,6 +757,54 @@ with tab_audit:
             "Brier X = errore quadratico tra P(X) e l'esito pareggio (0/1); più basso è meglio. "
             "I gruppi con poche partite vanno interpretati con cautela."
         )
+
+        # V5: diagnostica No Goal per fasce di lambda totale attesa.
+        # Solo analisi retrospettiva: non cambia le probabilità o i pronostici operativi.
+        str_lit.markdown("#### 🥅 Diagnostica No Goal per gol attesi")
+        str_lit.caption(
+            "Raggruppa le partite in base alla somma Lambda casa + Lambda trasferta. "
+            "Serve a capire se la sovrastima No Goal si concentra in partite con pochi, medi o molti gol attesi; "
+            "non applica correzioni al modello."
+        )
+        colonne_lambda = {"Lambda casa", "Lambda trasferta", "P(No Goal) %", "No Goal reale", "Brier Goal/No Goal"}
+        if colonne_lambda.issubset(df_audit.columns):
+            df_ng_tipo = df_audit.copy()
+            df_ng_tipo["Gol attesi totali (lambda) "] = (
+                pd.to_numeric(df_ng_tipo["Lambda casa"], errors="coerce")
+                + pd.to_numeric(df_ng_tipo["Lambda trasferta"], errors="coerce")
+            )
+            df_ng_tipo["P(No Goal) (0-1)"] = (pd.to_numeric(df_ng_tipo["P(No Goal) %"], errors="coerce") / 100).clip(0, 1)
+            df_ng_tipo["No Goal reale (0/1)"] = pd.to_numeric(df_ng_tipo["No Goal reale"], errors="coerce")
+            df_ng_tipo["Gruppo gol attesi"] = pd.cut(
+                df_ng_tipo["Gol attesi totali (lambda) "],
+                bins=[-float("inf"), 2.0, 2.8, float("inf")],
+                labels=["Bassi (≤2.0)", "Medi (>2.0–2.8)", "Alti (>2.8)"],
+                right=True,
+                include_lowest=True,
+            )
+            df_ng_tipo = df_ng_tipo.dropna(subset=["Gruppo gol attesi", "No Goal reale (0/1)", "P(No Goal) (0-1)"])
+            if not df_ng_tipo.empty:
+                riepilogo_ng_tipo = df_ng_tipo.groupby("Gruppo gol attesi", observed=False).agg(
+                    Partite=("No Goal reale (0/1)", "size"),
+                    **{
+                        "Lambda totale media": ("Gol attesi totali (lambda) ", "mean"),
+                        "P(No Goal) media (%)": ("P(No Goal) %", "mean"),
+                        "No Goal reali (%)": ("No Goal reale (0/1)", lambda x: 100 * x.mean()),
+                        "Brier No Goal": ("Brier Goal/No Goal", "mean"),
+                    },
+                ).reset_index()
+                riepilogo_ng_tipo["Scarto (pp)"] = (
+                    riepilogo_ng_tipo["P(No Goal) media (%)"] - riepilogo_ng_tipo["No Goal reali (%)"]
+                )
+                str_lit.dataframe(riepilogo_ng_tipo.round(2), use_container_width=True, hide_index=True)
+                str_lit.caption(
+                    "Brier No Goal è riportato dal calcolo walk-forward già presente nell'audit. "
+                    "Le fasce con poche partite sono descrittive e non bastano da sole a giustificare una modifica."
+                )
+            else:
+                str_lit.info("Non ci sono righe valide sufficienti per la diagnostica No Goal per lambda.")
+        else:
+            str_lit.warning("Diagnostica No Goal per lambda non disponibile: mancano una o più colonne attese nell'audit.")
 
         scarto_x = prob_x_media - freq_x_reale
         scarto_ng = prob_ng_media - freq_ng_reale
