@@ -241,8 +241,13 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=5):
             p2 = float(np.triu(matrice, 1).sum())
             p_goal = float(matrice[1:, 1:].sum())
             p_nogoal = 1.0 - p_goal
+            # Controllo indipendente: con Poisson indipendenti, P(No Goal) =
+            # 1 - P(casa segna almeno un gol) * P(trasferta segna almeno un gol).
+            p_nogoal_formula = 1.0 - (1.0 - math.exp(-lam_c)) * (1.0 - math.exp(-lam_t))
             esito = "1" if partita["gol_casa"] > partita["gol_trasferta"] else ("X" if partita["gol_casa"] == partita["gol_trasferta"] else "2")
             reale_nogoal = int(partita["gol_casa"] == 0 or partita["gol_trasferta"] == 0)
+            # Verifica semantica indipendente dall'etichetta: No Goal se almeno una squadra segna zero.
+            reale_nogoal_check = int(min(partita["gol_casa"], partita["gol_trasferta"]) == 0)
             probs = {"1": p1, "X": px, "2": p2}
             previsto = max(probs, key=probs.get)
             posizione_x = 1 + sum(probs[k] > px for k in ("1", "2"))
@@ -258,6 +263,11 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=5):
                 "Posizione X": posizione_x,
                 "P(No Goal) %": 100*p_nogoal, "No Goal favorito": int(p_nogoal > p_goal),
                 "No Goal reale": reale_nogoal,
+                "Gol casa reali": partita["gol_casa"], "Gol trasferta reali": partita["gol_trasferta"],
+                "P(No Goal) formula esatta (%)": 100 * p_nogoal_formula,
+                "Delta controllo No Goal (pp)": 100 * (p_nogoal - p_nogoal_formula),
+                "Controllo etichetta No Goal": int(reale_nogoal == reale_nogoal_check),
+                "Somma P(1X2) (%)": 100 * (p1 + px + p2),
                 "Brier 1X2": brier_1x2, "Log Loss 1X2": -math.log(p_esito),
                 "Brier Goal/No Goal": (p_nogoal - reale_nogoal) ** 2,
                 "Log Loss Goal/No Goal": -math.log(max(1e-12, p_ng_real)),
@@ -648,6 +658,27 @@ with tab_audit:
             "Servono almeno 30 risultati precedenti nella competizione prima di valutare una partita."
         )
     else:
+        # V7: controlli tecnici indipendenti su probabilità, etichette e walk-forward.
+        str_lit.markdown("#### 🔎 V7 — Verifica tecnica delle probabilità No Goal")
+        str_lit.caption(
+            "Confronta la probabilità No Goal della matrice 0–5 normalizzata con la formula Poisson analitica; "
+            "controlla inoltre l'etichetta reale e la somma delle probabilità 1X2. Non modifica le previsioni."
+        )
+        max_delta_ng = pd.to_numeric(df_audit["Delta controllo No Goal (pp)"], errors="coerce").abs().max()
+        etichette_ok = int(pd.to_numeric(df_audit["Controllo etichetta No Goal"], errors="coerce").fillna(0).sum())
+        somma_1x2_max_err = (pd.to_numeric(df_audit["Somma P(1X2) (%)"], errors="coerce") - 100).abs().max()
+        k1, k2, k3, k4 = str_lit.columns(4)
+        k1.metric("Partite controllate", f"{len(df_audit)}")
+        k2.metric("Etichette No Goal coerenti", f"{etichette_ok}/{len(df_audit)}")
+        k3.metric("Max differenza formula NG", f"{max_delta_ng:.4f} pp")
+        k4.metric("Max errore somma 1X2", f"{somma_1x2_max_err:.6f} pp")
+        if etichette_ok == len(df_audit) and somma_1x2_max_err < 0.01:
+            str_lit.success("Controlli di coerenza superati: etichette No Goal e somma 1X2 corrette nel campione.")
+        else:
+            str_lit.error("Attenzione: almeno un controllo di coerenza non è superato. Verificare le righe dettagliate.")
+        with str_lit.expander("Dettaglio tecnico per partita", expanded=False):
+            cols_check = ["Data", "Casa", "Trasferta", "Gol casa reali", "Gol trasferta reali", "P(No Goal) %", "P(No Goal) formula esatta (%)", "Delta controllo No Goal (pp)", "No Goal reale", "Controllo etichetta No Goal", "Somma P(1X2) (%)", "Storico pre-partita"]
+            str_lit.dataframe(df_audit[cols_check].round(4), use_container_width=True, hide_index=True)
         n = len(df_audit)
         freq_x_reale = (df_audit["Esito reale"] == "X").mean() * 100
         prob_x_media = df_audit["P(X) %"].mean()
