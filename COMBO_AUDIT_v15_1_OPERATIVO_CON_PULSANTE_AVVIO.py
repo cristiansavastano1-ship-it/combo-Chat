@@ -758,7 +758,7 @@ with tab_audit:
             "I gruppi con poche partite vanno interpretati con cautela."
         )
 
-        # V5: diagnostica No Goal per fasce di lambda totale attesa.
+        # V6: diagnostica No Goal per fasce di lambda totale attesa, con dettagli aggiuntivi.
         # Solo analisi retrospettiva: non cambia le probabilità o i pronostici operativi.
         str_lit.markdown("#### 🥅 Diagnostica No Goal per gol attesi")
         str_lit.caption(
@@ -784,18 +784,29 @@ with tab_audit:
             )
             df_ng_tipo = df_ng_tipo.dropna(subset=["Gruppo gol attesi", "No Goal reale (0/1)", "P(No Goal) (0-1)"])
             if not df_ng_tipo.empty:
+                df_ng_tipo["No Goal favorito (0/1)"] = (
+                    pd.to_numeric(df_ng_tipo["P(No Goal) %"], errors="coerce") > 50.0
+                ).astype(int)
                 riepilogo_ng_tipo = df_ng_tipo.groupby("Gruppo gol attesi", observed=False).agg(
                     Partite=("No Goal reale (0/1)", "size"),
                     **{
+                        "Lambda casa media": ("Lambda casa", "mean"),
+                        "Lambda trasferta media": ("Lambda trasferta", "mean"),
                         "Lambda totale media": ("Gol attesi totali (lambda) ", "mean"),
                         "P(No Goal) media (%)": ("P(No Goal) %", "mean"),
                         "No Goal reali (%)": ("No Goal reale (0/1)", lambda x: 100 * x.mean()),
+                        "No Goal favorito (%)": ("No Goal favorito (0/1)", lambda x: 100 * x.mean()),
                         "Brier No Goal": ("Brier Goal/No Goal", "mean"),
                     },
                 ).reset_index()
                 riepilogo_ng_tipo["Scarto (pp)"] = (
                     riepilogo_ng_tipo["P(No Goal) media (%)"] - riepilogo_ng_tipo["No Goal reali (%)"]
                 )
+                riepilogo_ng_tipo = riepilogo_ng_tipo[[
+                    "Gruppo gol attesi", "Partite", "Lambda casa media", "Lambda trasferta media",
+                    "Lambda totale media", "P(No Goal) media (%)", "No Goal reali (%)",
+                    "No Goal favorito (%)", "Scarto (pp)", "Brier No Goal"
+                ]]
                 str_lit.dataframe(riepilogo_ng_tipo.round(2), use_container_width=True, hide_index=True)
                 str_lit.caption(
                     "Brier No Goal è riportato dal calcolo walk-forward già presente nell'audit. "
