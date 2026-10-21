@@ -251,6 +251,12 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
             probs = {"1": p1, "X": px, "2": p2}
             previsto = max(probs, key=probs.get)
             posizione_x = 1 + sum(probs[k] > px for k in ("1", "2"))
+            migliore_vittoria = max(p1, p2)
+            # Scarto positivo: X supera entrambe le vittorie; negativo: almeno una vittoria la supera.
+            scarto_x_vs_vittoria = 100.0 * (px - migliore_vittoria)
+            # Risultato esatto più probabile della matrice normalizzata (solo diagnostica).
+            score_c, score_t = np.unravel_index(int(np.argmax(matrice)), matrice.shape)
+            prob_score_top = float(matrice[score_c, score_t])
             brier_1x2 = sum((probs[k] - (1.0 if esito == k else 0.0)) ** 2 for k in ("1", "X", "2"))
             p_esito = max(1e-12, probs[esito])
             p_ng_real = p_nogoal if reale_nogoal else p_goal
@@ -261,6 +267,11 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
                 "Segno previsto": previsto, "Esito reale": esito,
                 "X prevista come segno": int(previsto == "X"),
                 "Posizione X": posizione_x,
+                "Migliore tra P(1) e P(2) (%)": 100 * migliore_vittoria,
+                "Scarto P(X) - migliore vittoria (pp)": scarto_x_vs_vittoria,
+                "Risultato esatto più probabile": f"{score_c}-{score_t}",
+                "Probabilità risultato esatto top (%)": 100 * prob_score_top,
+                "Punteggio esatto top è pareggio": int(score_c == score_t),
                 "P(No Goal) %": 100*p_nogoal, "No Goal favorito": int(p_nogoal > p_goal),
                 "No Goal reale": reale_nogoal,
                 "Gol casa reali": partita["gol_casa"], "Gol trasferta reali": partita["gol_trasferta"],
@@ -658,11 +669,11 @@ with tab_audit:
             "Servono almeno 30 risultati precedenti nella competizione prima di valutare una partita."
         )
     else:
-        # V9: audit walk-forward esteso a 0..10, allineato alla matrice del pronostico live.
-        str_lit.markdown("#### 🔎 V9 — Audit allineato alla matrice Poisson 0–10")
+        # V10: diagnostica aggiuntiva, senza modifiche alle probabilità operative.
+        str_lit.markdown("#### 🔎 V10 — Audit Poisson 0–10 e diagnostica della X")
         str_lit.caption(
-            "Confronta la probabilità No Goal della matrice 0–10 normalizzata con la formula Poisson analitica; "
-            "controlla inoltre l'etichetta reale e la somma delle probabilità 1X2. Non modifica le previsioni."
+            "Mantiene i controlli V9 e aggiunge lo scarto tra P(X) e la migliore tra P(1)/P(2), "
+            "oltre al risultato esatto più probabile. È solo diagnostica: non modifica le previsioni."
         )
         max_delta_ng = pd.to_numeric(df_audit["Delta controllo No Goal (pp)"], errors="coerce").abs().max()
         etichette_ok = int(pd.to_numeric(df_audit["Controllo etichetta No Goal"], errors="coerce").fillna(0).sum())
@@ -748,6 +759,45 @@ with tab_audit:
         x1.metric("X al 1° posto", f"{posizione_x.loc[1]}", f"{posizione_x.loc[1]/n*100:.1f}% delle partite")
         x2.metric("X al 2° posto", f"{posizione_x.loc[2]}", f"{posizione_x.loc[2]/n*100:.1f}% delle partite")
         x3.metric("X al 3° posto", f"{posizione_x.loc[3]}", f"{posizione_x.loc[3]/n*100:.1f}% delle partite")
+
+        # V10: quanto la probabilità X si avvicina o supera la migliore tra 1 e 2.
+        str_lit.markdown("#### 🧩 Quanto è competitiva la X rispetto a 1 e 2?")
+        str_lit.caption(
+            "Scarto = P(X) meno la maggiore tra P(1) e P(2). Valore negativo: una vittoria è favorita; "
+            "zero o positivo: la X è almeno pari alla migliore vittoria. Nessuna probabilità viene cambiata."
+        )
+        df_x_gap = df_audit.copy()
+        df_x_gap["Esito X reale (0/1)"] = (df_x_gap["Esito reale"] == "X").astype(int)
+        df_x_gap["Fascia scarto X-vittoria"] = pd.cut(
+            df_x_gap["Scarto P(X) - migliore vittoria (pp)"],
+            bins=[-float("inf"), -15, -10, -5, 0, float("inf")],
+            labels=["X indietro >15 pp", "X indietro 10–15 pp", "X indietro 5–10 pp", "X indietro 0–5 pp", "X pari o superiore"],
+            right=False,
+        )
+        riepilogo_x_gap = df_x_gap.groupby("Fascia scarto X-vittoria", observed=False).agg(
+            Partite=("Esito X reale (0/1)", "size"),
+            **{
+                "Scarto medio X-vittoria (pp)": ("Scarto P(X) - migliore vittoria (pp)", "mean"),
+                "P(X) media (%)": ("P(X) %", "mean"),
+                "Pareggi reali (%)": ("Esito X reale (0/1)", lambda x: 100 * x.mean()),
+                "X al 1° posto (%)": ("X prevista come segno", lambda x: 100 * x.mean()),
+            },
+        ).reset_index()
+        str_lit.dataframe(riepilogo_x_gap.round(2), use_container_width=True, hide_index=True)
+
+        str_lit.markdown("#### 🎯 Risultato esatto più probabile — controllo descrittivo")
+        str_lit.caption(
+            "Il punteggio esatto top è il singolo risultato con probabilità maggiore nella matrice 0–10. "
+            "Non è una previsione aggiuntiva né una modifica al segno 1X2."
+        )
+        score_top_rate = 100 * df_audit["Punteggio esatto top è pareggio"].mean()
+        score_top_draw_real = df_audit.loc[df_audit["Punteggio esatto top è pareggio"].eq(1), "Esito reale"].eq("X").mean() * 100 if df_audit["Punteggio esatto top è pareggio"].eq(1).any() else 0.0
+        z1, z2 = str_lit.columns(2)
+        z1.metric("Punteggio esatto top in parità", f"{score_top_rate:.1f}%", "quota partite con score top X-X")
+        z2.metric("Pareggi reali quando score top è X-X", f"{score_top_draw_real:.1f}%", "descrittivo; campione potenzialmente piccolo")
+        cols_score = ["Data", "Casa", "Trasferta", "P(1) %", "P(X) %", "P(2) %", "Scarto P(X) - migliore vittoria (pp)", "Segno previsto", "Risultato esatto più probabile", "Probabilità risultato esatto top (%)", "Esito reale"]
+        with str_lit.expander("Dettaglio diagnostico X e punteggio esatto"):
+            str_lit.dataframe(df_audit[cols_score].sort_values("Scarto P(X) - migliore vittoria (pp)", ascending=False).round(3), use_container_width=True, hide_index=True)
 
         # V4: diagnostica della X per equilibrio tra probabilità di vittoria casa/trasferta.
         # Solo analisi: non modifica probabilità operative, lambda o pronostici.
