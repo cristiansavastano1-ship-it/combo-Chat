@@ -262,6 +262,7 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
             p_ng_real = p_nogoal if reale_nogoal else p_goal
             righe.append({
                 "Data": partita["data"].strftime("%Y-%m-%d"),
+                "Competizione": partita["competizione"],
                 "Casa": casa, "Trasferta": trasf,
                 "P(1) %": 100*p1, "P(X) %": 100*px, "P(2) %": 100*p2,
                 "Segno previsto": previsto, "Esito reale": esito,
@@ -669,10 +670,10 @@ with tab_audit:
             "Servono almeno 30 risultati precedenti nella competizione prima di valutare una partita."
         )
     else:
-        # V10: diagnostica aggiuntiva, senza modifiche alle probabilità operative.
-        str_lit.markdown("#### 🔎 V10 — Audit Poisson 0–10 e diagnostica della X")
+        # V11: aggiunge diagnostiche descrittive; nessuna modifica alle probabilità operative.
+        str_lit.markdown("#### 🔎 V11 — Audit Poisson 0–10 e diagnostica della X")
         str_lit.caption(
-            "Mantiene i controlli V9 e aggiunge lo scarto tra P(X) e la migliore tra P(1)/P(2), "
+            "Mantiene i controlli V9/V10 e aggiunge lo scarto tra P(X) e la migliore tra P(1)/P(2), "
             "oltre al risultato esatto più probabile. È solo diagnostica: non modifica le previsioni."
         )
         max_delta_ng = pd.to_numeric(df_audit["Delta controllo No Goal (pp)"], errors="coerce").abs().max()
@@ -897,6 +898,86 @@ with tab_audit:
                 str_lit.info("Non ci sono righe valide sufficienti per la diagnostica No Goal per lambda.")
         else:
             str_lit.warning("Diagnostica No Goal per lambda non disponibile: mancano una o più colonne attese nell'audit.")
+
+        # V11: separa l'errore di stima dei gol attesi dalla sola probabilità No Goal.
+        # Diagnostica retrospettiva; non modifica lambda, matrice o previsioni operative.
+        str_lit.markdown("#### 🧪 V11 — Gol attesi vs gol reali")
+        str_lit.caption(
+            "Confronta le lambda pre-partita con i gol effettivamente segnati, sia per la squadra di casa "
+            "sia per quella in trasferta. La frequenza reale di zero gol viene confrontata con exp(-lambda). "
+            "È un controllo diagnostico, non una correzione del modello."
+        )
+        df_lam = df_audit.copy()
+        for col in ["Lambda casa", "Lambda trasferta", "Gol casa reali", "Gol trasferta reali"]:
+            df_lam[col] = pd.to_numeric(df_lam[col], errors="coerce")
+        df_lam = df_lam.dropna(subset=["Lambda casa", "Lambda trasferta", "Gol casa reali", "Gol trasferta reali"])
+        if not df_lam.empty:
+            # Tabella riepilogativa complessiva: atteso vs osservato.
+            riepilogo_lam = pd.DataFrame([
+                {
+                    "Lato": "Casa",
+                    "Partite": len(df_lam),
+                    "Lambda media": df_lam["Lambda casa"].mean(),
+                    "Gol reali medi": df_lam["Gol casa reali"].mean(),
+                    "Errore medio (reali - attesi)": (df_lam["Gol casa reali"] - df_lam["Lambda casa"]).mean(),
+                    "Zero gol attesi (%)": 100 * np.exp(-df_lam["Lambda casa"]).mean(),
+                    "Zero gol reali (%)": 100 * (df_lam["Gol casa reali"] == 0).mean(),
+                },
+                {
+                    "Lato": "Trasferta",
+                    "Partite": len(df_lam),
+                    "Lambda media": df_lam["Lambda trasferta"].mean(),
+                    "Gol reali medi": df_lam["Gol trasferta reali"].mean(),
+                    "Errore medio (reali - attesi)": (df_lam["Gol trasferta reali"] - df_lam["Lambda trasferta"]).mean(),
+                    "Zero gol attesi (%)": 100 * np.exp(-df_lam["Lambda trasferta"]).mean(),
+                    "Zero gol reali (%)": 100 * (df_lam["Gol trasferta reali"] == 0).mean(),
+                },
+            ])
+            str_lit.dataframe(riepilogo_lam.round(3), use_container_width=True, hide_index=True)
+
+            # Raggruppamento per lambda, così si vede se gli errori si concentrano sui valori bassi.
+            for lato, col_lam, col_gol in [
+                ("Casa", "Lambda casa", "Gol casa reali"),
+                ("Trasferta", "Lambda trasferta", "Gol trasferta reali"),
+            ]:
+                d = df_lam[[col_lam, col_gol]].copy()
+                d["Fascia lambda"] = pd.cut(
+                    d[col_lam], bins=[-float("inf"), 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, float("inf")],
+                    labels=["≤0.75", "0.75–1.00", "1.00–1.25", "1.25–1.50", "1.50–1.75", "1.75–2.00", ">2.00"],
+                    right=True, include_lowest=True,
+                )
+                d["Zero gol reale (0/1)"] = (d[col_gol] == 0).astype(int)
+                d = d.dropna(subset=["Fascia lambda"])
+                riepilogo_lato = d.groupby("Fascia lambda", observed=False).agg(
+                    Partite=(col_gol, "size"),
+                    **{
+                        "Lambda media": (col_lam, "mean"),
+                        "Gol reali medi": (col_gol, "mean"),
+                        "Zero gol attesi (%)": (col_lam, lambda x: 100 * np.exp(-x).mean()),
+                        "Zero gol reali (%)": ("Zero gol reale (0/1)", lambda x: 100 * x.mean()),
+                    },
+                ).reset_index()
+                riepilogo_lato["Errore medio (reali - attesi)"] = riepilogo_lato["Gol reali medi"] - riepilogo_lato["Lambda media"]
+                with str_lit.expander(f"Dettaglio lambda — {lato}", expanded=False):
+                    str_lit.dataframe(riepilogo_lato.round(3), use_container_width=True, hide_index=True)
+
+        # Calibrazione X per competizione: utile per distinguere un problema globale da uno localizzato.
+        str_lit.markdown("#### 🏟️ V11 — Pareggio X per competizione")
+        if "Competizione" in df_audit.columns:
+            # Il nome competizione viene riportato nella riga walk-forward.
+            riepilogo_comp = df_audit.copy()
+            riepilogo_comp["X reale (0/1)"] = (riepilogo_comp["Esito reale"] == "X").astype(int)
+            riepilogo_comp = riepilogo_comp.groupby("Competizione", dropna=False).agg(
+                Partite=("Esito reale", "size"),
+                **{
+                    "P(X) media (%)": ("P(X) %", "mean"),
+                    "Pareggi reali (%)": ("X reale (0/1)", lambda x: 100 * x.mean()),
+                    "X prevista 1° (%)": ("X prevista come segno", lambda x: 100 * x.mean()),
+                },
+            ).reset_index()
+            riepilogo_comp["Scarto P(X) - pareggi reali (pp)"] = riepilogo_comp["P(X) media (%)"] - riepilogo_comp["Pareggi reali (%)"]
+            str_lit.dataframe(riepilogo_comp.round(2), use_container_width=True, hide_index=True)
+            str_lit.caption("Le competizioni con poche osservazioni sono indicative soltanto; non modificare il modello sulla base di un campione piccolo.")
 
         scarto_x = prob_x_media - freq_x_reale
         scarto_ng = prob_ng_media - freq_ng_reale
