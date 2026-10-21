@@ -171,13 +171,13 @@ def calcola_statistiche_avanzate_match(sq_casa, sq_trasf, statistiche_squadre):
     }
 
 # --- AUDIT WALK-FORWARD: PAREGGI (X) E GOAL / NO GOAL ---
-def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=5):
+def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
     """Audit walk-forward usando la stessa logica Poisson del pronostico operativo.
 
     Per ogni partita usa solo risultati precedenti della stessa competizione.
     Le lambda sono le medie gol fatti per squadra, coerenti con il modello live
-    (media_gf della classifica); la matrice 0..5 viene normalizzata prima di
-    calcolare 1X2 e Goal/No Goal.
+    (media_gf della classifica); la matrice 0..10 viene normalizzata prima di
+    calcolare 1X2 e Goal/No Goal. max_gol resta configurabile per i test.
     """
     partite = []
     for m in matches_list:
@@ -203,7 +203,7 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=5):
     righe = []
 
     def poisson_vector(lam):
-        # Stessa matrice dei pronostici live: risultati da 0 a 5 gol.
+        # Stessa estensione della matrice dei pronostici live: risultati da 0 a 10 gol.
         lam = max(0.01, float(lam))
         vals = np.array([
             math.exp(-lam) * (lam ** k) / math.factorial(k)
@@ -658,8 +658,8 @@ with tab_audit:
             "Servono almeno 30 risultati precedenti nella competizione prima di valutare una partita."
         )
     else:
-        # V8: controlli tecnici indipendenti su probabilità, etichette e walk-forward.
-        str_lit.markdown("#### 🔎 V8 — Matrice Poisson estesa e verifica No Goal")
+        # V9: audit walk-forward esteso a 0..10, allineato alla matrice del pronostico live.
+        str_lit.markdown("#### 🔎 V9 — Audit allineato alla matrice Poisson 0–10")
         str_lit.caption(
             "Confronta la probabilità No Goal della matrice 0–10 normalizzata con la formula Poisson analitica; "
             "controlla inoltre l'etichetta reale e la somma delle probabilità 1X2. Non modifica le previsioni."
