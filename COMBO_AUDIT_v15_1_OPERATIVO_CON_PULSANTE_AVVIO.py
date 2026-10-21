@@ -359,10 +359,10 @@ with tab_calendario:
         p_c, p_p, p_t = 0.0, 0.0, 0.0
         prob_under_over = {0.5: 0.0, 1.5: 0.0, 2.5: 0.0, 3.5: 0.0, 4.5: 0.0}
         prob_btts_yes = 0.0
-        matrice_risultati = np.zeros((6, 6))
+        matrice_risultati = np.zeros((11, 11))
 
-        for rc in range(6):
-            for rt in range(6):
+        for rc in range(11):
+            for rt in range(11):
                 prob = poisson_prob(lam_c, rc) * poisson_prob(lam_t, rt)
                 matrice_risultati[rc, rt] = prob
                 
@@ -379,7 +379,7 @@ with tab_calendario:
                     prob_btts_yes += prob
 
         tot = p_c + p_p + p_t
-        # La matrice considera i punteggi 0..5: normalizziamo anche BTTS,
+        # La matrice considera i punteggi 0..10: normalizziamo anche BTTS,
         # altrimenti la massa Poisson oltre 5 gol viene conteggiata erroneamente come No Goal.
         prob_btts_yes = prob_btts_yes / tot if tot > 0 else 0.0
         prob_btts_no = 1.0 - prob_btts_yes
@@ -449,8 +449,8 @@ with tab_calendario:
         str_lit.markdown("#### 🎯 Top 3 Risultati Esatti più Probabili")
         
         lista_esatti = []
-        for rc in range(6):
-            for rt in range(6):
+        for rc in range(11):
+            for rt in range(11):
                 lista_esatti.append(((rc, rt), matrice_risultati[rc, rt]))
         lista_esatti.sort(key=lambda x: x[1], reverse=True)
         
@@ -520,8 +520,8 @@ def genera_dataset_valore(matches_list, stats_dict):
             lt = stats_dict[a]["media_gf"]
             
             p_c, p_p, p_t = 0.0, 0.0, 0.0
-            for rc in range(6):
-                for rt in range(6):
+            for rc in range(11):
+                for rt in range(11):
                     prob = poisson_prob(lc, rc) * poisson_prob(lt, rt)
                     if rc > rt: p_c += prob
                     elif rc == rt: p_p += prob
@@ -658,10 +658,10 @@ with tab_audit:
             "Servono almeno 30 risultati precedenti nella competizione prima di valutare una partita."
         )
     else:
-        # V7: controlli tecnici indipendenti su probabilità, etichette e walk-forward.
-        str_lit.markdown("#### 🔎 V7 — Verifica tecnica delle probabilità No Goal")
+        # V8: controlli tecnici indipendenti su probabilità, etichette e walk-forward.
+        str_lit.markdown("#### 🔎 V8 — Matrice Poisson estesa e verifica No Goal")
         str_lit.caption(
-            "Confronta la probabilità No Goal della matrice 0–5 normalizzata con la formula Poisson analitica; "
+            "Confronta la probabilità No Goal della matrice 0–10 normalizzata con la formula Poisson analitica; "
             "controlla inoltre l'etichetta reale e la somma delle probabilità 1X2. Non modifica le previsioni."
         )
         max_delta_ng = pd.to_numeric(df_audit["Delta controllo No Goal (pp)"], errors="coerce").abs().max()
