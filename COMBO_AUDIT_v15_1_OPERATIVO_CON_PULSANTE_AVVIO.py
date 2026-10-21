@@ -8,7 +8,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V13",
     layout="wide",
     page_icon="⚽",
 )
@@ -280,6 +280,7 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
 
             righe.append({
                 "Data": partita["data"].strftime("%Y-%m-%d"),
+                "Anno": int(partita["data"].year),
                 "Competizione": partita["competizione"],
                 "Casa": casa, "Trasferta": trasf,
                 "P(1) %": 100*p1, "P(X) %": 100*px, "P(2) %": 100*p2,
@@ -310,6 +311,8 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
                 "Brier Goal/No Goal baseline": brier_base_ng,
                 "Log Loss Goal/No Goal baseline": logloss_base_ng,
                 "Storico pre-partita": len(precedenti),
+                "Baseline storico pre-partita": len(precedenti),
+                "Controllo causalità baseline": int(all(x["data"].date() < partita["data"].date() for x in precedenti)),
                 "Lambda casa": lam_c, "Lambda trasferta": lam_t,
             })
         storico.append(partita)
@@ -697,11 +700,11 @@ with tab_audit:
         )
     else:
         # V12: confronto con baseline empirica walk-forward; il modello operativo resta invariato.
-        str_lit.markdown("#### 🔎 V12 — Audit esteso e confronto con baseline storica")
+        str_lit.markdown("#### 🔎 V13 — Audit esteso, campione comune e stabilità temporale")
         str_lit.caption(
-            "Mantiene tutti i controlli V9–V11 e confronta Poisson con una baseline semplice: "
-            "frequenze 1/X/2 e No Goal osservate prima della partita nella stessa competizione, "
-            "con smoothing Laplace. Nessun dato futuro e nessuna modifica alle previsioni operative."
+            "Mantiene i controlli precedenti. Verifica il campione comune Poisson/baseline, la causalità "
+            "della baseline e la stabilità per competizione e anno. La baseline usa solo risultati "
+            "precedenti della stessa competizione con smoothing Laplace. Nessuna modifica alle previsioni operative."
         )
         max_delta_ng = pd.to_numeric(df_audit["Delta controllo No Goal (pp)"], errors="coerce").abs().max()
         etichette_ok = int(pd.to_numeric(df_audit["Controllo etichetta No Goal"], errors="coerce").fillna(0).sum())
@@ -1020,7 +1023,7 @@ with tab_audit:
             str_lit.success("No Goal: sul campione disponibile lo scarto aggregato non supera 7 punti percentuali. Controllare comunque il dettaglio per fascia e campionato.")
 
         # V12: confronto aggregato con baseline naïve, sugli stessi identici eventi walk-forward.
-        str_lit.markdown("#### 📏 V12 — Modello Poisson contro baseline storica")
+        str_lit.markdown("#### 📏 V13 — Poisson contro baseline: confronto sullo stesso campione")
         metriche_confronto = [
             ("1X2 — Brier", "Brier 1X2", "Brier 1X2 baseline"),
             ("1X2 — Log Loss", "Log Loss 1X2", "Log Loss 1X2 baseline"),
@@ -1048,6 +1051,60 @@ with tab_audit:
             )
         else:
             str_lit.info("Confronto baseline non disponibile: mancano le colonne necessarie.")
+
+        # V13: controlli espliciti di campione comune e causalità della baseline.
+        str_lit.markdown("#### 🧪 Verifica del campione e della causalità")
+        n_comune = int(df_audit[["Brier 1X2", "Brier 1X2 baseline", "Log Loss 1X2", "Log Loss 1X2 baseline",
+                                 "Brier Goal/No Goal", "Brier Goal/No Goal baseline",
+                                 "Log Loss Goal/No Goal", "Log Loss Goal/No Goal baseline"]].notna().all(axis=1).sum())
+        causalita_ok = int(pd.to_numeric(df_audit.get("Controllo causalità baseline", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        k1, k2, k3 = str_lit.columns(3)
+        k1.metric("Partite con metriche complete comuni", f"{n_comune}/{len(df_audit)}")
+        k2.metric("Baseline senza dati futuri", f"{causalita_ok}/{len(df_audit)}")
+        k3.metric("Campionati nel campione", f"{df_audit['Competizione'].nunique()}")
+        if n_comune == len(df_audit) and causalita_ok == len(df_audit):
+            str_lit.success("Campione comune confermato: Poisson e baseline sono valutati sulle stesse partite; la baseline usa solo date precedenti.")
+        else:
+            str_lit.warning("Campione incompleto o controllo temporale non superato: interpretare il confronto con cautela.")
+        str_lit.info(
+            "Nota importante: il walk-forward può valutare soltanto le partite storiche effettivamente presenti in matches_raw. "
+            "Se la fonte carica solo una stagione o un sottoinsieme di risultati, questa versione non inventa partite mancanti: "
+            "il numero mostrato sopra è il campione realmente disponibile."
+        )
+
+        # V13: confronto separato per competizione, evitando di nascondere differenze tra leghe.
+        str_lit.markdown("#### 🏆 Risultati per competizione")
+        colonne_metriche = ["Brier 1X2", "Brier 1X2 baseline", "Log Loss 1X2", "Log Loss 1X2 baseline",
+                            "Brier Goal/No Goal", "Brier Goal/No Goal baseline",
+                            "Log Loss Goal/No Goal", "Log Loss Goal/No Goal baseline"]
+        df_comp = df_audit.dropna(subset=colonne_metriche).groupby("Competizione", dropna=False).agg(
+            Partite=("Esito reale", "size"),
+            **{"P(X) media (%)": ("P(X) %", "mean"), "Pareggi reali (%)": ("Esito reale", lambda x: 100 * (x == "X").mean()),
+               "No Goal medio (%)": ("P(No Goal) %", "mean"), "No Goal reali (%)": ("No Goal reale", lambda x: 100 * x.mean()),
+               "Brier 1X2 Poisson": ("Brier 1X2", "mean"), "Brier 1X2 baseline": ("Brier 1X2 baseline", "mean"),
+               "Brier NG Poisson": ("Brier Goal/No Goal", "mean"), "Brier NG baseline": ("Brier Goal/No Goal baseline", "mean")}
+        ).reset_index()
+        if not df_comp.empty:
+            str_lit.dataframe(df_comp.round(4), use_container_width=True, hide_index=True)
+        else:
+            str_lit.caption("Non ci sono dati sufficienti per il dettaglio per competizione.")
+
+        # V13: stabilità temporale descrittiva per anno; campioni piccoli sono segnalati.
+        str_lit.markdown("#### 📆 Stabilità temporale per anno")
+        df_anno = df_audit.dropna(subset=colonne_metriche).groupby("Anno", dropna=False).agg(
+            Partite=("Esito reale", "size"),
+            **{"Pareggi reali (%)": ("Esito reale", lambda x: 100 * (x == "X").mean()),
+               "P(X) media (%)": ("P(X) %", "mean"), "No Goal reali (%)": ("No Goal reale", lambda x: 100 * x.mean()),
+               "P(No Goal) media (%)": ("P(No Goal) %", "mean"),
+               "Brier 1X2 Poisson": ("Brier 1X2", "mean"), "Brier 1X2 baseline": ("Brier 1X2 baseline", "mean"),
+               "Brier NG Poisson": ("Brier Goal/No Goal", "mean"), "Brier NG baseline": ("Brier Goal/No Goal baseline", "mean")}
+        ).reset_index()
+        if not df_anno.empty:
+            str_lit.dataframe(df_anno.round(4), use_container_width=True, hide_index=True)
+            if (df_anno["Partite"] < 100).any():
+                str_lit.caption("Attenzione: gli anni con meno di 100 partite sono indicativi e non consentono conclusioni robuste.")
+        else:
+            str_lit.caption("Non ci sono dati sufficienti per il dettaglio temporale.")
 
         with str_lit.expander("🔎 Dettaglio partite usate nell'audit"):
             str_lit.dataframe(df_audit, use_container_width=True, hide_index=True)
