@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V15",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V14",
     layout="wide",
     page_icon="⚽",
 )
@@ -387,207 +387,6 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
     return pd.DataFrame(righe)
 
 
-
-
-def _prob_clip(p):
-    return float(np.clip(float(p), 1e-6, 1.0 - 1e-6))
-
-
-def _fit_platt_prior(prob, outcome, min_train=100, max_train=300, steps=80):
-    """Fit Platt logistico regolarizzato usando esclusivamente osservazioni passate."""
-    p = np.asarray(prob, dtype=float)
-    y = np.asarray(outcome, dtype=float)
-    valid = np.isfinite(p) & np.isfinite(y)
-    p, y = p[valid], y[valid]
-    if len(y) < min_train or len(np.unique(y)) < 2:
-        return None
-    p, y = p[-max_train:], y[-max_train:]
-    x = np.log(np.clip(p, 1e-5, 1-1e-5) / np.clip(1-p, 1e-5, 1))
-    # Newton-Raphson su intercetta e coefficiente, con lieve ridge sul coefficiente.
-    X = np.column_stack([np.ones(len(x)), x])
-    beta = np.array([0.0, 1.0], dtype=float)
-    for _ in range(steps):
-        z = np.clip(X @ beta, -25, 25)
-        q = 1.0 / (1.0 + np.exp(-z))
-        w = np.clip(q * (1-q), 1e-6, None)
-        grad = X.T @ (q-y) + np.array([0.01 * beta[0], 0.02 * beta[1]])
-        hess = X.T @ (X * w[:, None]) + np.array([[0.01, 0.0], [0.0, 0.02]])
-        try:
-            step = np.linalg.solve(hess, grad)
-        except np.linalg.LinAlgError:
-            return None
-        beta -= step
-        beta[1] = float(np.clip(beta[1], -5.0, 5.0))
-        if float(np.max(np.abs(step))) < 1e-7:
-            break
-    return beta
-
-
-def _calcola_metriche_binaria(prob, y):
-    p = np.clip(np.asarray(prob, dtype=float), 1e-12, 1-1e-12)
-    y = np.asarray(y, dtype=float)
-    return float(np.mean((p-y)**2)), float(np.mean(-(y*np.log(p)+(1-y)*np.log(1-p))))
-
-
-@str_lit.cache_data(ttl=21600, show_spinner=False)
-def crea_test_v15_walk_forward(df_audit, min_train=100, max_train=300, max_gol=10):
-    """Test diagnostici out-of-sample: correzione lambda e calibrazione X/No Goal.
-    Ogni parametro per la partita target è stimato solo da righe precedenti della stessa competizione.
-    Nessun valore prodotto da questa funzione viene usato nelle previsioni operative.
-    """
-    if df_audit.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    d = df_audit.copy()
-    d['_data_dt'] = pd.to_datetime(d['Data'], errors='coerce', utc=True)
-    d = d.sort_values(['_data_dt', 'Competizione']).reset_index(drop=True)
-    d['P(X) raw'] = pd.to_numeric(d['P(X) %'], errors='coerce') / 100.0
-    d['P(NG) raw'] = pd.to_numeric(d['P(No Goal) %'], errors='coerce') / 100.0
-    d['X y'] = (d['Esito reale'] == 'X').astype(int)
-    d['NG y'] = pd.to_numeric(d['No Goal reale'], errors='coerce').fillna(0).astype(int)
-    d['y1'] = (d['Esito reale'] == '1').astype(int)
-    d['y2'] = (d['Esito reale'] == '2').astype(int)
-    for col in ['Lambda casa', 'Lambda trasferta', 'Gol casa reali', 'Gol trasferta reali', 'P(1) %', 'P(2) %']:
-        d[col] = pd.to_numeric(d[col], errors='coerce')
-    d['P(X) calibrata WF'] = np.nan
-    d['P(NG) calibrata WF'] = np.nan
-    d['Lambda casa corretta WF'] = np.nan
-    d['Lambda trasferta corretta WF'] = np.nan
-    d['P(1) lambda corretta WF'] = np.nan
-    d['P(X) lambda corretta WF'] = np.nan
-    d['P(2) lambda corretta WF'] = np.nan
-    d['P(NG) lambda corretta WF'] = np.nan
-    d['Training usato V15'] = 0
-    d['Fattore casa WF'] = np.nan
-    d['Fattore trasferta WF'] = np.nan
-
-    # Elaborazione per competizione; target-day escluso dal training.
-    for comp, idxs in d.groupby('Competizione', dropna=False).groups.items():
-        idxs = list(idxs)
-        prior_idxs = []
-        for idx in idxs:
-            target_date = d.at[idx, '_data_dt']
-            # Elimina tutte le partite dello stesso giorno dal training.
-            prior_idxs = [j for j in prior_idxs if d.at[j, '_data_dt'].date() < target_date.date()]
-            train = d.loc[prior_idxs].tail(max_train)
-            if len(train) >= min_train:
-                # Calibrazione binaria X e No Goal, fit solo su precedenti della stessa competizione.
-                bx = _fit_platt_prior(train['P(X) raw'], train['X y'], min_train, max_train)
-                bng = _fit_platt_prior(train['P(NG) raw'], train['NG y'], min_train, max_train)
-                if bx is not None:
-                    p = _prob_clip(d.at[idx, 'P(X) raw'])
-                    x = np.log(p/(1-p))
-                    d.at[idx, 'P(X) calibrata WF'] = 1/(1+np.exp(-np.clip(bx[0]+bx[1]*x, -25, 25)))
-                if bng is not None:
-                    p = _prob_clip(d.at[idx, 'P(NG) raw'])
-                    x = np.log(p/(1-p))
-                    d.at[idx, 'P(NG) calibrata WF'] = 1/(1+np.exp(-np.clip(bng[0]+bng[1]*x, -25, 25)))
-
-                # Fattori di correzione lambda, stimati dal rapporto gol reali / lambda
-                # nelle sole previsioni già valutate. Shrinkage verso 1 e limiti anti-estremi.
-                lc = train['Lambda casa'].to_numpy(dtype=float)
-                la = train['Lambda trasferta'].to_numpy(dtype=float)
-                gh = train['Gol casa reali'].to_numpy(dtype=float)
-                ga = train['Gol trasferta reali'].to_numpy(dtype=float)
-                valid_h = np.isfinite(lc) & np.isfinite(gh) & (lc > 0)
-                valid_a = np.isfinite(la) & np.isfinite(ga) & (la > 0)
-                fh = float(np.clip((np.mean(gh[valid_h]) / np.mean(lc[valid_h])) if valid_h.any() else 1.0, 0.80, 1.25))
-                fa = float(np.clip((np.mean(ga[valid_a]) / np.mean(la[valid_a])) if valid_a.any() else 1.0, 0.80, 1.25))
-                # Shrinkage: con massimo 300 partite evita correzioni troppo aggressive.
-                shrink = len(train) / (len(train) + 150.0)
-                fh = 1.0 + (fh - 1.0) * shrink
-                fa = 1.0 + (fa - 1.0) * shrink
-                lc_new = max(0.01, float(d.at[idx, 'Lambda casa']) * fh)
-                la_new = max(0.01, float(d.at[idx, 'Lambda trasferta']) * fa)
-                d.at[idx, 'Lambda casa corretta WF'] = lc_new
-                d.at[idx, 'Lambda trasferta corretta WF'] = la_new
-                d.at[idx, 'Fattore casa WF'] = fh
-                d.at[idx, 'Fattore trasferta WF'] = fa
-                # Matrice Poisson 0..max_gol con la stessa normalizzazione dell'audit originale.
-                vh = np.array([math.exp(-lc_new) * lc_new**k / math.factorial(k) for k in range(max_gol+1)])
-                va = np.array([math.exp(-la_new) * la_new**k / math.factorial(k) for k in range(max_gol+1)])
-                mat = np.outer(vh, va)
-                mat /= max(float(mat.sum()), 1e-15)
-                d.at[idx, 'P(1) lambda corretta WF'] = float(np.tril(mat, -1).sum())
-                d.at[idx, 'P(X) lambda corretta WF'] = float(np.trace(mat))
-                d.at[idx, 'P(2) lambda corretta WF'] = float(np.triu(mat, 1).sum())
-                d.at[idx, 'P(NG) lambda corretta WF'] = float(1.0 - mat[1:, 1:].sum())
-                d.at[idx, 'Training usato V15'] = len(train)
-            # Aggiungi la riga target allo storico solo dopo avere calcolato la previsione.
-            prior_idxs.append(idx)
-
-    # Tabella aggregata delle metriche: confronta sulle stesse righe per ciascuna coppia.
-    righe_metriche = []
-    yx = d['X y'].to_numpy(dtype=float)
-    yng = d['NG y'].to_numpy(dtype=float)
-    px_raw = d['P(X) raw'].to_numpy(dtype=float)
-    png_raw = d['P(NG) raw'].to_numpy(dtype=float)
-    for label, col, target, base in [
-        ('X — Brier', 'P(X) calibrata WF', 'X y', 'P(X) raw'),
-        ('No Goal — Brier', 'P(NG) calibrata WF', 'NG y', 'P(NG) raw'),
-    ]:
-        mask = d[col].notna() & d[base].notna()
-        if int(mask.sum()) >= 1:
-            y = d.loc[mask, target].to_numpy(dtype=float)
-            raw = d.loc[mask, base].to_numpy(dtype=float)
-            cal = d.loc[mask, col].to_numpy(dtype=float)
-            righe_metriche.append({'Test': label, 'N test out-of-sample': int(mask.sum()), 'Metrica raw': float(np.mean((raw-y)**2)), 'Metrica WF': float(np.mean((cal-y)**2)), 'Delta WF - raw': float(np.mean((cal-y)**2)-np.mean((raw-y)**2)), 'LogLoss raw': _calcola_metriche_binaria(raw,y)[1], 'LogLoss WF': _calcola_metriche_binaria(cal,y)[1]})
-    # Lambda correction: goals MAE and probability scores on identical rows.
-    mask_l = d['Lambda casa corretta WF'].notna() & d['Lambda trasferta corretta WF'].notna()
-    if int(mask_l.sum()) >= 1:
-        z = d.loc[mask_l]
-        raw_h = z['Lambda casa'].to_numpy(dtype=float); raw_a = z['Lambda trasferta'].to_numpy(dtype=float)
-        adj_h = z['Lambda casa corretta WF'].to_numpy(dtype=float); adj_a = z['Lambda trasferta corretta WF'].to_numpy(dtype=float)
-        gh = z['Gol casa reali'].to_numpy(dtype=float); ga = z['Gol trasferta reali'].to_numpy(dtype=float)
-        y1 = z['y1'].to_numpy(dtype=float); yxv = z['X y'].to_numpy(dtype=float); y2 = z['y2'].to_numpy(dtype=float)
-        raw_probs = z[['P(1) %','P(X) %','P(2) %']].to_numpy(dtype=float)/100
-        adj_probs = z[['P(1) lambda corretta WF','P(X) lambda corretta WF','P(2) lambda corretta WF']].to_numpy(dtype=float)
-        raw_brier_1x2 = float(np.mean(np.sum((raw_probs - np.column_stack([y1,yxv,y2]))**2, axis=1)))
-        adj_brier_1x2 = float(np.mean(np.sum((adj_probs - np.column_stack([y1,yxv,y2]))**2, axis=1)))
-        yng_l = z['NG y'].to_numpy(dtype=float)
-        raw_ng = z['P(NG) raw'].to_numpy(dtype=float)
-        adj_ng = z['P(NG) lambda corretta WF'].to_numpy(dtype=float)
-        righe_metriche.extend([
-            {'Test':'Lambda — MAE gol casa', 'N test out-of-sample':int(mask_l.sum()), 'Metrica raw':float(np.mean(np.abs(raw_h-gh))), 'Metrica WF':float(np.mean(np.abs(adj_h-gh))), 'Delta WF - raw':float(np.mean(np.abs(adj_h-gh))-np.mean(np.abs(raw_h-gh))), 'LogLoss raw':np.nan, 'LogLoss WF':np.nan},
-            {'Test':'Lambda — MAE gol trasferta', 'N test out-of-sample':int(mask_l.sum()), 'Metrica raw':float(np.mean(np.abs(raw_a-ga))), 'Metrica WF':float(np.mean(np.abs(adj_a-ga))), 'Delta WF - raw':float(np.mean(np.abs(adj_a-ga))-np.mean(np.abs(raw_a-ga))), 'LogLoss raw':np.nan, 'LogLoss WF':np.nan},
-            {'Test':'Lambda — Brier 1X2', 'N test out-of-sample':int(mask_l.sum()), 'Metrica raw':raw_brier_1x2, 'Metrica WF':adj_brier_1x2, 'Delta WF - raw':adj_brier_1x2-raw_brier_1x2, 'LogLoss raw':np.nan, 'LogLoss WF':np.nan},
-            {'Test':'Lambda — Brier No Goal', 'N test out-of-sample':int(mask_l.sum()), 'Metrica raw':float(np.mean((raw_ng-yng_l)**2)), 'Metrica WF':float(np.mean((adj_ng-yng_l)**2)), 'Delta WF - raw':float(np.mean((adj_ng-yng_l)**2)-np.mean((raw_ng-yng_l)**2)), 'LogLoss raw':_calcola_metriche_binaria(raw_ng,yng_l)[1], 'LogLoss WF':_calcola_metriche_binaria(adj_ng,yng_l)[1]},
-        ])
-    # Riepilogo per competizione: raw vs correzioni sulle stesse righe out-of-sample.
-    righe_comp = []
-    for comp, z in d.groupby('Competizione', dropna=False):
-        row = {
-            'Competizione': comp,
-            'Partite valutate': int(len(z)),
-            'Prima data': z['_data_dt'].min(),
-            'Ultima data': z['_data_dt'].max(),
-            'Training minimo usato': int(z['Training usato V15'].min()),
-            'Training massimo usato': int(z['Training usato V15'].max()),
-        }
-        for raw_col, cal_col, target_col, label_raw, label_cal in [
-            ('P(X) raw', 'P(X) calibrata WF', 'X y', 'Brier X raw', 'Brier X calibrato WF'),
-            ('P(NG) raw', 'P(NG) calibrata WF', 'NG y', 'Brier No Goal raw', 'Brier No Goal calibrato WF'),
-        ]:
-            zcal = z[z[cal_col].notna()]
-            row[label_raw] = float(np.mean((zcal[raw_col].to_numpy(dtype=float) - zcal[target_col].to_numpy(dtype=float))**2)) if not zcal.empty else np.nan
-            row[label_cal] = float(np.mean((zcal[cal_col].to_numpy(dtype=float) - zcal[target_col].to_numpy(dtype=float))**2)) if not zcal.empty else np.nan
-        zz = z[z['Lambda casa corretta WF'].notna() & z['Lambda trasferta corretta WF'].notna()]
-        if not zz.empty:
-            targets = np.column_stack([(zz['Esito reale'] == '1').astype(int), (zz['Esito reale'] == 'X').astype(int), (zz['Esito reale'] == '2').astype(int)])
-            probs_raw = zz[['P(1) %','P(X) %','P(2) %']].to_numpy(dtype=float)/100.0
-            probs_adj = zz[['P(1) lambda corretta WF','P(X) lambda corretta WF','P(2) lambda corretta WF']].to_numpy(dtype=float)
-            row['Brier 1X2 raw'] = float(np.mean(np.sum((probs_raw-targets)**2, axis=1)))
-            row['Brier 1X2 lambda WF'] = float(np.mean(np.sum((probs_adj-targets)**2, axis=1)))
-            row['MAE lambda casa raw'] = float(np.mean(np.abs(zz['Lambda casa']-zz['Gol casa reali'])))
-            row['MAE lambda casa WF'] = float(np.mean(np.abs(zz['Lambda casa corretta WF']-zz['Gol casa reali'])))
-            row['MAE lambda trasferta raw'] = float(np.mean(np.abs(zz['Lambda trasferta']-zz['Gol trasferta reali'])))
-            row['MAE lambda trasferta WF'] = float(np.mean(np.abs(zz['Lambda trasferta corretta WF']-zz['Gol trasferta reali'])))
-        else:
-            for col in ['Brier 1X2 raw','Brier 1X2 lambda WF','MAE lambda casa raw','MAE lambda casa WF','MAE lambda trasferta raw','MAE lambda trasferta WF']:
-                row[col] = np.nan
-        righe_comp.append(row)
-    return d, pd.DataFrame(righe_metriche), pd.DataFrame(righe_comp)
-
-
 # --- ACQUISIZIONE DATI ---
 statistiche_squadre = {}
 matches_raw = []
@@ -960,7 +759,7 @@ with tab_audit:
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
     )
-    str_lit.markdown("#### 🌍 V15 — Audit storico multi-campionato con dati gratuiti")
+    str_lit.markdown("#### 🌍 V14 — Audit storico multi-campionato con dati gratuiti")
     str_lit.caption(
         "L'audit diagnostico carica separatamente fino a tre stagioni per sei campionati da football-data.co.uk. "
         "Non usa la sola competizione selezionata nel menu e non modifica i dati o le previsioni operative. "
@@ -982,49 +781,8 @@ with tab_audit:
             "Servono almeno 30 risultati precedenti nella competizione prima di valutare una partita."
         )
     else:
-        # V15: pacchetto diagnostico aggiuntivo; nessuna modifica alle previsioni operative.
-        str_lit.markdown("#### 🧪 V15 — Test combinati out-of-sample (solo diagnostica)")
-        str_lit.caption(
-            "In un'unica esecuzione verifica: riconciliazione caricamento/valutazione, correzione walk-forward delle lambda casa/trasferta, "
-            "calibrazione separata di X e No Goal. Ogni correzione usa solo partite precedenti della stessa competizione; le previsioni operative restano invariate."
-        )
-        with str_lit.spinner("Esecuzione test walk-forward V15; può richiedere qualche secondo..."):
-            df_v15_test, df_v15_metriche, df_v15_comp = crea_test_v15_walk_forward(df_audit)
-        # Riconciliazione: partite valutate per competizione contro partite caricate dalla fonte gratuita.
-        if matches_audit:
-            caricate_comp = pd.DataFrame(matches_audit)
-            caricate_comp = caricate_comp.groupby("Competizione").size().reset_index(name="Partite caricate")
-            valutate_comp = df_audit.groupby("Competizione").size().reset_index(name="Partite valutate")
-            df_riconciliazione = caricate_comp.merge(valutate_comp, on="Competizione", how="outer").fillna(0)
-            df_riconciliazione["Partite non valutate / differenza"] = df_riconciliazione["Partite caricate"] - df_riconciliazione["Partite valutate"]
-            str_lit.markdown("##### 1. Riconciliazione partite caricate e valutate")
-            str_lit.dataframe(df_riconciliazione.round(0), use_container_width=True, hide_index=True)
-            str_lit.caption("La differenza include soprattutto lo storico minimo richiesto prima della prima valutazione; eventuali scarti diversi vanno investigati.")
-        if not df_v15_metriche.empty:
-            str_lit.markdown("##### 2. Confronto raw vs correzioni walk-forward")
-            str_lit.dataframe(df_v15_metriche.round(5), use_container_width=True, hide_index=True)
-            str_lit.caption("Delta WF - raw negativo = versione testata migliore. Per le righe lambda, la metrica è MAE dei gol attesi; per le probabilità è Brier Score. Log Loss è mostrato dove applicabile.")
-        else:
-            str_lit.info("Campione insufficiente per i test calibrati: servono almeno 100 osservazioni precedenti della stessa competizione.")
-        if not df_v15_comp.empty:
-            str_lit.markdown("##### 3. Risultati diagnostici per competizione")
-            str_lit.dataframe(df_v15_comp.round(3), use_container_width=True, hide_index=True)
-        if not df_v15_test.empty:
-            with str_lit.expander("Dettaglio delle correzioni V15 (solo test, non operative)", expanded=False):
-                cols_v15 = [c for c in ["Data", "Competizione", "Casa", "Trasferta", "Training usato V15", "Fattore casa WF", "Fattore trasferta WF", "P(X) %", "P(X) calibrata WF", "P(No Goal) %", "P(NG) calibrata WF", "P(NG) lambda corretta WF"] if c in df_v15_test.columns]
-                df_v15_display = df_v15_test[cols_v15].copy()
-                for col_pct in ["P(X) calibrata WF", "P(NG) calibrata WF", "P(1) lambda corretta WF", "P(X) lambda corretta WF", "P(2) lambda corretta WF", "P(NG) lambda corretta WF"]:
-                    if col_pct in df_v15_display.columns:
-                        df_v15_display[col_pct] = pd.to_numeric(df_v15_display[col_pct], errors="coerce") * 100.0
-                str_lit.dataframe(df_v15_display.round(3), use_container_width=True, hide_index=True)
-                df_v15_download = df_v15_test.copy()
-                for col_pct in ["P(X) calibrata WF", "P(NG) calibrata WF", "P(1) lambda corretta WF", "P(X) lambda corretta WF", "P(2) lambda corretta WF", "P(NG) lambda corretta WF"]:
-                    if col_pct in df_v15_download.columns:
-                        df_v15_download[col_pct] = pd.to_numeric(df_v15_download[col_pct], errors="coerce") * 100.0
-                str_lit.download_button("📥 Scarica confronto diagnostico V15 CSV", df_v15_download.to_csv(index=False).encode("utf-8-sig"), "audit_diagnostica_v15_walk_forward.csv", "text/csv")
-
         # V12: confronto con baseline empirica walk-forward; il modello operativo resta invariato.
-        str_lit.markdown("#### 🔎 V15 — Audit esteso, campione comune e stabilità temporale")
+        str_lit.markdown("#### 🔎 V14 — Audit esteso, campione comune e stabilità temporale")
         str_lit.caption(
             "Mantiene i controlli precedenti e amplia il campione storico a più competizioni. Verifica il campione comune Poisson/baseline, la causalità "
             "della baseline e la stabilità per competizione e anno. La baseline usa solo risultati "
@@ -1347,7 +1105,7 @@ with tab_audit:
             str_lit.success("No Goal: sul campione disponibile lo scarto aggregato non supera 7 punti percentuali. Controllare comunque il dettaglio per fascia e campionato.")
 
         # V12: confronto aggregato con baseline naïve, sugli stessi identici eventi walk-forward.
-        str_lit.markdown("#### 📏 V15 — Poisson contro baseline: confronto sullo stesso campione")
+        str_lit.markdown("#### 📏 V14 — Poisson contro baseline: confronto sullo stesso campione")
         metriche_confronto = [
             ("1X2 — Brier", "Brier 1X2", "Brier 1X2 baseline"),
             ("1X2 — Log Loss", "Log Loss 1X2", "Log Loss 1X2 baseline"),
