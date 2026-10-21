@@ -1,4 +1,5 @@
 import math
+from datetime import datetime
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -8,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V13",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V14",
     layout="wide",
     page_icon="⚽",
 )
@@ -139,6 +140,72 @@ def scarica_classifica_club(chiave, league_code):
         if res.status_code == 200: return res.json()
     except Exception: pass
     return None
+
+@str_lit.cache_data(ttl=21600, show_spinner=False)
+def carica_storico_audit_gratuito():
+    """Carica fino a 3 stagioni da football-data.co.uk per l'audit multi-campionato.
+    Questa fonte è separata dai dati operativi/API della app e non modifica i pronostici live.
+    """
+    leghe_csv = {
+        "Serie A (Italia)": "I1",
+        "Premier League (Inghilterra)": "E0",
+        "La Liga (Spagna)": "SP1",
+        "Bundesliga (Germania)": "D1",
+        "Ligue 1 (Francia)": "F1",
+        "Eredivisie (Olanda)": "N1",
+    }
+    anno_corrente = datetime.now().year
+    # La stagione calcistica inizia normalmente ad agosto.
+    anno_inizio = anno_corrente if datetime.now().month >= 8 else anno_corrente - 1
+    stagioni = [f"{str(y)[-2:]}{str(y + 1)[-2:]}" for y in range(anno_inizio, anno_inizio - 3, -1)]
+    risultati = []
+    diagnostica = []
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; COMBO-Audit/14.0)"}
+    for nome_lega, codice in leghe_csv.items():
+        righe_lega = 0
+        errori = []
+        for stagione in stagioni:
+            url = f"https://football-data.co.uk/mmz4281/{stagione}/{codice}.csv"
+            try:
+                response = requests.get(url, headers=headers, timeout=15)
+                if response.status_code != 200 or not response.content:
+                    errori.append(f"{stagione}: HTTP {response.status_code}")
+                    continue
+                from io import BytesIO
+                df = pd.read_csv(BytesIO(response.content), encoding="latin1", on_bad_lines="skip")
+                colonne = {str(c).strip(): c for c in df.columns}
+                richieste = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]
+                if not all(c in colonne for c in richieste):
+                    errori.append(f"{stagione}: colonne richieste mancanti")
+                    continue
+                for _, r in df.iterrows():
+                    if pd.isna(r[colonne["FTHG"]]) or pd.isna(r[colonne["FTAG"]]) or pd.isna(r[colonne["Date"]]):
+                        continue
+                    try:
+                        data = pd.to_datetime(str(r[colonne["Date"]]).strip(), dayfirst=True, errors="coerce")
+                        gc, gt = int(r[colonne["FTHG"]]), int(r[colonne["FTAG"]])
+                        casa, trasf = str(r[colonne["HomeTeam"]]).strip(), str(r[colonne["AwayTeam"]]).strip()
+                        if pd.isna(data) or not casa or not trasf or gc < 0 or gt < 0:
+                            continue
+                        risultati.append({
+                            "status": "FINISHED",
+                            "utcDate": data.strftime("%Y-%m-%dT12:00:00Z"),
+                            "Competizione": nome_lega,
+                            "homeTeam": {"name": casa},
+                            "awayTeam": {"name": trasf},
+                            "score": {"fullTime": {"home": gc, "away": gt}},
+                            "Stagione audit": stagione,
+                        })
+                        righe_lega += 1
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+            except Exception as exc:
+                errori.append(f"{stagione}: {type(exc).__name__}")
+        diagnostica.append({"Competizione": nome_lega, "Partite storiche caricate": righe_lega,
+                            "Stagioni richieste": ", ".join(stagioni),
+                            "Note caricamento": "; ".join(errori) if errori else "OK"})
+    return risultati, pd.DataFrame(diagnostica)
+
 
 def poisson_prob(lmbda, k):
     return (math.exp(-lmbda) * (lmbda**k)) / math.factorial(k)
@@ -692,7 +759,22 @@ with tab_audit:
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
     )
-    df_audit = crea_audit_walk_forward(matches_raw)
+    str_lit.markdown("#### 🌍 V14 — Audit storico multi-campionato con dati gratuiti")
+    str_lit.caption(
+        "L'audit diagnostico carica separatamente fino a tre stagioni per sei campionati da football-data.co.uk. "
+        "Non usa la sola competizione selezionata nel menu e non modifica i dati o le previsioni operative. "
+        "Per ogni partita, le stime usano soltanto risultati precedenti della stessa competizione."
+    )
+    with str_lit.spinner("Caricamento dello storico gratuito per tutti i campionati..."):
+        matches_audit, df_caricamento = carica_storico_audit_gratuito()
+    str_lit.markdown("##### Stato caricamento storico")
+    str_lit.dataframe(df_caricamento, use_container_width=True, hide_index=True)
+    if matches_audit:
+        df_audit = crea_audit_walk_forward(matches_audit)
+    else:
+        # Fallback trasparente alla fonte già usata dalla V13, senza cambiare il modello.
+        df_audit = crea_audit_walk_forward(matches_raw)
+        str_lit.warning("Fonte storica gratuita non raggiungibile: mostrato il campione API della V13, se disponibile.")
     if df_audit.empty:
         str_lit.warning(
             "Non ci sono ancora abbastanza partite concluse per un audit walk-forward. "
@@ -700,9 +782,9 @@ with tab_audit:
         )
     else:
         # V12: confronto con baseline empirica walk-forward; il modello operativo resta invariato.
-        str_lit.markdown("#### 🔎 V13 — Audit esteso, campione comune e stabilità temporale")
+        str_lit.markdown("#### 🔎 V14 — Audit esteso, campione comune e stabilità temporale")
         str_lit.caption(
-            "Mantiene i controlli precedenti. Verifica il campione comune Poisson/baseline, la causalità "
+            "Mantiene i controlli precedenti e amplia il campione storico a più competizioni. Verifica il campione comune Poisson/baseline, la causalità "
             "della baseline e la stabilità per competizione e anno. La baseline usa solo risultati "
             "precedenti della stessa competizione con smoothing Laplace. Nessuna modifica alle previsioni operative."
         )
@@ -992,7 +1074,7 @@ with tab_audit:
                     str_lit.dataframe(riepilogo_lato.round(3), use_container_width=True, hide_index=True)
 
         # Calibrazione X per competizione: utile per distinguere un problema globale da uno localizzato.
-        str_lit.markdown("#### 🏟️ V12 — Pareggio X per competizione")
+        str_lit.markdown("#### 🏟️ V14 — Pareggio X per competizione")
         if "Competizione" in df_audit.columns:
             # Il nome competizione viene riportato nella riga walk-forward.
             riepilogo_comp = df_audit.copy()
@@ -1023,7 +1105,7 @@ with tab_audit:
             str_lit.success("No Goal: sul campione disponibile lo scarto aggregato non supera 7 punti percentuali. Controllare comunque il dettaglio per fascia e campionato.")
 
         # V12: confronto aggregato con baseline naïve, sugli stessi identici eventi walk-forward.
-        str_lit.markdown("#### 📏 V13 — Poisson contro baseline: confronto sullo stesso campione")
+        str_lit.markdown("#### 📏 V14 — Poisson contro baseline: confronto sullo stesso campione")
         metriche_confronto = [
             ("1X2 — Brier", "Brier 1X2", "Brier 1X2 baseline"),
             ("1X2 — Log Loss", "Log Loss 1X2", "Log Loss 1X2 baseline"),
