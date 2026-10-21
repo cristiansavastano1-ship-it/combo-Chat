@@ -260,6 +260,24 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
             brier_1x2 = sum((probs[k] - (1.0 if esito == k else 0.0)) ** 2 for k in ("1", "X", "2"))
             p_esito = max(1e-12, probs[esito])
             p_ng_real = p_nogoal if reale_nogoal else p_goal
+
+            # V12: baseline empirica walk-forward, stimata SOLO dalle partite precedenti
+            # della stessa competizione. Laplace smoothing evita probabilità pari a zero.
+            n_pre = len(precedenti)
+            conteggi_esiti = {
+                "1": sum(x["gol_casa"] > x["gol_trasferta"] for x in precedenti),
+                "X": sum(x["gol_casa"] == x["gol_trasferta"] for x in precedenti),
+                "2": sum(x["gol_casa"] < x["gol_trasferta"] for x in precedenti),
+            }
+            p_base = {k: (conteggi_esiti[k] + 1.0) / (n_pre + 3.0) for k in ("1", "X", "2")}
+            brier_base_1x2 = sum((p_base[k] - (1.0 if esito == k else 0.0)) ** 2 for k in ("1", "X", "2"))
+            logloss_base_1x2 = -math.log(max(1e-12, p_base[esito]))
+            ng_pre = sum(x["gol_casa"] == 0 or x["gol_trasferta"] == 0 for x in precedenti)
+            p_base_ng = (ng_pre + 1.0) / (n_pre + 2.0)
+            p_base_ng_esito = p_base_ng if reale_nogoal else (1.0 - p_base_ng)
+            brier_base_ng = (p_base_ng - reale_nogoal) ** 2
+            logloss_base_ng = -math.log(max(1e-12, p_base_ng_esito))
+
             righe.append({
                 "Data": partita["data"].strftime("%Y-%m-%d"),
                 "Competizione": partita["competizione"],
@@ -283,6 +301,14 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
                 "Brier 1X2": brier_1x2, "Log Loss 1X2": -math.log(p_esito),
                 "Brier Goal/No Goal": (p_nogoal - reale_nogoal) ** 2,
                 "Log Loss Goal/No Goal": -math.log(max(1e-12, p_ng_real)),
+                "Baseline P(1) %": 100 * p_base["1"],
+                "Baseline P(X) %": 100 * p_base["X"],
+                "Baseline P(2) %": 100 * p_base["2"],
+                "Brier 1X2 baseline": brier_base_1x2,
+                "Log Loss 1X2 baseline": logloss_base_1x2,
+                "Baseline P(No Goal) %": 100 * p_base_ng,
+                "Brier Goal/No Goal baseline": brier_base_ng,
+                "Log Loss Goal/No Goal baseline": logloss_base_ng,
                 "Storico pre-partita": len(precedenti),
                 "Lambda casa": lam_c, "Lambda trasferta": lam_t,
             })
@@ -670,11 +696,12 @@ with tab_audit:
             "Servono almeno 30 risultati precedenti nella competizione prima di valutare una partita."
         )
     else:
-        # V11: aggiunge diagnostiche descrittive; nessuna modifica alle probabilità operative.
-        str_lit.markdown("#### 🔎 V11 — Audit Poisson 0–10 e diagnostica della X")
+        # V12: confronto con baseline empirica walk-forward; il modello operativo resta invariato.
+        str_lit.markdown("#### 🔎 V12 — Audit esteso e confronto con baseline storica")
         str_lit.caption(
-            "Mantiene i controlli V9/V10 e aggiunge lo scarto tra P(X) e la migliore tra P(1)/P(2), "
-            "oltre al risultato esatto più probabile. È solo diagnostica: non modifica le previsioni."
+            "Mantiene tutti i controlli V9–V11 e confronta Poisson con una baseline semplice: "
+            "frequenze 1/X/2 e No Goal osservate prima della partita nella stessa competizione, "
+            "con smoothing Laplace. Nessun dato futuro e nessuna modifica alle previsioni operative."
         )
         max_delta_ng = pd.to_numeric(df_audit["Delta controllo No Goal (pp)"], errors="coerce").abs().max()
         etichette_ok = int(pd.to_numeric(df_audit["Controllo etichetta No Goal"], errors="coerce").fillna(0).sum())
@@ -962,7 +989,7 @@ with tab_audit:
                     str_lit.dataframe(riepilogo_lato.round(3), use_container_width=True, hide_index=True)
 
         # Calibrazione X per competizione: utile per distinguere un problema globale da uno localizzato.
-        str_lit.markdown("#### 🏟️ V11 — Pareggio X per competizione")
+        str_lit.markdown("#### 🏟️ V12 — Pareggio X per competizione")
         if "Competizione" in df_audit.columns:
             # Il nome competizione viene riportato nella riga walk-forward.
             riepilogo_comp = df_audit.copy()
@@ -991,6 +1018,36 @@ with tab_audit:
             str_lit.info("No Goal: lo scarto tra probabilità media e frequenza reale è ampio. Non applicare correzioni fisse; verificare prima la calibrazione per fasce di probabilità.")
         else:
             str_lit.success("No Goal: sul campione disponibile lo scarto aggregato non supera 7 punti percentuali. Controllare comunque il dettaglio per fascia e campionato.")
+
+        # V12: confronto aggregato con baseline naïve, sugli stessi identici eventi walk-forward.
+        str_lit.markdown("#### 📏 V12 — Modello Poisson contro baseline storica")
+        metriche_confronto = [
+            ("1X2 — Brier", "Brier 1X2", "Brier 1X2 baseline"),
+            ("1X2 — Log Loss", "Log Loss 1X2", "Log Loss 1X2 baseline"),
+            ("Goal/No Goal — Brier", "Brier Goal/No Goal", "Brier Goal/No Goal baseline"),
+            ("Goal/No Goal — Log Loss", "Log Loss Goal/No Goal", "Log Loss Goal/No Goal baseline"),
+        ]
+        righe_confronto = []
+        for nome, col_modello, col_base in metriche_confronto:
+            if col_modello in df_audit.columns and col_base in df_audit.columns:
+                val_modello = pd.to_numeric(df_audit[col_modello], errors="coerce").mean()
+                val_base = pd.to_numeric(df_audit[col_base], errors="coerce").mean()
+                righe_confronto.append({
+                    "Metrica": nome,
+                    "Poisson": val_modello,
+                    "Baseline storica": val_base,
+                    "Delta Poisson - baseline": val_modello - val_base,
+                    "Migliore": "Poisson" if val_modello < val_base else ("Baseline" if val_base < val_modello else "Pari"),
+                })
+        if righe_confronto:
+            str_lit.dataframe(pd.DataFrame(righe_confronto).round(5), use_container_width=True, hide_index=True)
+            str_lit.caption(
+                "Per Brier e Log Loss valori più bassi sono migliori. La baseline usa soltanto risultati "
+                "precedenti della stessa competizione, con smoothing Laplace; il confronto non implica "
+                "che la baseline sia un modello predittivo avanzato."
+            )
+        else:
+            str_lit.info("Confronto baseline non disponibile: mancano le colonne necessarie.")
 
         with str_lit.expander("🔎 Dettaglio partite usate nell'audit"):
             str_lit.dataframe(df_audit, use_container_width=True, hide_index=True)
