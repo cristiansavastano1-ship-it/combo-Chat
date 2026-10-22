@@ -1256,55 +1256,87 @@ with tab_audit:
                     str_lit.info("Non ci sono abbastanza dati con probabilità RAW e WF disponibili per il riepilogo semestrale.")
                 str_lit.info("V18 è esclusivamente diagnostica: non cambia le probabilità operative, le lambda o il ranking delle previsioni.")
 
-                # V19: audit delle esclusioni, causalità del training e focus Bundesliga.
+                # V19.2: audit esclusioni ottimizzato. Le date vengono convertite una sola volta:
+                # la precedente list-comprehension riconvertiva migliaia di date per ogni riga
+                # (complessità O(N^2)), lasciando la sezione apparentemente vuota in Cloud.
                 str_lit.markdown("##### 12. V19 — Audit delle partite non valutate")
+                from bisect import bisect_left
+
                 def _v19_key(comp, date_value, home, away):
                     date_norm = pd.to_datetime(date_value, errors="coerce", utc=True)
                     if pd.isna(date_norm):
-                        return (str(comp).strip().casefold(), "", str(home).strip().casefold(), str(away).strip().casefold())
-                    return (str(comp).strip().casefold(), date_norm.strftime("%Y-%m-%d"), str(home).strip().casefold(), str(away).strip().casefold())
+                        date_text = ""
+                    else:
+                        date_text = date_norm.strftime("%Y-%m-%d")
+                    return (str(comp).strip().casefold(), date_text,
+                            str(home).strip().casefold(), str(away).strip().casefold())
 
                 v19_eval_keys = set()
                 if not df_audit.empty:
                     for _, rr in df_audit.iterrows():
                         v19_eval_keys.add(_v19_key(rr.get("Competizione"), rr.get("Data"), rr.get("Casa"), rr.get("Trasferta")))
-                v19_loaded_rows = []
-                v19_prior_by_comp = {}
-                for mm in sorted(matches_audit or [], key=lambda q: str(q.get("utcDate", ""))):
+
+                # Prepara una sola volta le partite caricate e le date con risultato valido.
+                v19_prepared = []
+                v19_dates_by_comp = {}
+                for mm in (matches_audit or []):
                     comp = mm.get("Competizione", "Torneo")
                     score = (mm.get("score") or {}).get("fullTime") or {}
                     home = (mm.get("homeTeam") or {}).get("name", "Casa")
                     away = (mm.get("awayTeam") or {}).get("name", "Trasferta")
                     date_value = mm.get("utcDate")
-                    key = _v19_key(comp, date_value, home, away)
                     date_norm = pd.to_datetime(date_value, errors="coerce", utc=True)
-                    if pd.isna(date_norm) or score.get("home") is None or score.get("away") is None:
+                    valid_score = score.get("home") is not None and score.get("away") is not None
+                    valid_date = pd.notna(date_norm)
+                    date_day = date_norm.strftime("%Y-%m-%d") if valid_date else ""
+                    key = (str(comp).strip().casefold(), date_day,
+                           str(home).strip().casefold(), str(away).strip().casefold())
+                    if valid_date and valid_score:
+                        v19_dates_by_comp.setdefault(str(comp), []).append(date_norm.date())
+                    v19_prepared.append({
+                        "comp": comp, "score": score, "home": home, "away": away,
+                        "date_value": date_value, "date_norm": date_norm,
+                        "date_day": date_day, "valid_date": valid_date,
+                        "valid_score": valid_score, "key": key,
+                    })
+
+                # Liste ordinate: bisect_left conta solo risultati con data strettamente precedente.
+                for comp in v19_dates_by_comp:
+                    v19_dates_by_comp[comp].sort()
+
+                v19_loaded_rows = []
+                v19_reconciled = 0
+                for item in v19_prepared:
+                    if item["key"] in v19_eval_keys:
+                        v19_reconciled += 1
+                        continue
+                    comp = item["comp"]
+                    date_norm = item["date_norm"]
+                    if not item["valid_date"] or not item["valid_score"]:
                         reason = "Dati data/risultato mancanti o non validi"
                         n_prior = np.nan
                     else:
-                        prior_matches = [x for x in (matches_audit or [])
-                                         if str(x.get("Competizione", "Torneo")) == str(comp)
-                                         and pd.notna(pd.to_datetime(x.get("utcDate"), errors="coerce", utc=True))
-                                         and pd.to_datetime(x.get("utcDate"), errors="coerce", utc=True).date() < date_norm.date()
-                                         and ((x.get("score") or {}).get("fullTime") or {}).get("home") is not None
-                                         and ((x.get("score") or {}).get("fullTime") or {}).get("away") is not None]
-                        n_prior = len(prior_matches)
-                        if key in v19_eval_keys:
-                            continue
+                        n_prior = bisect_left(v19_dates_by_comp.get(str(comp), []), date_norm.date())
                         if n_prior < 30:
                             reason = "Storico pre-partita insufficiente (<30)"
                         else:
                             reason = "Non riconciliata con audit: verificare data/nomi/competizione"
-                    if key not in v19_eval_keys:
-                        v19_loaded_rows.append({
-                            "Competizione": comp,
-                            "Data": date_norm.strftime("%Y-%m-%d") if pd.notna(date_norm) else str(date_value),
-                            "Casa": home, "Trasferta": away,
-                            "Gol casa": score.get("home"), "Gol trasferta": score.get("away"),
-                            "Storico precedente stessa competizione": n_prior,
-                            "Motivo esclusione diagnosticato": reason,
-                        })
+                    v19_loaded_rows.append({
+                        "Competizione": comp,
+                        "Data": item["date_day"] if item["date_day"] else str(item["date_value"]),
+                        "Casa": item["home"], "Trasferta": item["away"],
+                        "Gol casa": item["score"].get("home"),
+                        "Gol trasferta": item["score"].get("away"),
+                        "Storico precedente stessa competizione": n_prior,
+                        "Motivo esclusione diagnosticato": reason,
+                    })
+
                 df_v19_escluse = pd.DataFrame(v19_loaded_rows)
+                # Riepilogo di stato sempre visibile, anche quando non ci sono esclusioni.
+                k_v19a, k_v19b, k_v19c = str_lit.columns(3)
+                k_v19a.metric("Partite caricate", f"{len(v19_prepared):,}".replace(",", "."))
+                k_v19b.metric("Riconciliate con audit", f"{v19_reconciled:,}".replace(",", "."))
+                k_v19c.metric("Non valutate", f"{len(df_v19_escluse):,}".replace(",", "."))
                 if not df_v19_escluse.empty:
                     df_v19_escluse_summary = df_v19_escluse.groupby(["Competizione", "Motivo esclusione diagnosticato"], dropna=False).size().reset_index(name="Partite escluse")
                     str_lit.dataframe(df_v19_escluse_summary, use_container_width=True, hide_index=True)
@@ -1313,7 +1345,7 @@ with tab_audit:
                         str_lit.dataframe(df_v19_escluse, use_container_width=True, hide_index=True)
                         str_lit.download_button("📥 Scarica dettaglio esclusioni V19 CSV", df_v19_escluse.to_csv(index=False).encode("utf-8-sig"), "v19_dettaglio_esclusioni.csv", "text/csv")
                 else:
-                    str_lit.success("Tutte le partite caricate risultano riconciliate con l'audit.")
+                    str_lit.success("Nessuna partita caricata risulta esclusa dall'audit; controllare i conteggi di caricamento sopra se il divario atteso era diverso.")
 
                 str_lit.markdown("##### 13. V19 — Verifica causale del training WF")
                 if not df_v15_test.empty and "Training usato V15" in df_v15_test.columns:
