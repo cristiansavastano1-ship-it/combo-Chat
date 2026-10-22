@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V16",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V17",
     layout="wide",
     page_icon="⚽",
 )
@@ -1061,6 +1061,112 @@ with tab_audit:
                     str_lit.info("Non ci sono abbastanza previsioni calibrate WF per il riepilogo per competizione.")
             else:
                 str_lit.warning("Diagnostica V16 No Goal non disponibile: mancano colonne necessarie nel risultato walk-forward.")
+
+                # V17: audit di calibrazione No Goal per fasce di probabilità.
+                # Tabelle 1 e 2 raggruppano rispettivamente per probabilità RAW e WF.
+                # Tabella 3 usa le fasce RAW per confrontare RAW/WF sulle stesse partite.
+                str_lit.markdown("##### 6. V17 — Audit No Goal per fasce di probabilità")
+                str_lit.caption(
+                    "Audit esclusivamente diagnostico. Tabelle RAW e WF descrivono la calibrazione nelle rispettive fasce; "
+                    "il confronto appaiato usa invece le fasce RAW per mantenere identico il campione in ogni confronto. "
+                    "La correzione non modifica le previsioni operative."
+                )
+                fasce_v17 = np.linspace(0.0, 1.0, 11)
+                etichette_v17 = [f"{int(fasce_v17[i]*100)}–{int(fasce_v17[i+1]*100)}%" for i in range(10)]
+                df_ng_v17 = df_ng_v16.copy()
+                df_ng_v17["NG y"] = pd.to_numeric(df_ng_v17["NG y"], errors="coerce").clip(0, 1)
+                df_ng_v17["P(NG) raw"] = pd.to_numeric(df_ng_v17["P(NG) raw"], errors="coerce").clip(0, 1)
+                df_ng_v17["P(NG) calibrata WF"] = pd.to_numeric(df_ng_v17["P(NG) calibrata WF"], errors="coerce").clip(0, 1)
+                df_ng_v17 = df_ng_v17.dropna(subset=["P(NG) raw", "P(NG) calibrata WF", "NG y"])
+                df_ng_v17["Fascia RAW"] = pd.cut(df_ng_v17["P(NG) raw"], bins=fasce_v17, labels=etichette_v17, include_lowest=True, right=True)
+                df_ng_v17["Fascia WF"] = pd.cut(df_ng_v17["P(NG) calibrata WF"], bins=fasce_v17, labels=etichette_v17, include_lowest=True, right=True)
+
+                def _tabella_calibrazione_v17(frame, col_fascia, col_prob, suffisso):
+                    righe = []
+                    for fascia in etichette_v17:
+                        g = frame[frame[col_fascia].astype(str) == fascia]
+                        if g.empty:
+                            continue
+                        prob = g[col_prob].to_numpy(dtype=float)
+                        y = g["NG y"].to_numpy(dtype=float)
+                        brier, logloss = _calcola_metriche_binaria(prob, y)
+                        media = float(np.mean(prob))
+                        reale = float(np.mean(y))
+                        righe.append({
+                            "Fascia probabilità " + suffisso: fascia,
+                            "Partite": int(len(g)),
+                            "P(No Goal) media " + suffisso + " (%)": 100 * media,
+                            "No Goal reali (%)": 100 * reale,
+                            "Scarto " + suffisso + " (pp)": 100 * (media - reale),
+                            "Brier " + suffisso: brier,
+                            "LogLoss " + suffisso: logloss,
+                            "Affidabilità campione": "Basso n (<50)" if len(g) < 50 else ("Medio n (50–99)" if len(g) < 100 else "Almeno 100"),
+                        })
+                    return pd.DataFrame(righe)
+
+                tab_v17_raw = _tabella_calibrazione_v17(df_ng_v17, "Fascia RAW", "P(NG) raw", "RAW")
+                tab_v17_wf = _tabella_calibrazione_v17(df_ng_v17, "Fascia WF", "P(NG) calibrata WF", "WF")
+                str_lit.markdown("**Tabella 1 — Calibrazione No Goal RAW per fasce**")
+                if not tab_v17_raw.empty:
+                    str_lit.dataframe(tab_v17_raw.round(5), use_container_width=True, hide_index=True)
+                else:
+                    str_lit.info("Nessuna osservazione RAW disponibile per le fasce.")
+                str_lit.markdown("**Tabella 2 — Calibrazione No Goal Walk-Forward per fasce**")
+                if not tab_v17_wf.empty:
+                    str_lit.dataframe(tab_v17_wf.round(5), use_container_width=True, hide_index=True)
+                else:
+                    str_lit.info("Nessuna osservazione WF disponibile per le fasce.")
+
+                righe_confronto_v17 = []
+                for fascia in etichette_v17:
+                    g = df_ng_v17[df_ng_v17["Fascia RAW"].astype(str) == fascia]
+                    if g.empty:
+                        continue
+                    y = g["NG y"].to_numpy(dtype=float)
+                    raw = g["P(NG) raw"].to_numpy(dtype=float)
+                    wf = g["P(NG) calibrata WF"].to_numpy(dtype=float)
+                    br, lr = _calcola_metriche_binaria(raw, y)
+                    bw, lw = _calcola_metriche_binaria(wf, y)
+                    righe_confronto_v17.append({
+                        "Fascia (classificata su RAW)": fascia,
+                        "Partite": int(len(g)),
+                        "Brier RAW": br, "Brier WF": bw, "Delta Brier WF - RAW": bw-br,
+                        "LogLoss RAW": lr, "LogLoss WF": lw, "Delta LogLoss WF - RAW": lw-lr,
+                        "Migliora entrambe": "Sì" if bw < br and lw < lr else "No",
+                        "Affidabilità campione": "Basso n (<50)" if len(g) < 50 else ("Medio n (50–99)" if len(g) < 100 else "Almeno 100"),
+                    })
+                tab_v17_cmp = pd.DataFrame(righe_confronto_v17)
+                str_lit.markdown("**Tabella 3 — Confronto RAW vs WF per fascia RAW (confronto appaiato)**")
+                str_lit.caption("Delta negativo = WF migliore. Brier e LogLoss più bassi sono migliori. Le fasce della tabella 3 sono definite dalla probabilità RAW, non dalla probabilità WF.")
+                if not tab_v17_cmp.empty:
+                    str_lit.dataframe(tab_v17_cmp.round(5), use_container_width=True, hide_index=True)
+                else:
+                    str_lit.info("Nessuna osservazione sufficiente per il confronto per fasce.")
+
+                if not df_ng_v17.empty:
+                    y_all = df_ng_v17["NG y"].to_numpy(dtype=float)
+                    raw_all = df_ng_v17["P(NG) raw"].to_numpy(dtype=float)
+                    wf_all = df_ng_v17["P(NG) calibrata WF"].to_numpy(dtype=float)
+                    braw_all, llraw_all = _calcola_metriche_binaria(raw_all, y_all)
+                    bwf_all, llwf_all = _calcola_metriche_binaria(wf_all, y_all)
+                    m1, m2, m3, m4 = str_lit.columns(4)
+                    m1.metric("V17 — Partite appaiate", f"{len(df_ng_v17):,}".replace(",", "."))
+                    m2.metric("Brier RAW → WF", f"{braw_all:.5f} → {bwf_all:.5f}", f"{bwf_all-braw_all:+.5f}")
+                    m3.metric("LogLoss RAW → WF", f"{llraw_all:.5f} → {llwf_all:.5f}", f"{llwf_all-llraw_all:+.5f}")
+                    m4.metric("Fasce con n < 50", str(int((tab_v17_cmp["Partite"] < 50).sum()) if not tab_v17_cmp.empty else 0))
+                    str_lit.caption(
+                        f"Campione comune: {len(df_ng_v17)} partite; escluse dalla base V17 per valori mancanti/non validi: "
+                        f"{max(0, len(df_v15_test) - len(df_ng_v17))}. Il confronto resta limitato alle partite per cui esiste una probabilità WF."
+                    )
+                    csv_v17 = df_ng_v17.copy()
+                    csv_v17["P(NG) raw (%)"] = 100 * csv_v17["P(NG) raw"]
+                    csv_v17["P(NG) calibrata WF (%)"] = 100 * csv_v17["P(NG) calibrata WF"]
+                    str_lit.download_button(
+                        "📥 Scarica dati V17 per verifica esterna",
+                        csv_v17.to_csv(index=False).encode("utf-8-sig"),
+                        "audit_v17_nogoal_fasce.csv",
+                        "text/csv",
+                    )
 
         if not df_v15_test.empty:
             with str_lit.expander("Dettaglio delle correzioni walk-forward (solo test, non operative)", expanded=False):
