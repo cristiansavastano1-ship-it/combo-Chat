@@ -457,7 +457,7 @@ def crea_test_v15_walk_forward(df_audit, min_train=100, max_train=300, max_gol=1
     d['P(2) lambda corretta WF'] = np.nan
     d['P(NG) lambda corretta WF'] = np.nan
     d['Training usato V15'] = 0
-    # V19.6: audit trasparente del training effettivamente passato al fit Platt No Goal.
+    # V19.7: audit trasparente del training effettivamente passato al fit Platt No Goal.
     # Queste colonne sono esclusivamente diagnostiche e non cambiano il fit né le previsioni.
     d['NG training righe valide'] = 0
     d['NG training date uniche'] = 0
@@ -479,9 +479,17 @@ def crea_test_v15_walk_forward(df_audit, min_train=100, max_train=300, max_gol=1
         prior_idxs = []
         for idx in idxs:
             target_date = d.at[idx, '_data_dt']
-            # Elimina tutte le partite dello stesso giorno dal training.
-            prior_idxs = [j for j in prior_idxs if d.at[j, '_data_dt'].date() < target_date.date()]
-            train = d.loc[prior_idxs].tail(max_train)
+            # V19.7 FIX: escludi dal training le partite della data target senza
+            # eliminare permanentemente dallo storico le altre partite di quella data.
+            # prior_idxs deve conservare tutte le righe precedenti; il filtro è una vista
+            # temporanea, così le partite del giorno entrano nel training dei giorni successivi.
+            eligible_idxs = [
+                j for j in prior_idxs
+                if pd.notna(d.at[j, '_data_dt'])
+                and pd.notna(target_date)
+                and d.at[j, '_data_dt'].date() < target_date.date()
+            ]
+            train = d.loc[eligible_idxs].tail(max_train)
             if len(train) >= min_train:
                 d.at[idx, 'Training usato V15'] = int(len(train))
                 ultima_data_train = train['_data_dt'].max()
@@ -1574,8 +1582,8 @@ with tab_audit:
                         str_lit.dataframe(v195_focus[cols_focus].sort_values("Data").round(5), use_container_width=True, hide_index=True)
                         str_lit.download_button("📥 Scarica dettaglio Bundesliga 2026-S1 V19.5 CSV", v195_focus[cols_focus].sort_values("Data").to_csv(index=False).encode("utf-8-sig"), "v19_5_bundesliga_dettaglio_2026_S1.csv", "text/csv")
 
-                        # V19.6: audit esplicito del training effettivo e dei parametri Platt.
-                        str_lit.markdown("###### V19.6 — Audit del training WF No Goal (diagnostica soltanto)")
+                        # V19.7: audit esplicito del training effettivo e dei parametri Platt.
+                        str_lit.markdown("###### V19.7 — Audit del training WF No Goal (diagnostica soltanto)")
                         str_lit.caption("Verifica per ogni partita quante righe valide entrano nel fit, quante date distinte coprono, prevalenza No Goal del training, parametri Platt e ultima data usata. Nessuna previsione operativa viene modificata.")
                         cols_v196 = [c for c in ["Data", "Casa", "Trasferta", "NG y", "P(NG) raw", "P(NG) calibrata WF", "Training usato V15", "NG training righe valide", "NG training date uniche", "NG training prevalenza (%)", "Pendenza Platt NG", "Intercetta Platt NG", "Ultima data training NG", "Check training NG"] if c in v195_focus.columns]
                         v196_focus = v195_focus[cols_v196].sort_values("Data").copy()
@@ -1583,15 +1591,15 @@ with tab_audit:
                         n_check_pass = int(v196_focus["Check training NG"].eq("PASS").sum()) if "Check training NG" in v196_focus.columns else 0
                         n_check_bad = int(v196_focus["Check training NG"].eq("VERIFICARE").sum()) if "Check training NG" in v196_focus.columns else len(v196_focus)
                         if n_check_bad == 0 and len(v196_focus) > 0:
-                            str_lit.success(f"V19.6 training NG: {n_check_pass}/{len(v196_focus)} righe PASS su conteggio e causalità.")
+                            str_lit.success(f"V19.7 training NG: {n_check_pass}/{len(v196_focus)} righe PASS su conteggio e causalità.")
                         else:
-                            str_lit.warning(f"V19.6 training NG: {n_check_pass} PASS e {n_check_bad} righe da verificare. Il flag è diagnostico, non modifica il fit.")
-                        str_lit.download_button("📥 Scarica audit training WF V19.6 CSV", v196_focus.to_csv(index=False).encode("utf-8-sig"), "v19_6_audit_training_wf_bundesliga_2026_S1.csv", "text/csv")
+                            str_lit.warning(f"V19.7 training NG: {n_check_pass} PASS e {n_check_bad} righe da verificare. Il flag è diagnostico, non modifica il fit.")
+                        str_lit.download_button("📥 Scarica audit training WF V19.7 CSV", v196_focus.to_csv(index=False).encode("utf-8-sig"), "v19_6_audit_training_wf_bundesliga_2026_S1.csv", "text/csv")
 
-                    str_lit.success(f"V19.5/V19.6: {n_base} partite Bundesliga appaiate; metriche confrontate sulle stesse righe RAW/WF.")
+                    str_lit.success(f"V19.5/V19.7: {n_base} partite Bundesliga appaiate; metriche confrontate sulle stesse righe RAW/WF.")
                 else:
                     str_lit.info("Nessuna partita Bundesliga appaiata RAW/WF disponibile per l'analisi temporale.")
-                str_lit.info("V19.5/V19.6 sono esclusivamente diagnostiche: non modificano probabilità operative, lambda, classifiche o ranking Combo.")
+                str_lit.info("V19.5/V19.7 sono esclusivamente diagnostiche: non modificano probabilità operative, lambda, classifiche o ranking Combo.")
             else:
                 str_lit.warning("Diagnostica V16 No Goal non disponibile: mancano colonne necessarie nel risultato walk-forward.")
 
