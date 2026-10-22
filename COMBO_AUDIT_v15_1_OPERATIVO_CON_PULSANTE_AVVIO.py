@@ -457,6 +457,15 @@ def crea_test_v15_walk_forward(df_audit, min_train=100, max_train=300, max_gol=1
     d['P(2) lambda corretta WF'] = np.nan
     d['P(NG) lambda corretta WF'] = np.nan
     d['Training usato V15'] = 0
+    # V19.6: audit trasparente del training effettivamente passato al fit Platt No Goal.
+    # Queste colonne sono esclusivamente diagnostiche e non cambiano il fit né le previsioni.
+    d['NG training righe valide'] = 0
+    d['NG training date uniche'] = 0
+    d['NG training prevalenza (%)'] = np.nan
+    d['Pendenza Platt NG'] = np.nan
+    d['Intercetta Platt NG'] = np.nan
+    d['Ultima data training NG'] = pd.Series(pd.NaT, index=d.index, dtype='datetime64[ns, UTC]')
+    d['Check training NG'] = ''
     # Colonna UTC-aware: _data_dt è creato con utc=True e l'assegnazione
     # di Timestamp timezone-aware a una colonna datetime-naive causava TypeError.
     d['Data ultimo training V15'] = pd.Series(pd.NaT, index=d.index, dtype='datetime64[ns, UTC]')
@@ -484,6 +493,25 @@ def crea_test_v15_walk_forward(df_audit, min_train=100, max_train=300, max_gol=1
                 # Calibrazione binaria X e No Goal, fit solo su precedenti della stessa competizione.
                 bx = _fit_platt_prior(train['P(X) raw'], train['X y'], min_train, max_train)
                 bng = _fit_platt_prior(train['P(NG) raw'], train['NG y'], min_train, max_train)
+                # Replica soltanto il filtro iniziale del fit Platt per documentare
+                # quanti record NG validi entrano davvero nel fit, dopo il cap max_train.
+                _p_ng = pd.to_numeric(train['P(NG) raw'], errors='coerce').to_numpy(dtype=float)
+                _y_ng = pd.to_numeric(train['NG y'], errors='coerce').to_numpy(dtype=float)
+                _valid_ng = np.isfinite(_p_ng) & np.isfinite(_y_ng)
+                _ng_fit = train.loc[_valid_ng].tail(max_train).copy()
+                d.at[idx, 'NG training righe valide'] = int(len(_ng_fit))
+                d.at[idx, 'NG training date uniche'] = int(_ng_fit['_data_dt'].dt.date.nunique()) if not _ng_fit.empty else 0
+                d.at[idx, 'NG training prevalenza (%)'] = 100.0 * float(_ng_fit['NG y'].mean()) if not _ng_fit.empty else np.nan
+                if not _ng_fit.empty:
+                    d.at[idx, 'Ultima data training NG'] = _ng_fit['_data_dt'].max()
+                d.at[idx, 'Check training NG'] = (
+                    'PASS' if len(_ng_fit) == int(d.at[idx, 'Training usato V15'])
+                    and (pd.isna(target_date) or _ng_fit.empty or _ng_fit['_data_dt'].dt.date.max() < target_date.date())
+                    else 'VERIFICARE'
+                )
+                if bng is not None:
+                    d.at[idx, 'Intercetta Platt NG'] = float(bng[0])
+                    d.at[idx, 'Pendenza Platt NG'] = float(bng[1])
                 if bx is not None:
                     p = _prob_clip(d.at[idx, 'P(X) raw'])
                     x = np.log(p/(1-p))
@@ -1546,10 +1574,24 @@ with tab_audit:
                         str_lit.dataframe(v195_focus[cols_focus].sort_values("Data").round(5), use_container_width=True, hide_index=True)
                         str_lit.download_button("📥 Scarica dettaglio Bundesliga 2026-S1 V19.5 CSV", v195_focus[cols_focus].sort_values("Data").to_csv(index=False).encode("utf-8-sig"), "v19_5_bundesliga_dettaglio_2026_S1.csv", "text/csv")
 
-                    str_lit.success(f"V19.5: {n_base} partite Bundesliga appaiate; metriche confrontate sulle stesse righe RAW/WF.")
+                        # V19.6: audit esplicito del training effettivo e dei parametri Platt.
+                        str_lit.markdown("###### V19.6 — Audit del training WF No Goal (diagnostica soltanto)")
+                        str_lit.caption("Verifica per ogni partita quante righe valide entrano nel fit, quante date distinte coprono, prevalenza No Goal del training, parametri Platt e ultima data usata. Nessuna previsione operativa viene modificata.")
+                        cols_v196 = [c for c in ["Data", "Casa", "Trasferta", "NG y", "P(NG) raw", "P(NG) calibrata WF", "Training usato V15", "NG training righe valide", "NG training date uniche", "NG training prevalenza (%)", "Pendenza Platt NG", "Intercetta Platt NG", "Ultima data training NG", "Check training NG"] if c in v195_focus.columns]
+                        v196_focus = v195_focus[cols_v196].sort_values("Data").copy()
+                        str_lit.dataframe(v196_focus.round(5), use_container_width=True, hide_index=True)
+                        n_check_pass = int(v196_focus["Check training NG"].eq("PASS").sum()) if "Check training NG" in v196_focus.columns else 0
+                        n_check_bad = int(v196_focus["Check training NG"].eq("VERIFICARE").sum()) if "Check training NG" in v196_focus.columns else len(v196_focus)
+                        if n_check_bad == 0 and len(v196_focus) > 0:
+                            str_lit.success(f"V19.6 training NG: {n_check_pass}/{len(v196_focus)} righe PASS su conteggio e causalità.")
+                        else:
+                            str_lit.warning(f"V19.6 training NG: {n_check_pass} PASS e {n_check_bad} righe da verificare. Il flag è diagnostico, non modifica il fit.")
+                        str_lit.download_button("📥 Scarica audit training WF V19.6 CSV", v196_focus.to_csv(index=False).encode("utf-8-sig"), "v19_6_audit_training_wf_bundesliga_2026_S1.csv", "text/csv")
+
+                    str_lit.success(f"V19.5/V19.6: {n_base} partite Bundesliga appaiate; metriche confrontate sulle stesse righe RAW/WF.")
                 else:
                     str_lit.info("Nessuna partita Bundesliga appaiata RAW/WF disponibile per l'analisi temporale.")
-                str_lit.info("V19.5 è esclusivamente diagnostica: non modifica probabilità operative, lambda, classifiche o ranking Combo.")
+                str_lit.info("V19.5/V19.6 sono esclusivamente diagnostiche: non modificano probabilità operative, lambda, classifiche o ranking Combo.")
             else:
                 str_lit.warning("Diagnostica V16 No Goal non disponibile: mancano colonne necessarie nel risultato walk-forward.")
 
