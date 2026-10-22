@@ -95,6 +95,7 @@ LEAGUES = {
     "Ligue 1 (Francia)": ("FL1", "football-data"),
     "Eredivisie (Olanda)": ("DED", "football-data"),
     "Champions League": ("CL", "football-data"),
+    "Europa League": ("EL", "football-data"),
 }
 
 # --- SELETTORE PRINCIPALE IN EVIDENZA (OTTIMIZZATO ANCHE PER MOBILE) ---
