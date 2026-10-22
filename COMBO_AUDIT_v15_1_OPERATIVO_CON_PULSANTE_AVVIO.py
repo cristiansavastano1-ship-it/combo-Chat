@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V16",
+    page_title="COMBO Master Pro AI — Diagnostica V19.9 Europa League Fix",
     layout="wide",
     page_icon="⚽",
 )
@@ -104,6 +104,7 @@ campionato_scelto = str_lit.selectbox("Scegli il torneo da analizzare", list(LEA
 selezionati_dict = {campionato_scelto: LEAGUES[campionato_scelto]}
 
 str_lit.sidebar.markdown("### ⚙ Configurazione API")
+str_lit.sidebar.caption("La API key è richiesta per i campionati football-data.org; l’Europa League usa un feed pubblico gratuito senza chiave.")
 api_key = str_lit.sidebar.text_input("🔑 API Key (football-data.org)", value="", type="password")
 str_lit.sidebar.markdown("---")
 str_lit.sidebar.info("💡 Suggerimento: Da cellulare puoi cambiare campionato direttamente dal menu a tendina in alto nella pagina principale.")
@@ -130,6 +131,60 @@ def scarica_dati_club(chiave, league_code):
         if res.status_code == 200: return res.json()
     except Exception: pass
     return None
+
+@str_lit.cache_data(ttl=3600, show_spinner=False)
+def scarica_europa_league_json():
+    """Carica il calendario pubblico Europa League 2026/27, senza API key.
+    La fonte viene aggiornata generalmente una volta al giorno; non è un feed live.
+    """
+    url = "https://fixturedownload.com/feed/json/europa-league-2026"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; COMBO-Master-Pro/19.9)"}
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        dati = response.json()
+        if not isinstance(dati, list):
+            return [], f"Formato JSON inatteso (HTTP {response.status_code})."
+        normalizzati = []
+        for item in dati:
+            try:
+                data = pd.to_datetime(item.get("DateUtc"), utc=True, errors="coerce")
+                casa = str(item.get("HomeTeam") or "").strip()
+                trasferta = str(item.get("AwayTeam") or "").strip()
+                if pd.isna(data) or not casa or not trasferta:
+                    continue
+                gc = item.get("HomeTeamScore")
+                gt = item.get("AwayTeamScore")
+                # Il feed può usare null o stringhe vuote per partite non disputate.
+                try:
+                    gc = int(gc) if gc is not None and str(gc).strip() != "" else None
+                except (TypeError, ValueError):
+                    gc = None
+                try:
+                    gt = int(gt) if gt is not None and str(gt).strip() != "" else None
+                except (TypeError, ValueError):
+                    gt = None
+                giocata = gc is not None and gt is not None
+                normalizzati.append({
+                    "id": item.get("MatchNumber"),
+                    "Competizione": "Europa League",
+                    "matchday": item.get("RoundNumber") or 0,
+                    "utcDate": data.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "status": "FINISHED" if giocata else "SCHEDULED",
+                    "homeTeam": {"name": casa},
+                    "awayTeam": {"name": trasferta},
+                    "score": {"fullTime": {"home": gc, "away": gt}},
+                })
+            except Exception:
+                continue
+        if not normalizzati:
+            return [], "Il feed è raggiungibile ma non contiene partite riconoscibili."
+        return normalizzati, None
+    except requests.RequestException as exc:
+        return [], f"Errore rete/feed Europa League: {type(exc).__name__}: {exc}"
+    except ValueError as exc:
+        return [], f"Risposta non JSON dal feed Europa League: {exc}"
+
 
 @str_lit.cache_data(ttl=3600)
 def scarica_classifica_club(chiave, league_code):
@@ -639,15 +694,59 @@ def crea_test_v15_walk_forward(df_audit, min_train=100, max_train=300, max_gol=1
 # --- ACQUISIZIONE DATI ---
 statistiche_squadre = {}
 matches_raw = []
+errori_caricamento = []
 
 for c_nome, (codice_lega, tipo_fonte) in selezionati_dict.items():
+    # Europa League: feed pubblico gratuito, non richiede API key.
+    if c_nome == "Europa League":
+        partite_el, errore_el = scarica_europa_league_json()
+        matches_raw.extend(partite_el)
+        if errore_el:
+            errori_caricamento.append(errore_el)
+        # Ricava statistiche di base soltanto dai risultati già conclusi del feed.
+        bilanci = {}
+        for m in partite_el:
+            score = (m.get("score") or {}).get("fullTime") or {}
+            gc, gt = score.get("home"), score.get("away")
+            if m.get("status") != "FINISHED" or gc is None or gt is None:
+                continue
+            for nome in (m["homeTeam"]["name"], m["awayTeam"]["name"]):
+                bilanci.setdefault(nome, {"gf": 0, "gs": 0, "giocate": 0, "punti": 0})
+            casa, trasf = m["homeTeam"]["name"], m["awayTeam"]["name"]
+            bilanci[casa]["gf"] += gc
+            bilanci[casa]["gs"] += gt
+            bilanci[casa]["giocate"] += 1
+            bilanci[trasf]["gf"] += gt
+            bilanci[trasf]["gs"] += gc
+            bilanci[trasf]["giocate"] += 1
+            if gc > gt:
+                bilanci[casa]["punti"] += 3
+            elif gc < gt:
+                bilanci[trasf]["punti"] += 3
+            else:
+                bilanci[casa]["punti"] += 1
+                bilanci[trasf]["punti"] += 1
+        for nome_sq, b in bilanci.items():
+            if b["giocate"]:
+                statistiche_squadre[nome_sq] = {
+                    "media_gf": b["gf"] / b["giocate"],
+                    "media_gs": b["gs"] / b["giocate"],
+                    "punti": b["punti"],
+                    "forma": "N/D",
+                    "Competizione": c_nome,
+                }
+        continue
+
+    # Tutti gli altri campionati mantengono il caricamento football-data.org.
     if api_key:
         dati = scarica_dati_club(api_key, codice_lega)
         dati_classifica = scarica_classifica_club(api_key, codice_lega)
-        if dati and "matches" in dati: 
+        if dati and "matches" in dati:
             for m in dati["matches"]:
                 m["Competizione"] = c_nome
                 matches_raw.append(m)
+        else:
+            errori_caricamento.append(f"{c_nome}: football-data.org non ha restituito il calendario (controlla API key/accesso).")
         if dati_classifica and "standings" in dati_classifica:
             for s in dati_classifica["standings"]:
                 for riga in s.get("table", []):
@@ -660,6 +759,8 @@ for c_nome, (codice_lega, tipo_fonte) in selezionati_dict.items():
                         "forma": "N/D",
                         "Competizione": c_nome
                     }
+    else:
+        errori_caricamento.append(f"{c_nome}: inserisci la API key football-data.org nella barra laterale.")
 
 # --- TAB 1: CALENDARIO & STUDIO ---
 with tab_calendario:
@@ -705,7 +806,14 @@ with tab_calendario:
                 if str_lit.button("📊 Analizza Match", key=f"btn_{idx}"):
                     str_lit.session_state["match_attivo"] = row
     else:
-        str_lit.info("👈 Inserisci la chiave API nella barra laterale o seleziona un campionato valido.")
+        str_lit.warning("Non sono state caricate partite per il torneo selezionato.")
+    if errori_caricamento:
+        for messaggio_errore in errori_caricamento:
+            str_lit.warning(messaggio_errore)
+    if campionato_scelto == "Europa League" and matches_raw:
+        concluse = sum(1 for m in matches_raw if m.get("status") == "FINISHED")
+        future = len(matches_raw) - concluse
+        str_lit.caption(f"Fonte: Fixture Download · {len(matches_raw)} partite caricate · {concluse} con risultato · {future} future/in attesa. Aggiornamento fonte generalmente giornaliero, non live.")
 
     if "match_attivo" in str_lit.session_state:
         m = str_lit.session_state["match_attivo"]
