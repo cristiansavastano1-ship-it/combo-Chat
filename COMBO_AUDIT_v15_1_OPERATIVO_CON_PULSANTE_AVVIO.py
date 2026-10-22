@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V15",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V16",
     layout="wide",
     page_icon="⚽",
 )
@@ -983,12 +983,12 @@ with tab_audit:
         )
     else:
         # V15: pacchetto diagnostico aggiuntivo; nessuna modifica alle previsioni operative.
-        str_lit.markdown("#### 🧪 V15 — Test combinati out-of-sample (solo diagnostica)")
+        str_lit.markdown("#### 🧪 V16 — Test out-of-sample e stabilità No Goal (solo diagnostica)")
         str_lit.caption(
             "In un'unica esecuzione verifica: riconciliazione caricamento/valutazione, correzione walk-forward delle lambda casa/trasferta, "
             "calibrazione separata di X e No Goal. Ogni correzione usa solo partite precedenti della stessa competizione; le previsioni operative restano invariate."
         )
-        with str_lit.spinner("Esecuzione test walk-forward V15; può richiedere qualche secondo..."):
+        with str_lit.spinner("Esecuzione test walk-forward V16; può richiedere qualche secondo..."):
             df_v15_test, df_v15_metriche, df_v15_comp = crea_test_v15_walk_forward(df_audit)
         # Riconciliazione: partite valutate per competizione contro partite caricate dalla fonte gratuita.
         if matches_audit:
@@ -1009,8 +1009,61 @@ with tab_audit:
         if not df_v15_comp.empty:
             str_lit.markdown("##### 3. Risultati diagnostici per competizione")
             str_lit.dataframe(df_v15_comp.round(3), use_container_width=True, hide_index=True)
+
+        # V16: verifica della stabilità della calibrazione No Goal per periodo e competizione.
+        # Confronto paired: raw e WF sono calcolati sulle stesse partite in cui WF è disponibile.
         if not df_v15_test.empty:
-            with str_lit.expander("Dettaglio delle correzioni V15 (solo test, non operative)", expanded=False):
+            colonne_ng_v16 = ["P(NG) raw", "P(NG) calibrata WF", "NG y", "Competizione", "Data"]
+            if all(c in df_v15_test.columns for c in colonne_ng_v16):
+                df_ng_v16 = df_v15_test[colonne_ng_v16].copy()
+                for col in ["P(NG) raw", "P(NG) calibrata WF", "NG y"]:
+                    df_ng_v16[col] = pd.to_numeric(df_ng_v16[col], errors="coerce")
+                df_ng_v16["Data"] = pd.to_datetime(df_ng_v16["Data"], errors="coerce", utc=True)
+                df_ng_v16 = df_ng_v16.dropna(subset=["P(NG) raw", "P(NG) calibrata WF", "NG y", "Competizione", "Data"])
+                df_ng_v16["Anno test"] = df_ng_v16["Data"].dt.year
+
+                def _riepilogo_ng_v16(gruppi, nome_gruppo):
+                    risultati = []
+                    for chiave, gruppo in df_ng_v16.groupby(gruppi, dropna=False):
+                        if not isinstance(chiave, tuple):
+                            chiave = (chiave,)
+                        y = gruppo["NG y"].to_numpy(dtype=float)
+                        raw = gruppo["P(NG) raw"].to_numpy(dtype=float)
+                        wf = gruppo["P(NG) calibrata WF"].to_numpy(dtype=float)
+                        brier_raw, ll_raw = _calcola_metriche_binaria(raw, y)
+                        brier_wf, ll_wf = _calcola_metriche_binaria(wf, y)
+                        r = {nome_gruppo: " / ".join(str(v) for v in chiave), "Partite test WF": int(len(gruppo)),
+                             "Brier NG raw": brier_raw, "Brier NG WF": brier_wf,
+                             "Delta Brier WF - raw": brier_wf - brier_raw,
+                             "LogLoss NG raw": ll_raw, "LogLoss NG WF": ll_wf,
+                             "Delta LogLoss WF - raw": ll_wf - ll_raw}
+                        if len(gruppo) < 100:
+                            r["Affidabilità campione"] = "Basso n (<100)"
+                        else:
+                            r["Affidabilità campione"] = "Almeno 100"
+                        r["Entrambe migliorano"] = "Sì" if (brier_wf < brier_raw and ll_wf < ll_raw) else "No"
+                        risultati.append(r)
+                    return pd.DataFrame(risultati)
+
+                str_lit.markdown("##### 4. V16 — Stabilità No Goal per anno")
+                str_lit.caption("Confronto RAW/WF sulle stesse partite out-of-sample per cui esiste una calibrazione WF. Delta negativo è migliore; gli anni con meno di 100 partite sono indicativi.")
+                df_ng_anno_v16 = _riepilogo_ng_v16(["Anno test"], "Anno")
+                if not df_ng_anno_v16.empty:
+                    str_lit.dataframe(df_ng_anno_v16.round(5), use_container_width=True, hide_index=True)
+                else:
+                    str_lit.info("Non ci sono abbastanza previsioni calibrate WF per il riepilogo annuale No Goal.")
+
+                str_lit.markdown("##### 5. V16 — Stabilità No Goal per competizione")
+                df_ng_comp_v16 = _riepilogo_ng_v16(["Competizione"], "Competizione")
+                if not df_ng_comp_v16.empty:
+                    str_lit.dataframe(df_ng_comp_v16.round(5), use_container_width=True, hide_index=True)
+                else:
+                    str_lit.info("Non ci sono abbastanza previsioni calibrate WF per il riepilogo per competizione.")
+            else:
+                str_lit.warning("Diagnostica V16 No Goal non disponibile: mancano colonne necessarie nel risultato walk-forward.")
+
+        if not df_v15_test.empty:
+            with str_lit.expander("Dettaglio delle correzioni walk-forward (solo test, non operative)", expanded=False):
                 cols_v15 = [c for c in ["Data", "Competizione", "Casa", "Trasferta", "Training usato V15", "Fattore casa WF", "Fattore trasferta WF", "P(X) %", "P(X) calibrata WF", "P(No Goal) %", "P(NG) calibrata WF", "P(NG) lambda corretta WF"] if c in df_v15_test.columns]
                 df_v15_display = df_v15_test[cols_v15].copy()
                 for col_pct in ["P(X) calibrata WF", "P(NG) calibrata WF", "P(1) lambda corretta WF", "P(X) lambda corretta WF", "P(2) lambda corretta WF", "P(NG) lambda corretta WF"]:
@@ -1021,7 +1074,7 @@ with tab_audit:
                 for col_pct in ["P(X) calibrata WF", "P(NG) calibrata WF", "P(1) lambda corretta WF", "P(X) lambda corretta WF", "P(2) lambda corretta WF", "P(NG) lambda corretta WF"]:
                     if col_pct in df_v15_download.columns:
                         df_v15_download[col_pct] = pd.to_numeric(df_v15_download[col_pct], errors="coerce") * 100.0
-                str_lit.download_button("📥 Scarica confronto diagnostico V15 CSV", df_v15_download.to_csv(index=False).encode("utf-8-sig"), "audit_diagnostica_v15_walk_forward.csv", "text/csv")
+                str_lit.download_button("📥 Scarica confronto diagnostico V16 CSV", df_v15_download.to_csv(index=False).encode("utf-8-sig"), "audit_diagnostica_v16_walk_forward.csv", "text/csv")
 
         # V12: confronto con baseline empirica walk-forward; il modello operativo resta invariato.
         str_lit.markdown("#### 🔎 V15 — Audit esteso, campione comune e stabilità temporale")
