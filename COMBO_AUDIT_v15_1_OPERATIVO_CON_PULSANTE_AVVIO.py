@@ -971,7 +971,7 @@ with tab_audit:
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
     )
-    str_lit.markdown("#### 🌍 V19 — Audit storico multi-campionato con dati gratuiti")
+    str_lit.markdown("#### 🌍 V19.3 — Audit storico multi-campionato con dati gratuiti")
     str_lit.caption(
         "L'audit diagnostico carica separatamente fino a tre stagioni per sei campionati da football-data.co.uk. "
         "Non usa la sola competizione selezionata nel menu e non modifica i dati o le previsioni operative. "
@@ -1142,6 +1142,24 @@ with tab_audit:
                         "Affidabilità campione": "Basso n (<100)" if len(g) < 100 else "Almeno 100"
                     })
                 df_v17_confronto = pd.DataFrame(righe_confronto_v17)
+                # V19.3: rendere esplicito che il totale per fasce della sezione globale
+                # deve coincidere con il campione appaiato RAW/WF, senza confonderlo
+                # con il successivo focus Bundesliga che è un sottoinsieme separato.
+                n_globale_appaiato = int(len(df_ng_v17))
+                n_somma_fasce_globali = int(df_v17_confronto["Partite"].sum()) if not df_v17_confronto.empty else 0
+                delta_fasce_globali = n_somma_fasce_globali - n_globale_appaiato
+                str_lit.markdown("###### Riconciliazione del campione globale per fasce")
+                df_ric_fasce_globali = pd.DataFrame([{
+                    "Osservazioni globali RAW/WF appaiate": n_globale_appaiato,
+                    "Somma partite nelle fasce RAW": n_somma_fasce_globali,
+                    "Differenza (somma - globale)": delta_fasce_globali,
+                    "Esito": "PASS" if delta_fasce_globali == 0 else "ATTENZIONE"
+                }])
+                str_lit.dataframe(df_ric_fasce_globali, use_container_width=True, hide_index=True)
+                if delta_fasce_globali != 0:
+                    str_lit.warning("Le fasce RAW globali non riconciliano con il campione appaiato: verificare probabilità mancanti o fuori intervallo.")
+                else:
+                    str_lit.caption("Il totale globale per fasce è riconciliato. Il focus Bundesliga nella sezione 14 usa invece solo le partite della Bundesliga.")
                 if not df_v17_confronto.empty:
                     str_lit.dataframe(df_v17_confronto.round(5), use_container_width=True, hide_index=True)
                     str_lit.download_button("📥 Scarica confronto RAW-WF per fasce V17", df_v17_confronto.to_csv(index=False).encode("utf-8-sig"), "v17_nogoal_confronto_raw_wf_fasce.csv", "text/csv")
@@ -1256,7 +1274,7 @@ with tab_audit:
                     str_lit.info("Non ci sono abbastanza dati con probabilità RAW e WF disponibili per il riepilogo semestrale.")
                 str_lit.info("V18 è esclusivamente diagnostica: non cambia le probabilità operative, le lambda o il ranking delle previsioni.")
 
-                # V19.2: audit esclusioni ottimizzato. Le date vengono convertite una sola volta:
+                # V19.3: audit esclusioni ottimizzato. Le date vengono convertite una sola volta:
                 # la precedente list-comprehension riconvertiva migliaia di date per ogni riga
                 # (complessità O(N^2)), lasciando la sezione apparentemente vuota in Cloud.
                 str_lit.markdown("##### 12. V19 — Audit delle partite non valutate")
@@ -1379,10 +1397,11 @@ with tab_audit:
                     else:
                         str_lit.warning("Colonne data ultimo training non disponibili: eseguire il calcolo aggiornato e verificare il risultato.")
 
-                str_lit.markdown("##### 14. V19 — Focus Bundesliga per fascia RAW")
+                str_lit.markdown("##### 14. V19.3 — Focus Bundesliga per fascia RAW (campione separato)")
                 v19_bg = df_v18_all[df_v18_all["Competizione"].astype(str).str.contains("Bundesliga", case=False, na=False)].copy() if "Competizione" in df_v18_all.columns else pd.DataFrame()
                 if not v19_bg.empty:
                     v19_bg = v19_bg.loc[mask_v18_ng.reindex(v19_bg.index, fill_value=False)].copy()
+                    str_lit.caption(f"Sottoinsieme Bundesliga soltanto: {len(v19_bg):,} partite appaiate RAW/WF. Questo conteggio è distinto dal campione globale No Goal, che comprende tutte le competizioni.")
                     v19_bg["Fascia P(No Goal) RAW"] = pd.cut(v19_bg["P(NG) raw"], bins=[0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1.000001], right=False,
                                                                   labels=["0-10%", "10-20%", "20-30%", "30-40%", "40-50%", "50-60%", "60-70%", "70-80%", "80-90%", "90-100%"])
                     v19_bins = []
@@ -1401,11 +1420,31 @@ with tab_audit:
                                          "Affidabilità campione": "Basso n (<50)" if len(gg)<50 else ("Medio n (50-99)" if len(gg)<100 else "Almeno 100")})
                     df_v19_bins = pd.DataFrame(v19_bins)
                     if not df_v19_bins.empty:
+                        # Riga totale per mostrare la riconciliazione delle fasce Bundesliga.
+                        yy_all = v19_bg["NG y"].to_numpy(dtype=float)
+                        pr_all = v19_bg["P(NG) raw"].to_numpy(dtype=float)
+                        pw_all = v19_bg["P(NG) calibrata WF"].to_numpy(dtype=float)
+                        br_all, lr_all = _calcola_metriche_binaria(pr_all, yy_all)
+                        bw_all, lw_all = _calcola_metriche_binaria(pw_all, yy_all)
+                        totale_bg = pd.DataFrame([{
+                            "Fascia RAW": "TOTALE BUNDESLIGA",
+                            "Partite": int(len(v19_bg)),
+                            "P NG RAW media (%)": 100*float(np.mean(pr_all)),
+                            "No Goal reale (%)": 100*float(np.mean(yy_all)),
+                            "Brier RAW": br_all, "Brier WF": bw_all, "Delta Brier": bw_all-br_all,
+                            "LogLoss RAW": lr_all, "LogLoss WF": lw_all, "Delta LogLoss": lw_all-lr_all,
+                            "Affidabilità campione": "Basso n (<50)" if len(v19_bg)<50 else ("Medio n (50-99)" if len(v19_bg)<100 else "Almeno 100")
+                        }])
+                        df_v19_bins = pd.concat([df_v19_bins, totale_bg], ignore_index=True)
+                        somma_fasce_bg = int(df_v19_bins.loc[df_v19_bins["Fascia RAW"] != "TOTALE BUNDESLIGA", "Partite"].sum())
+                        str_lit.caption(f"Riconciliazione focus Bundesliga: {somma_fasce_bg} partite nelle fasce; {len(v19_bg)} partite nel sottoinsieme globale appaiato.")
+                        if somma_fasce_bg != len(v19_bg):
+                            str_lit.warning("Le fasce Bundesliga non riconciliano: alcune probabilità potrebbero essere fuori fascia o mancanti.")
                         str_lit.dataframe(df_v19_bins.round(5), use_container_width=True, hide_index=True)
-                        str_lit.download_button("📥 Scarica focus Bundesliga V19 CSV", df_v19_bins.to_csv(index=False).encode("utf-8-sig"), "v19_bundesliga_fasce_nogoal.csv", "text/csv")
+                        str_lit.download_button("📥 Scarica focus Bundesliga V19.3 CSV", df_v19_bins.to_csv(index=False).encode("utf-8-sig"), "v19_3_bundesliga_fasce_nogoal.csv", "text/csv")
                 else:
                     str_lit.info("Nessuna riga Bundesliga disponibile per il focus per fascia.")
-                str_lit.info("V19 è esclusivamente diagnostica: non modifica probabilità operative, lambda, classifiche o ranking Combo. I controlli PASS si riferiscono solo alle verifiche effettivamente eseguite.")
+                str_lit.info("V19.3 è esclusivamente diagnostica: non modifica probabilità operative, lambda, classifiche o ranking Combo. Il focus Bundesliga è un sottoinsieme del test globale e i conteggi per fascia non vanno sommati al campione globale delle 2.572 partite.")
             else:
                 str_lit.warning("Diagnostica V16 No Goal non disponibile: mancano colonne necessarie nel risultato walk-forward.")
 
