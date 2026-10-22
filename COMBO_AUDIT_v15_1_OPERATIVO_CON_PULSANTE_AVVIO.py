@@ -960,7 +960,7 @@ with tab_audit:
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
     )
-    str_lit.markdown("#### 🌍 V15 — Audit storico multi-campionato con dati gratuiti")
+    str_lit.markdown("#### 🌍 V18 — Audit storico multi-campionato con dati gratuiti")
     str_lit.caption(
         "L'audit diagnostico carica separatamente fino a tre stagioni per sei campionati da football-data.co.uk. "
         "Non usa la sola competizione selezionata nel menu e non modifica i dati o le previsioni operative. "
@@ -983,10 +983,10 @@ with tab_audit:
         )
     else:
         # V15: pacchetto diagnostico aggiuntivo; nessuna modifica alle previsioni operative.
-        str_lit.markdown("#### 🧪 V17 — Calibrazione No Goal per fasce (solo diagnostica)")
+        str_lit.markdown("#### 🧪 V18 — Riconciliazione conteggi e stabilità temporale (solo diagnostica)")
         str_lit.caption(
-            "In un'unica esecuzione verifica: riconciliazione caricamento/valutazione, correzione walk-forward delle lambda casa/trasferta, "
-            "calibrazione separata di X e No Goal. Ogni correzione usa solo partite precedenti della stessa competizione; le previsioni operative restano invariate."
+            "Mantiene le verifiche V16–V17 e aggiunge una riconciliazione esplicita dei conteggi effettivamente confrontati RAW/WF, "
+            "più metriche No Goal per semestre. Solo diagnostica: le previsioni operative restano invariate."
         )
         with str_lit.spinner("Esecuzione test walk-forward V17; può richiedere qualche secondo..."):
             df_v15_test, df_v15_metriche, df_v15_comp = crea_test_v15_walk_forward(df_audit)
@@ -1137,6 +1137,113 @@ with tab_audit:
                 else:
                     str_lit.info("Nessun dato valido per il confronto RAW vs WF per fascia.")
                 str_lit.info("V17 è esclusivamente diagnostica: nessuna correzione viene applicata alle previsioni operative.")
+
+                # V18: riconciliazione dei conteggi e stabilità temporale.
+                # Tutte le metriche RAW/WF sono calcolate su righe appaiate identiche.
+                str_lit.markdown("##### 9. V18 — Riconciliazione esatta dei conteggi")
+                df_v18_all = df_v15_test.copy()
+                for col in ["P(X) raw", "P(X) calibrata WF", "X y", "P(NG) raw", "P(NG) calibrata WF", "NG y",
+                            "Lambda casa", "Lambda trasferta", "Gol casa reali", "Gol trasferta reali",
+                            "Lambda casa corretta WF", "Lambda trasferta corretta WF"]:
+                    if col in df_v18_all.columns:
+                        df_v18_all[col] = pd.to_numeric(df_v18_all[col], errors="coerce")
+
+                mask_v18_x = df_v18_all[["P(X) raw", "P(X) calibrata WF", "X y"]].notna().all(axis=1)
+                mask_v18_ng = df_v18_all[["P(NG) raw", "P(NG) calibrata WF", "NG y"]].notna().all(axis=1)
+                mask_v18_lambda = df_v18_all[["Lambda casa", "Lambda trasferta", "Gol casa reali", "Gol trasferta reali",
+                                               "Lambda casa corretta WF", "Lambda trasferta corretta WF"]].notna().all(axis=1)
+
+                conteggi_v18 = []
+                if matches_audit:
+                    df_v18_caricate = pd.DataFrame(matches_audit).groupby("Competizione").size().rename("Partite caricate")
+                else:
+                    df_v18_caricate = pd.Series(dtype="int64", name="Partite caricate")
+                df_v18_valutate = df_audit.groupby("Competizione").size().rename("Partite valutate nell'audit")
+                df_v18_test = df_v18_all.groupby("Competizione").agg(
+                    **{"Righe test totali": ("Competizione", "size")}
+                ) if "Competizione" in df_v18_all.columns else pd.DataFrame()
+                for comp in sorted(set(df_v18_all["Competizione"].dropna().unique()) | set(df_audit["Competizione"].dropna().unique()) | set(df_v18_caricate.index)):
+                    z = df_v18_all[df_v18_all["Competizione"] == comp]
+                    za = df_audit[df_audit["Competizione"] == comp]
+                    zng = z.loc[mask_v18_ng[z.index]] if len(z) else z
+                    zx = z.loc[mask_v18_x[z.index]] if len(z) else z
+                    zl = z.loc[mask_v18_lambda[z.index]] if len(z) else z
+                    training_ng = pd.to_numeric(zng.get("Training usato V15", pd.Series(dtype=float)), errors="coerce")
+                    conteggi_v18.append({
+                        "Competizione": comp,
+                        "Partite caricate": int(df_v18_caricate.get(comp, 0)),
+                        "Partite valutate nell'audit": int(len(za)),
+                        "Differenza caricate - audit": int(df_v18_caricate.get(comp, 0) - len(za)),
+                        "Righe test totali": int(len(z)),
+                        "Test X appaiati RAW/WF": int(len(zx)),
+                        "Test No Goal appaiati RAW/WF": int(len(zng)),
+                        "Test lambda appaiati": int(len(zl)),
+                        "Training minimo su test NG": int(training_ng.min()) if not training_ng.empty and training_ng.notna().any() else np.nan,
+                        "Training massimo su test NG": int(training_ng.max()) if not training_ng.empty and training_ng.notna().any() else np.nan,
+                    })
+                df_v18_conteggi = pd.DataFrame(conteggi_v18)
+                if not df_v18_conteggi.empty:
+                    str_lit.dataframe(df_v18_conteggi, use_container_width=True, hide_index=True)
+                    str_lit.download_button("📥 Scarica riconciliazione conteggi V18 CSV", df_v18_conteggi.to_csv(index=False).encode("utf-8-sig"), "v18_nogoal_riconciliazione_conteggi.csv", "text/csv")
+
+                # Recompute the global metrics on the exact same paired rows used by the per-competition table.
+                if int(mask_v18_ng.sum()) > 0:
+                    zng_all = df_v18_all.loc[mask_v18_ng]
+                    y_ng = zng_all["NG y"].to_numpy(dtype=float)
+                    p_ng_raw = zng_all["P(NG) raw"].to_numpy(dtype=float)
+                    p_ng_wf = zng_all["P(NG) calibrata WF"].to_numpy(dtype=float)
+                    brier_ng_raw, ll_ng_raw = _calcola_metriche_binaria(p_ng_raw, y_ng)
+                    brier_ng_wf, ll_ng_wf = _calcola_metriche_binaria(p_ng_wf, y_ng)
+                    n_ng_comp = int(df_v18_conteggi["Test No Goal appaiati RAW/WF"].sum()) if not df_v18_conteggi.empty else 0
+                    df_v18_metriche = pd.DataFrame([{
+                        "Controllo": "No Goal RAW vs WF",
+                        "N righe globali appaiate": int(mask_v18_ng.sum()),
+                        "Somma conteggi per competizione": n_ng_comp,
+                        "Differenza conteggi": n_ng_comp - int(mask_v18_ng.sum()),
+                        "Brier RAW": brier_ng_raw,
+                        "Brier WF": brier_ng_wf,
+                        "Delta Brier WF - RAW": brier_ng_wf - brier_ng_raw,
+                        "LogLoss RAW": ll_ng_raw,
+                        "LogLoss WF": ll_ng_wf,
+                        "Delta LogLoss WF - RAW": ll_ng_wf - ll_ng_raw,
+                        "Conteggi coerenti": "Sì" if n_ng_comp == int(mask_v18_ng.sum()) else "NO — verificare"
+                    }])
+                    str_lit.markdown("##### 10. V18 — Verifica delle metriche aggregate")
+                    str_lit.dataframe(df_v18_metriche.round(6), use_container_width=True, hide_index=True)
+                    str_lit.download_button("📥 Scarica verifica metriche V18 CSV", df_v18_metriche.to_csv(index=False).encode("utf-8-sig"), "v18_nogoal_verifica_metriche.csv", "text/csv")
+
+                # Stabilità temporale per semestre, usando sempre lo stesso campione appaiato.
+                str_lit.markdown("##### 11. V18 — Stabilità No Goal per semestre")
+                df_v18_periodo = df_ng_v16.copy()
+                df_v18_periodo["Data"] = pd.to_datetime(df_v18_periodo["Data"], errors="coerce", utc=True)
+                df_v18_periodo = df_v18_periodo.dropna(subset=["Data", "P(NG) raw", "P(NG) calibrata WF", "NG y"])
+                df_v18_periodo["Periodo"] = df_v18_periodo["Data"].dt.year.astype(str) + "-S" + np.where(df_v18_periodo["Data"].dt.month <= 6, "1", "2")
+                righe_periodo_v18 = []
+                for periodo, g in df_v18_periodo.groupby("Periodo", sort=True):
+                    y = g["NG y"].to_numpy(dtype=float)
+                    raw = g["P(NG) raw"].to_numpy(dtype=float)
+                    wf = g["P(NG) calibrata WF"].to_numpy(dtype=float)
+                    br, lr = _calcola_metriche_binaria(raw, y)
+                    bw, lw = _calcola_metriche_binaria(wf, y)
+                    righe_periodo_v18.append({
+                        "Periodo": periodo,
+                        "Partite appaiate": int(len(g)),
+                        "Brier RAW": br,
+                        "Brier WF": bw,
+                        "Delta Brier WF - RAW": bw - br,
+                        "LogLoss RAW": lr,
+                        "LogLoss WF": lw,
+                        "Delta LogLoss WF - RAW": lw - lr,
+                        "Entrambe migliorano": "Sì" if bw < br and lw < lr else "No",
+                        "Affidabilità campione": "Basso n (<100)" if len(g) < 100 else "Almeno 100"
+                    })
+                df_v18_periodi = pd.DataFrame(righe_periodo_v18)
+                if not df_v18_periodi.empty:
+                    str_lit.dataframe(df_v18_periodi.round(5), use_container_width=True, hide_index=True)
+                    str_lit.download_button("📥 Scarica stabilità semestrale V18 CSV", df_v18_periodi.to_csv(index=False).encode("utf-8-sig"), "v18_nogoal_stabilita_semestrale.csv", "text/csv")
+                else:
+                    str_lit.info("Non ci sono abbastanza dati con probabilità RAW e WF disponibili per il riepilogo semestrale.")
+                str_lit.info("V18 è esclusivamente diagnostica: non cambia le probabilità operative, le lambda o il ranking delle previsioni.")
             else:
                 str_lit.warning("Diagnostica V16 No Goal non disponibile: mancano colonne necessarie nel risultato walk-forward.")
 
