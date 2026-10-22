@@ -1444,7 +1444,57 @@ with tab_audit:
                         str_lit.download_button("📥 Scarica focus Bundesliga V19.3 CSV", df_v19_bins.to_csv(index=False).encode("utf-8-sig"), "v19_3_bundesliga_fasce_nogoal.csv", "text/csv")
                 else:
                     str_lit.info("Nessuna riga Bundesliga disponibile per il focus per fascia.")
-                str_lit.info("V19.3 è esclusivamente diagnostica: non modifica probabilità operative, lambda, classifiche o ranking Combo. Il focus Bundesliga è un sottoinsieme del test globale e i conteggi per fascia non vanno sommati al campione globale delle 2.572 partite.")
+                # V19.4: stabilità temporale del confronto RAW/WF per la sola Bundesliga.
+                # Stesso campione appaiato; solo diagnostica, nessuna modifica al modello operativo.
+                str_lit.markdown("##### 15. V19.4 — Bundesliga: confronto RAW/WF per stagione e periodo")
+                v194_bg = df_v18_all[df_v18_all["Competizione"].astype(str).str.contains("Bundesliga", case=False, na=False)].copy() if "Competizione" in df_v18_all.columns else pd.DataFrame()
+                if not v194_bg.empty:
+                    v194_bg = v194_bg.loc[mask_v18_ng.reindex(v194_bg.index, fill_value=False)].copy()
+                    v194_bg["Data"] = pd.to_datetime(v194_bg["Data"], errors="coerce", utc=True)
+                    v194_bg = v194_bg.dropna(subset=["Data", "P(NG) raw", "P(NG) calibrata WF", "NG y"])
+                    v194_bg["Stagione calcistica"] = np.where(
+                        v194_bg["Data"].dt.month >= 7,
+                        v194_bg["Data"].dt.year.astype(str) + "/" + (v194_bg["Data"].dt.year + 1).astype(str).str[-2:],
+                        (v194_bg["Data"].dt.year - 1).astype(str) + "/" + v194_bg["Data"].dt.year.astype(str).str[-2:]
+                    )
+                    v194_bg["Semestre"] = v194_bg["Data"].dt.year.astype(str) + "-S" + np.where(v194_bg["Data"].dt.month <= 6, "1", "2")
+
+                    def _v194_metriche(gruppo, nome, etichetta):
+                        righe = []
+                        for chiave, gg in gruppo.groupby(nome, dropna=False, sort=True):
+                            yy = gg["NG y"].to_numpy(dtype=float)
+                            raw = gg["P(NG) raw"].to_numpy(dtype=float)
+                            wf = gg["P(NG) calibrata WF"].to_numpy(dtype=float)
+                            br, lr = _calcola_metriche_binaria(raw, yy)
+                            bw, lw = _calcola_metriche_binaria(wf, yy)
+                            n = len(gg)
+                            righe.append({
+                                etichetta: str(chiave), "Partite appaiate": int(n),
+                                "No Goal reali (%)": 100 * float(np.mean(yy)),
+                                "P NG RAW media (%)": 100 * float(np.mean(raw)),
+                                "P NG WF media (%)": 100 * float(np.mean(wf)),
+                                "Brier RAW": br, "Brier WF": bw, "Delta Brier WF - RAW": bw - br,
+                                "LogLoss RAW": lr, "LogLoss WF": lw, "Delta LogLoss WF - RAW": lw - lr,
+                                "Entrambe migliorano": "Sì" if bw < br and lw < lr else "No",
+                                "Affidabilità campione": "Molto basso n (<30)" if n < 30 else ("Basso n (30-99)" if n < 100 else "Almeno 100")
+                            })
+                        return pd.DataFrame(righe)
+
+                    df_v194_stagioni = _v194_metriche(v194_bg, "Stagione calcistica", "Stagione calcistica")
+                    df_v194_sem = _v194_metriche(v194_bg, "Semestre", "Semestre")
+                    str_lit.caption("Le stagioni sono ricostruite dalla data partita (luglio–giugno); i semestri sono gennaio–giugno e luglio–dicembre. Delta negativo indica una metrica migliore con WF. I gruppi piccoli sono indicativi.")
+                    if not df_v194_stagioni.empty:
+                        str_lit.markdown("###### Bundesliga per stagione calcistica")
+                        str_lit.dataframe(df_v194_stagioni.round(5), use_container_width=True, hide_index=True)
+                        str_lit.download_button("📥 Scarica Bundesliga per stagione V19.4 CSV", df_v194_stagioni.to_csv(index=False).encode("utf-8-sig"), "v19_4_bundesliga_per_stagione.csv", "text/csv")
+                    if not df_v194_sem.empty:
+                        str_lit.markdown("###### Bundesliga per semestre")
+                        str_lit.dataframe(df_v194_sem.round(5), use_container_width=True, hide_index=True)
+                        str_lit.download_button("📥 Scarica Bundesliga per semestre V19.4 CSV", df_v194_sem.to_csv(index=False).encode("utf-8-sig"), "v19_4_bundesliga_per_semestre.csv", "text/csv")
+                    str_lit.success(f"Riconciliazione V19.4: {len(v194_bg)} partite Bundesliga appaiate, suddivise per stagione e semestre senza cambiare il campione RAW/WF.")
+                else:
+                    str_lit.info("Nessuna partita Bundesliga appaiata RAW/WF disponibile per l'analisi temporale.")
+                str_lit.info("V19.4 è esclusivamente diagnostica: non modifica probabilità operative, lambda, classifiche o ranking Combo.")
             else:
                 str_lit.warning("Diagnostica V16 No Goal non disponibile: mancano colonne necessarie nel risultato walk-forward.")
 
