@@ -457,7 +457,9 @@ def crea_test_v15_walk_forward(df_audit, min_train=100, max_train=300, max_gol=1
     d['P(2) lambda corretta WF'] = np.nan
     d['P(NG) lambda corretta WF'] = np.nan
     d['Training usato V15'] = 0
-    d['Data ultimo training V15'] = pd.NaT
+    # Colonna UTC-aware: _data_dt è creato con utc=True e l'assegnazione
+    # di Timestamp timezone-aware a una colonna datetime-naive causava TypeError.
+    d['Data ultimo training V15'] = pd.Series(pd.NaT, index=d.index, dtype='datetime64[ns, UTC]')
     d['Controllo causalità training V15'] = np.nan
     d['Fattore casa WF'] = np.nan
     d['Fattore trasferta WF'] = np.nan
