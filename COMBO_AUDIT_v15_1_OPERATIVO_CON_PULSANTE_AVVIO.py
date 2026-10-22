@@ -457,6 +457,8 @@ def crea_test_v15_walk_forward(df_audit, min_train=100, max_train=300, max_gol=1
     d['P(2) lambda corretta WF'] = np.nan
     d['P(NG) lambda corretta WF'] = np.nan
     d['Training usato V15'] = 0
+    d['Data ultimo training V15'] = pd.NaT
+    d['Controllo causalità training V15'] = np.nan
     d['Fattore casa WF'] = np.nan
     d['Fattore trasferta WF'] = np.nan
 
@@ -470,6 +472,13 @@ def crea_test_v15_walk_forward(df_audit, min_train=100, max_train=300, max_gol=1
             prior_idxs = [j for j in prior_idxs if d.at[j, '_data_dt'].date() < target_date.date()]
             train = d.loc[prior_idxs].tail(max_train)
             if len(train) >= min_train:
+                d.at[idx, 'Training usato V15'] = int(len(train))
+                ultima_data_train = train['_data_dt'].max()
+                d.at[idx, 'Data ultimo training V15'] = ultima_data_train
+                d.at[idx, 'Controllo causalità training V15'] = int(
+                    pd.notna(target_date) and pd.notna(ultima_data_train)
+                    and ultima_data_train.date() < target_date.date()
+                )
                 # Calibrazione binaria X e No Goal, fit solo su precedenti della stessa competizione.
                 bx = _fit_platt_prior(train['P(X) raw'], train['X y'], min_train, max_train)
                 bng = _fit_platt_prior(train['P(NG) raw'], train['NG y'], min_train, max_train)
@@ -960,7 +969,7 @@ with tab_audit:
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
     )
-    str_lit.markdown("#### 🌍 V18 — Audit storico multi-campionato con dati gratuiti")
+    str_lit.markdown("#### 🌍 V19 — Audit storico multi-campionato con dati gratuiti")
     str_lit.caption(
         "L'audit diagnostico carica separatamente fino a tre stagioni per sei campionati da football-data.co.uk. "
         "Non usa la sola competizione selezionata nel menu e non modifica i dati o le previsioni operative. "
@@ -1244,6 +1253,125 @@ with tab_audit:
                 else:
                     str_lit.info("Non ci sono abbastanza dati con probabilità RAW e WF disponibili per il riepilogo semestrale.")
                 str_lit.info("V18 è esclusivamente diagnostica: non cambia le probabilità operative, le lambda o il ranking delle previsioni.")
+
+                # V19: audit delle esclusioni, causalità del training e focus Bundesliga.
+                str_lit.markdown("##### 12. V19 — Audit delle partite non valutate")
+                def _v19_key(comp, date_value, home, away):
+                    date_norm = pd.to_datetime(date_value, errors="coerce", utc=True)
+                    if pd.isna(date_norm):
+                        return (str(comp).strip().casefold(), "", str(home).strip().casefold(), str(away).strip().casefold())
+                    return (str(comp).strip().casefold(), date_norm.strftime("%Y-%m-%d"), str(home).strip().casefold(), str(away).strip().casefold())
+
+                v19_eval_keys = set()
+                if not df_audit.empty:
+                    for _, rr in df_audit.iterrows():
+                        v19_eval_keys.add(_v19_key(rr.get("Competizione"), rr.get("Data"), rr.get("Casa"), rr.get("Trasferta")))
+                v19_loaded_rows = []
+                v19_prior_by_comp = {}
+                for mm in sorted(matches_audit or [], key=lambda q: str(q.get("utcDate", ""))):
+                    comp = mm.get("Competizione", "Torneo")
+                    score = (mm.get("score") or {}).get("fullTime") or {}
+                    home = (mm.get("homeTeam") or {}).get("name", "Casa")
+                    away = (mm.get("awayTeam") or {}).get("name", "Trasferta")
+                    date_value = mm.get("utcDate")
+                    key = _v19_key(comp, date_value, home, away)
+                    date_norm = pd.to_datetime(date_value, errors="coerce", utc=True)
+                    if pd.isna(date_norm) or score.get("home") is None or score.get("away") is None:
+                        reason = "Dati data/risultato mancanti o non validi"
+                        n_prior = np.nan
+                    else:
+                        prior_matches = [x for x in (matches_audit or [])
+                                         if str(x.get("Competizione", "Torneo")) == str(comp)
+                                         and pd.notna(pd.to_datetime(x.get("utcDate"), errors="coerce", utc=True))
+                                         and pd.to_datetime(x.get("utcDate"), errors="coerce", utc=True).date() < date_norm.date()
+                                         and ((x.get("score") or {}).get("fullTime") or {}).get("home") is not None
+                                         and ((x.get("score") or {}).get("fullTime") or {}).get("away") is not None]
+                        n_prior = len(prior_matches)
+                        if key in v19_eval_keys:
+                            continue
+                        if n_prior < 30:
+                            reason = "Storico pre-partita insufficiente (<30)"
+                        else:
+                            reason = "Non riconciliata con audit: verificare data/nomi/competizione"
+                    if key not in v19_eval_keys:
+                        v19_loaded_rows.append({
+                            "Competizione": comp,
+                            "Data": date_norm.strftime("%Y-%m-%d") if pd.notna(date_norm) else str(date_value),
+                            "Casa": home, "Trasferta": away,
+                            "Gol casa": score.get("home"), "Gol trasferta": score.get("away"),
+                            "Storico precedente stessa competizione": n_prior,
+                            "Motivo esclusione diagnosticato": reason,
+                        })
+                df_v19_escluse = pd.DataFrame(v19_loaded_rows)
+                if not df_v19_escluse.empty:
+                    df_v19_escluse_summary = df_v19_escluse.groupby(["Competizione", "Motivo esclusione diagnosticato"], dropna=False).size().reset_index(name="Partite escluse")
+                    str_lit.dataframe(df_v19_escluse_summary, use_container_width=True, hide_index=True)
+                    str_lit.download_button("📥 Scarica riepilogo esclusioni V19 CSV", df_v19_escluse_summary.to_csv(index=False).encode("utf-8-sig"), "v19_riepilogo_esclusioni.csv", "text/csv")
+                    with str_lit.expander("Dettaglio delle partite non valutate", expanded=False):
+                        str_lit.dataframe(df_v19_escluse, use_container_width=True, hide_index=True)
+                        str_lit.download_button("📥 Scarica dettaglio esclusioni V19 CSV", df_v19_escluse.to_csv(index=False).encode("utf-8-sig"), "v19_dettaglio_esclusioni.csv", "text/csv")
+                else:
+                    str_lit.success("Tutte le partite caricate risultano riconciliate con l'audit.")
+
+                str_lit.markdown("##### 13. V19 — Verifica causale del training WF")
+                if not df_v15_test.empty and "Training usato V15" in df_v15_test.columns:
+                    v19_train = df_v15_test.copy()
+                    v19_train["Training usato V15"] = pd.to_numeric(v19_train["Training usato V15"], errors="coerce")
+                    v19_valid_train = v19_train[v19_train["P(NG) calibrata WF"].notna()].copy()
+                    if "Data ultimo training V15" in v19_valid_train.columns:
+                        v19_train["Data ultimo training V15"] = pd.to_datetime(v19_train["Data ultimo training V15"], errors="coerce", utc=True)
+                        v19_train["_target_dt"] = pd.to_datetime(v19_train["Data"], errors="coerce", utc=True)
+                        v19_train_rows = v19_train[v19_train["P(NG) calibrata WF"].notna()].copy()
+                        v19_train_rows["Data ultimo training V15"] = pd.to_datetime(v19_train_rows["Data ultimo training V15"], errors="coerce", utc=True)
+                        v19_train_rows["_target_dt"] = pd.to_datetime(v19_train_rows["Data"], errors="coerce", utc=True)
+                        v19_train_rows["Training strettamente precedente"] = (
+                            v19_train_rows["Data ultimo training V15"].notna() & v19_train_rows["_target_dt"].notna()
+                            & (v19_train_rows["Data ultimo training V15"].dt.date < v19_train_rows["_target_dt"].dt.date)
+                        )
+                        causal_ok = int(v19_train_rows["Training strettamente precedente"].sum())
+                        causal_bad = int((~v19_train_rows["Training strettamente precedente"]).sum())
+                        v19_train_summary = pd.DataFrame([{
+                            "Test No Goal con calibrazione WF": int(len(v19_train_rows)),
+                            "Training minimo osservato": int(v19_train_rows["Training usato V15"].min()) if not v19_train_rows.empty else np.nan,
+                            "Training massimo osservato": int(v19_train_rows["Training usato V15"].max()) if not v19_train_rows.empty else np.nan,
+                            "Ultimo training strettamente precedente": causal_ok,
+                            "Casi non verificati/non causali": causal_bad,
+                            "Esito controllo": "PASS" if causal_bad == 0 and not v19_train_rows.empty else "ATTENZIONE",
+                        }])
+                        str_lit.dataframe(v19_train_summary, use_container_width=True, hide_index=True)
+                        str_lit.download_button("📥 Scarica controllo training V19 CSV", v19_train_summary.to_csv(index=False).encode("utf-8-sig"), "v19_controllo_training.csv", "text/csv")
+                        if causal_bad:
+                            str_lit.warning("Alcune righe non hanno una data training strettamente precedente verificabile; controllare il dettaglio prima di dichiarare PASS.")
+                    else:
+                        str_lit.warning("Colonne data ultimo training non disponibili: eseguire il calcolo aggiornato e verificare il risultato.")
+
+                str_lit.markdown("##### 14. V19 — Focus Bundesliga per fascia RAW")
+                v19_bg = df_v18_all[df_v18_all["Competizione"].astype(str).str.contains("Bundesliga", case=False, na=False)].copy() if "Competizione" in df_v18_all.columns else pd.DataFrame()
+                if not v19_bg.empty:
+                    v19_bg = v19_bg.loc[mask_v18_ng.reindex(v19_bg.index, fill_value=False)].copy()
+                    v19_bg["Fascia P(No Goal) RAW"] = pd.cut(v19_bg["P(NG) raw"], bins=[0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1.000001], right=False,
+                                                                  labels=["0-10%", "10-20%", "20-30%", "30-40%", "40-50%", "50-60%", "60-70%", "70-80%", "80-90%", "90-100%"])
+                    v19_bins = []
+                    for fascia, gg in v19_bg.groupby("Fascia P(No Goal) RAW", observed=False, dropna=False):
+                        if gg.empty:
+                            continue
+                        yy = gg["NG y"].to_numpy(dtype=float)
+                        pr = gg["P(NG) raw"].to_numpy(dtype=float)
+                        pw = gg["P(NG) calibrata WF"].to_numpy(dtype=float)
+                        br, lr = _calcola_metriche_binaria(pr, yy)
+                        bw, lw = _calcola_metriche_binaria(pw, yy)
+                        v19_bins.append({"Fascia RAW": str(fascia), "Partite": int(len(gg)),
+                                         "P NG RAW media (%)": 100*float(np.mean(pr)), "No Goal reale (%)": 100*float(np.mean(yy)),
+                                         "Brier RAW": br, "Brier WF": bw, "Delta Brier": bw-br,
+                                         "LogLoss RAW": lr, "LogLoss WF": lw, "Delta LogLoss": lw-lr,
+                                         "Affidabilità campione": "Basso n (<50)" if len(gg)<50 else ("Medio n (50-99)" if len(gg)<100 else "Almeno 100")})
+                    df_v19_bins = pd.DataFrame(v19_bins)
+                    if not df_v19_bins.empty:
+                        str_lit.dataframe(df_v19_bins.round(5), use_container_width=True, hide_index=True)
+                        str_lit.download_button("📥 Scarica focus Bundesliga V19 CSV", df_v19_bins.to_csv(index=False).encode("utf-8-sig"), "v19_bundesliga_fasce_nogoal.csv", "text/csv")
+                else:
+                    str_lit.info("Nessuna riga Bundesliga disponibile per il focus per fascia.")
+                str_lit.info("V19 è esclusivamente diagnostica: non modifica probabilità operative, lambda, classifiche o ranking Combo. I controlli PASS si riferiscono solo alle verifiche effettivamente eseguite.")
             else:
                 str_lit.warning("Diagnostica V16 No Goal non disponibile: mancano colonne necessarie nel risultato walk-forward.")
 
