@@ -12,7 +12,7 @@ str_lit.set_page_config(
     page_title="COMBO Master Pro AI — Diagnostica V19.9 Europa League Fix",
     layout="wide",
     page_icon="⚽",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # --- DESIGN MODERNO AVANZATO (CUSTOM CSS & GLASSMORPHISM) ---
@@ -155,11 +155,18 @@ str_lit.markdown("### 🏆 Seleziona Campionato (Mobile & Desktop)")
 campionato_scelto = str_lit.selectbox("Scegli il torneo da analizzare", list(LEAGUES.keys()), label_visibility="collapsed")
 selezionati_dict = {campionato_scelto: LEAGUES[campionato_scelto]}
 
-str_lit.sidebar.markdown("### ⚙ Configurazione API")
-str_lit.sidebar.caption("La API key è richiesta per i campionati football-data.org; l’Europa League usa un feed pubblico gratuito senza chiave.")
-api_key = str_lit.sidebar.text_input("🔑 API Key (football-data.org)", value="", type="password")
-str_lit.sidebar.markdown("---")
-str_lit.sidebar.info("💡 Suggerimento: Da cellulare puoi cambiare campionato direttamente dal menu a tendina in alto nella pagina principale.")
+# Configurazione chiavi ben visibile anche su Safari/iOS.
+# La chiave viene inserita nella pagina principale, così non è nascosta nella sidebar mobile.
+with str_lit.expander("🔑 CONFIGURAZIONE API — inserisci qui la tua chiave", expanded=True):
+    api_key = str_lit.text_input(
+        "API key football-data.org",
+        value="",
+        type="password",
+        key="football_data_api_key_main",
+        help="Serve per i campionati caricati tramite football-data.org. Non serve per il feed pubblico dell'Europa League né per football-data.co.uk.",
+        placeholder="Incolla qui la tua API key"
+    )
+    str_lit.caption("🔒 La chiave viene usata per le richieste API durante la sessione. football-data.co.uk non richiede una chiave API.")
 
 tab_calendario, tab_classifica, tab_value, tab_grafici, tab_ai_schedine, tab_value_finder, tab_monte_carlo, tab_audit = str_lit.tabs([
     "📅 Calendario",
