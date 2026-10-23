@@ -12,6 +12,7 @@ str_lit.set_page_config(
     page_title="COMBO Master Pro AI — Diagnostica V19.9 Europa League Fix",
     layout="wide",
     page_icon="⚽",
+    initial_sidebar_state="collapsed",
 )
 
 # --- DESIGN MODERNO AVANZATO (CUSTOM CSS & GLASSMORPHISM) ---
@@ -70,6 +71,57 @@ str_lit.markdown(
     [data-testid="stMetricValue"] {
         color: #38bdf8 !important;
         font-weight: 700 !important;
+    }
+
+    /* Adattamento responsive per Safari su iPhone/iPad */
+    @media (max-width: 768px) {
+        .block-container {
+            padding: 0.75rem 0.75rem 2rem 0.75rem !important;
+            max-width: 100% !important;
+        }
+        h1 { font-size: 1.45rem !important; line-height: 1.25 !important; }
+        h2 { font-size: 1.25rem !important; }
+        h3 { font-size: 1.08rem !important; }
+        p, label, .stMarkdown, .stCaption { overflow-wrap: anywhere; }
+        [data-testid="stMetric"] {
+            padding: 0.65rem !important;
+            min-width: 0 !important;
+        }
+        [data-testid="stMetricValue"] { font-size: 1.25rem !important; }
+        [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+            gap: 0.55rem !important;
+        }
+        [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+            min-width: min(100%, 145px) !important;
+            flex: 1 1 145px !important;
+        }
+        [data-testid="stTabs"] [role="tablist"] {
+            gap: 0.25rem !important;
+            overflow-x: auto !important;
+            flex-wrap: nowrap !important;
+            -webkit-overflow-scrolling: touch;
+        }
+        [data-testid="stTabs"] button[role="tab"] {
+            flex: 0 0 auto !important;
+            white-space: nowrap !important;
+            padding: 0.45rem 0.65rem !important;
+            font-size: 0.82rem !important;
+        }
+        [data-testid="stDataFrame"], [data-testid="stTable"] {
+            max-width: 100% !important;
+            overflow-x: auto !important;
+        }
+        .stButton > button, .stDownloadButton > button {
+            width: 100% !important;
+            min-height: 2.7rem;
+            white-space: normal !important;
+        }
+        input, textarea, select { font-size: 16px !important; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { transition: none !important; }
     }
     </style>
     """,
