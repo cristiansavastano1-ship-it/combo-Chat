@@ -1003,11 +1003,12 @@ with tab_monte_carlo:
 # --- TAB 8: AUDIT ---
 with tab_audit:
     str_lit.subheader("🛡️ Audit statistico: Pareggio X e Goal / No Goal")
+    str_lit.info("Versione diagnostica V19.7.3: riconciliazione partite non valutate e audit score esatto. Modello operativo invariato.")
     str_lit.caption(
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
     )
-    str_lit.markdown("#### 🌍 V19.3 — Audit storico multi-campionato con dati gratuiti")
+    str_lit.markdown("#### 🌍 V19.7.3 — Audit storico multi-campionato con dati gratuiti")
     str_lit.caption(
         "L'audit diagnostico carica separatamente fino a tre stagioni per sei campionati da football-data.co.uk. "
         "Non usa la sola competizione selezionata nel menu e non modifica i dati o le previsioni operative. "
@@ -1475,7 +1476,12 @@ with tab_audit:
                 # V19.3: audit esclusioni ottimizzato. Le date vengono convertite una sola volta:
                 # la precedente list-comprehension riconvertiva migliaia di date per ogni riga
                 # (complessità O(N^2)), lasciando la sezione apparentemente vuota in Cloud.
-                str_lit.markdown("##### 12. V19 — Audit delle partite non valutate")
+                str_lit.markdown("##### 12. V19.7.3 — Audit delle partite non valutate")
+                str_lit.caption(
+                    "Spiega ogni differenza tra partite storiche caricate e partite valutate. "
+                    "Il walk-forward richiede almeno 30 risultati precedenti della stessa competizione "
+                    "e non usa partite della stessa data come storico precedente. Solo diagnostica."
+                )
                 from bisect import bisect_left
 
                 def _v19_key(comp, date_value, home, away):
@@ -1534,7 +1540,7 @@ with tab_audit:
                     else:
                         n_prior = bisect_left(v19_dates_by_comp.get(str(comp), []), date_norm.date())
                         if n_prior < 30:
-                            reason = "Storico pre-partita insufficiente (<30)"
+                            reason = "Storico pre-partita insufficiente (<30; stessa data esclusa)"
                         else:
                             reason = "Non riconciliata con audit: verificare data/nomi/competizione"
                     v19_loaded_rows.append({
@@ -1549,19 +1555,38 @@ with tab_audit:
 
                 df_v19_escluse = pd.DataFrame(v19_loaded_rows)
                 # Riepilogo di stato sempre visibile, anche quando non ci sono esclusioni.
-                k_v19a, k_v19b, k_v19c = str_lit.columns(3)
-                k_v19a.metric("Partite caricate", f"{len(v19_prepared):,}".replace(",", "."))
+                n_v19_caricate = len(v19_prepared)
+                n_v19_non_valutate = len(df_v19_escluse)
+                n_v19_storico_insuff = int(df_v19_escluse["Motivo esclusione diagnosticato"].eq("Storico pre-partita insufficiente (<30; stessa data esclusa)").sum()) if not df_v19_escluse.empty else 0
+                n_v19_dati_invalidi = int(df_v19_escluse["Motivo esclusione diagnosticato"].eq("Dati data/risultato mancanti o non validi").sum()) if not df_v19_escluse.empty else 0
+                n_v19_non_riconciliate = int(df_v19_escluse["Motivo esclusione diagnosticato"].str.startswith("Non riconciliata", na=False).sum()) if not df_v19_escluse.empty else 0
+                n_v19_somma = v19_reconciled + n_v19_non_valutate
+                k_v19a, k_v19b, k_v19c, k_v19d = str_lit.columns(4)
+                k_v19a.metric("Partite caricate", f"{n_v19_caricate:,}".replace(",", "."))
                 k_v19b.metric("Riconciliate con audit", f"{v19_reconciled:,}".replace(",", "."))
-                k_v19c.metric("Non valutate", f"{len(df_v19_escluse):,}".replace(",", "."))
+                k_v19c.metric("Non valutate", f"{n_v19_non_valutate:,}".replace(",", "."))
+                k_v19d.metric("Controllo totale", "PASS" if n_v19_somma == n_v19_caricate else f"DIFF. {n_v19_somma - n_v19_caricate:+d}")
+                df_v19_cause = pd.DataFrame([
+                    {"Causa": "Storico pre-partita insufficiente (<30; stessa data esclusa)", "Partite": n_v19_storico_insuff},
+                    {"Causa": "Dati data/risultato mancanti o non validi", "Partite": n_v19_dati_invalidi},
+                    {"Causa": "Non riconciliate: verificare data/nomi/competizione", "Partite": n_v19_non_riconciliate},
+                ])
+                str_lit.markdown("**Riepilogo globale delle cause di esclusione**")
+                str_lit.dataframe(df_v19_cause, use_container_width=True, hide_index=True)
                 if not df_v19_escluse.empty:
                     df_v19_escluse_summary = df_v19_escluse.groupby(["Competizione", "Motivo esclusione diagnosticato"], dropna=False).size().reset_index(name="Partite escluse")
+                    str_lit.markdown("**Cause di esclusione per competizione**")
                     str_lit.dataframe(df_v19_escluse_summary, use_container_width=True, hide_index=True)
-                    str_lit.download_button("📥 Scarica riepilogo esclusioni V19 CSV", df_v19_escluse_summary.to_csv(index=False).encode("utf-8-sig"), "v19_riepilogo_esclusioni.csv", "text/csv")
-                    with str_lit.expander("Dettaglio delle partite non valutate", expanded=False):
+                    str_lit.download_button("📥 Scarica riepilogo esclusioni V19.7.3 CSV", df_v19_escluse_summary.to_csv(index=False).encode("utf-8-sig"), "v1973_riepilogo_esclusioni.csv", "text/csv")
+                    with str_lit.expander("Dettaglio delle partite non valutate", expanded=True):
                         str_lit.dataframe(df_v19_escluse, use_container_width=True, hide_index=True)
-                        str_lit.download_button("📥 Scarica dettaglio esclusioni V19 CSV", df_v19_escluse.to_csv(index=False).encode("utf-8-sig"), "v19_dettaglio_esclusioni.csv", "text/csv")
+                        str_lit.download_button("📥 Scarica dettaglio esclusioni V19.7.3 CSV", df_v19_escluse.to_csv(index=False).encode("utf-8-sig"), "v1973_dettaglio_esclusioni.csv", "text/csv")
                 else:
-                    str_lit.success("Nessuna partita caricata risulta esclusa dall'audit; controllare i conteggi di caricamento sopra se il divario atteso era diverso.")
+                    str_lit.success("Nessuna partita caricata risulta esclusa dall'audit.")
+                if n_v19_somma == n_v19_caricate and n_v19_non_riconciliate == 0 and n_v19_dati_invalidi == 0:
+                    str_lit.success("Riconciliazione completa: tutte le partite caricate sono o valutate o escluse per storico precedente insufficiente.")
+                elif n_v19_somma != n_v19_caricate or n_v19_non_riconciliate > 0 or n_v19_dati_invalidi > 0:
+                    str_lit.warning("Riconciliazione da approfondire: sono presenti differenze o cause diverse dallo storico insufficiente.")
 
                 str_lit.markdown("##### 13. V19 — Verifica causale del training WF")
                 if not df_v15_test.empty and "Training usato V15" in df_v15_test.columns:
@@ -1901,14 +1926,64 @@ with tab_audit:
             "Il punteggio esatto top è il singolo risultato con probabilità maggiore nella matrice 0–10. "
             "Non è una previsione aggiuntiva né una modifica al segno 1X2."
         )
-        score_top_rate = 100 * df_audit["Punteggio esatto top è pareggio"].mean()
-        score_top_draw_real = df_audit.loc[df_audit["Punteggio esatto top è pareggio"].eq(1), "Esito reale"].eq("X").mean() * 100 if df_audit["Punteggio esatto top è pareggio"].eq(1).any() else 0.0
-        z1, z2 = str_lit.columns(2)
-        z1.metric("Punteggio esatto top in parità", f"{score_top_rate:.1f}%", "quota partite con score top X-X")
-        z2.metric("Pareggi reali quando score top è X-X", f"{score_top_draw_real:.1f}%", "descrittivo; campione potenzialmente piccolo")
-        cols_score = ["Data", "Casa", "Trasferta", "P(1) %", "P(X) %", "P(2) %", "Scarto P(X) - migliore vittoria (pp)", "Segno previsto", "Risultato esatto più probabile", "Probabilità risultato esatto top (%)", "Esito reale"]
-        with str_lit.expander("Dettaglio diagnostico X e punteggio esatto"):
-            str_lit.dataframe(df_audit[cols_score].sort_values("Scarto P(X) - migliore vittoria (pp)", ascending=False).round(3), use_container_width=True, hide_index=True)
+        df_score_audit = df_audit.copy()
+        df_score_audit["Risultato esatto reale"] = (
+            pd.to_numeric(df_score_audit["Gol casa reali"], errors="coerce").astype("Int64").astype(str)
+            + "-" + pd.to_numeric(df_score_audit["Gol trasferta reali"], errors="coerce").astype("Int64").astype(str)
+        )
+        df_score_audit["Score top corretto"] = (
+            df_score_audit["Risultato esatto più probabile"].astype(str)
+            == df_score_audit["Risultato esatto reale"].astype(str)
+        )
+        n_score = int(df_score_audit["Score top corretto"].notna().sum())
+        score_hit_rate = 100 * df_score_audit["Score top corretto"].mean() if n_score else 0.0
+        score_top_prob_mean = pd.to_numeric(df_score_audit["Probabilità risultato esatto top (%)"], errors="coerce").mean()
+        score_top_rate = 100 * df_score_audit["Punteggio esatto top è pareggio"].mean()
+        mask_top_draw = df_score_audit["Punteggio esatto top è pareggio"].eq(1)
+        score_top_draw_n = int(mask_top_draw.sum())
+        score_top_draw_real = df_score_audit.loc[mask_top_draw, "Esito reale"].eq("X").mean() * 100 if score_top_draw_n else 0.0
+        z1, z2, z3, z4 = str_lit.columns(4)
+        z1.metric("Partite nel controllo score", f"{n_score:,}".replace(",", "."))
+        z2.metric("Score esatto top indovinato", f"{score_hit_rate:.2f}%")
+        z3.metric("Probabilità media score top", f"{score_top_prob_mean:.2f}%" if pd.notna(score_top_prob_mean) else "N/D")
+        z4.metric("Score top in parità", f"{score_top_rate:.1f}%")
+        str_lit.caption(
+            f"Tra le {score_top_draw_n:,} partite in cui lo score top era X-X, "
+            f"i pareggi reali sono stati il {score_top_draw_real:.1f}%. "
+            "Dato descrittivo: non modifica il segno 1X2 né il modello operativo."
+        )
+
+        str_lit.markdown("##### Distribuzione degli score top e riscontro reale")
+        df_score_dist = df_score_audit.groupby("Risultato esatto più probabile", dropna=False).agg(
+            Partite=("Risultato esatto più probabile", "size"),
+            **{
+                "Probabilità media score top (%)": ("Probabilità risultato esatto top (%)", "mean"),
+                "Score esatto corretto (n)": ("Score top corretto", "sum"),
+                "Tasso corretto (%)": ("Score top corretto", lambda x: 100 * x.mean()),
+            },
+        ).reset_index().sort_values(["Partite", "Risultato esatto più probabile"], ascending=[False, True])
+        str_lit.dataframe(df_score_dist.round(2), use_container_width=True, hide_index=True)
+        str_lit.download_button("📥 Scarica audit score esatto per score top CSV", df_score_dist.to_csv(index=False).encode("utf-8-sig"), "v1973_audit_score_esatto_per_score.csv", "text/csv")
+
+        str_lit.markdown("##### Risultato esatto top: confronto per competizione")
+        score_comp_rows = []
+        for comp_score, gg in df_score_audit.groupby("Competizione", dropna=False):
+            score_comp_rows.append({
+                "Competizione": comp_score,
+                "Partite": int(len(gg)),
+                "Score top corretto (%)": 100 * gg["Score top corretto"].mean(),
+                "Probabilità media score top (%)": pd.to_numeric(gg["Probabilità risultato esatto top (%)"], errors="coerce").mean(),
+                "Score top in parità (%)": 100 * gg["Punteggio esatto top è pareggio"].mean(),
+                "Pareggio reale quando score top X-X (%)": 100 * gg.loc[gg["Punteggio esatto top è pareggio"].eq(1), "Esito reale"].eq("X").mean() if gg["Punteggio esatto top è pareggio"].eq(1).any() else np.nan,
+            })
+        df_score_comp = pd.DataFrame(score_comp_rows).sort_values("Competizione")
+        str_lit.dataframe(df_score_comp.round(2), use_container_width=True, hide_index=True)
+        str_lit.download_button("📥 Scarica audit score esatto per competizione CSV", df_score_comp.to_csv(index=False).encode("utf-8-sig"), "v1973_audit_score_esatto_per_competizione.csv", "text/csv")
+
+        cols_score = ["Data", "Competizione", "Casa", "Trasferta", "P(1) %", "P(X) %", "P(2) %", "Scarto P(X) - migliore vittoria (pp)", "Segno previsto", "Risultato esatto più probabile", "Probabilità risultato esatto top (%)", "Risultato esatto reale", "Score top corretto", "Esito reale"]
+        with str_lit.expander("Dettaglio diagnostico X e punteggio esatto", expanded=False):
+            str_lit.dataframe(df_score_audit[cols_score].sort_values("Scarto P(X) - migliore vittoria (pp)", ascending=False).round(3), use_container_width=True, hide_index=True)
+            str_lit.download_button("📥 Scarica dettaglio partite score esatto CSV", df_score_audit[cols_score].to_csv(index=False).encode("utf-8-sig"), "v1973_dettaglio_score_esatto.csv", "text/csv")
 
         # V4: diagnostica della X per equilibrio tra probabilità di vittoria casa/trasferta.
         # Solo analisi: non modifica probabilità operative, lambda o pronostici.
