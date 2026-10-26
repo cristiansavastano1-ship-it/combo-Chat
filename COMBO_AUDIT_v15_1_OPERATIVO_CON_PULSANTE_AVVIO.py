@@ -1037,6 +1037,91 @@ with tab_audit:
         )
         with str_lit.spinner("Esecuzione test walk-forward V17; può richiedere qualche secondo..."):
             df_v15_test, df_v15_metriche, df_v15_comp = crea_test_v15_walk_forward(df_audit)
+
+        # V19.7.1: riepilogo RAW vs WF No Goal immediatamente visibile nell'Audit.
+        # Diagnostica soltanto: non modifica fit, lambda, probabilità operative o ranking.
+        str_lit.markdown("### 🎯 Confronto statistico No Goal: RAW vs Walk-Forward")
+        str_lit.caption(
+            "Il confronto usa esclusivamente le stesse partite con probabilità RAW, probabilità WF ed esito reale disponibili. "
+            "Brier Score e Log Loss più bassi indicano una qualità probabilistica migliore. "
+            "Delta = WF − RAW: un valore negativo favorisce WF."
+        )
+        df_ng_raw_wf_top = df_v15_test.copy()
+        colonne_ng_top = ["P(NG) raw", "P(NG) calibrata WF", "NG y"]
+        if all(c in df_ng_raw_wf_top.columns for c in colonne_ng_top):
+            for c in colonne_ng_top:
+                df_ng_raw_wf_top[c] = pd.to_numeric(df_ng_raw_wf_top[c], errors="coerce")
+            mask_ng_top = df_ng_raw_wf_top[colonne_ng_top].notna().all(axis=1)
+            # Esclude esplicitamente righe senza etichetta reale, evitando che un eventuale NaN
+            # trasformato in zero nella colonna diagnostica NG y venga contato come esito.
+            if "No Goal reale" in df_ng_raw_wf_top.columns:
+                mask_ng_top &= pd.to_numeric(df_ng_raw_wf_top["No Goal reale"], errors="coerce").notna()
+            if "Gol casa reali" in df_ng_raw_wf_top.columns and "Gol trasferta reali" in df_ng_raw_wf_top.columns:
+                mask_ng_top &= pd.to_numeric(df_ng_raw_wf_top["Gol casa reali"], errors="coerce").notna()
+                mask_ng_top &= pd.to_numeric(df_ng_raw_wf_top["Gol trasferta reali"], errors="coerce").notna()
+            for c in colonne_ng_top:
+                mask_ng_top &= np.isfinite(df_ng_raw_wf_top[c].to_numpy(dtype=float))
+            z_ng_top = df_ng_raw_wf_top.loc[mask_ng_top].copy()
+            if not z_ng_top.empty:
+                y_ng_top = z_ng_top["NG y"].to_numpy(dtype=float)
+                p_raw_top = z_ng_top["P(NG) raw"].to_numpy(dtype=float)
+                p_wf_top = z_ng_top["P(NG) calibrata WF"].to_numpy(dtype=float)
+                brier_raw_top, logloss_raw_top = _calcola_metriche_binaria(p_raw_top, y_ng_top)
+                brier_wf_top, logloss_wf_top = _calcola_metriche_binaria(p_wf_top, y_ng_top)
+                delta_brier_top = brier_wf_top - brier_raw_top
+                delta_logloss_top = logloss_wf_top - logloss_raw_top
+
+                reale_top = 100.0 * float(np.mean(y_ng_top))
+                raw_media_top = 100.0 * float(np.mean(p_raw_top))
+                wf_media_top = 100.0 * float(np.mean(p_wf_top))
+                m1, m2, m3, m4 = str_lit.columns(4)
+                m1.metric("Partite appaiate", f"{len(z_ng_top):,}".replace(",", "."))
+                m2.metric("No Goal reale", f"{reale_top:.2f}%")
+                m3.metric("P(NG) RAW media", f"{raw_media_top:.2f}%")
+                m4.metric("P(NG) WF media", f"{wf_media_top:.2f}%")
+
+                m5, m6, m7, m8 = str_lit.columns(4)
+                m5.metric("Brier RAW", f"{brier_raw_top:.6f}")
+                m6.metric("Brier WF", f"{brier_wf_top:.6f}", f"{delta_brier_top:+.6f}", delta_color="inverse")
+                m7.metric("Log Loss RAW", f"{logloss_raw_top:.6f}")
+                m8.metric("Log Loss WF", f"{logloss_wf_top:.6f}", f"{delta_logloss_top:+.6f}", delta_color="inverse")
+
+                if delta_brier_top < -1e-12 and delta_logloss_top < -1e-12:
+                    str_lit.success("Esito: WF migliora sia Brier Score sia Log Loss sul campione appaiato.")
+                    esito_ng_top = "WF migliore su entrambe"
+                elif delta_brier_top > 1e-12 and delta_logloss_top > 1e-12:
+                    str_lit.warning("Esito: WF peggiora sia Brier Score sia Log Loss sul campione appaiato.")
+                    esito_ng_top = "RAW migliore su entrambe"
+                else:
+                    str_lit.info("Esito: risultato misto o sostanzialmente pari; leggere entrambe le metriche prima di giudicare la calibrazione.")
+                    esito_ng_top = "Misto / sostanzialmente pari"
+
+                df_ng_raw_wf_riepilogo = pd.DataFrame([{
+                    "Partite appaiate": int(len(z_ng_top)),
+                    "No Goal reale (%)": reale_top,
+                    "P(NG) RAW media (%)": raw_media_top,
+                    "P(NG) WF media (%)": wf_media_top,
+                    "Brier RAW": brier_raw_top,
+                    "Brier WF": brier_wf_top,
+                    "Delta Brier WF - RAW": delta_brier_top,
+                    "Log Loss RAW": logloss_raw_top,
+                    "Log Loss WF": logloss_wf_top,
+                    "Delta Log Loss WF - RAW": delta_logloss_top,
+                    "Esito confronto": esito_ng_top,
+                }])
+                str_lit.dataframe(df_ng_raw_wf_riepilogo.round(6), use_container_width=True, hide_index=True)
+                str_lit.download_button(
+                    "📥 Scarica riepilogo No Goal RAW vs WF",
+                    df_ng_raw_wf_riepilogo.to_csv(index=False).encode("utf-8-sig"),
+                    "v19_7_1_riepilogo_nogoal_raw_vs_wf.csv",
+                    "text/csv",
+                    key="download_v1971_nogoal_raw_wf_summary",
+                )
+            else:
+                str_lit.warning("Confronto No Goal RAW vs WF non calcolabile: non ci sono righe appaiate con esito reale valido.")
+        else:
+            str_lit.warning("Confronto No Goal RAW vs WF non disponibile: mancano una o più colonne necessarie.")
+
         # Riconciliazione: partite valutate per competizione contro partite caricate dalla fonte gratuita.
         if matches_audit:
             caricate_comp = pd.DataFrame(matches_audit)
