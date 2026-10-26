@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V16",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V19.7.2",
     layout="wide",
     page_icon="⚽",
 )
@@ -1121,6 +1121,83 @@ with tab_audit:
                 str_lit.warning("Confronto No Goal RAW vs WF non calcolabile: non ci sono righe appaiate con esito reale valido.")
         else:
             str_lit.warning("Confronto No Goal RAW vs WF non disponibile: mancano una o più colonne necessarie.")
+
+        # V19.7.2: riconciliazione esclusioni RAW/WF. Solo diagnostica; non modifica il modello.
+        str_lit.markdown("### 🔎 V19.7.2 — Riconciliazione completa delle esclusioni No Goal")
+        str_lit.caption(
+            "Ogni riga dell'Audit viene assegnata a una sola categoria di esclusione oppure al campione appaiato. "
+            "Il training insufficiente indica meno di 100 partite precedenti della stessa competizione; "
+            "fit non valido/altro indica che il WF manca nonostante training almeno pari a 100. "
+            "Questa sezione è esclusivamente diagnostica."
+        )
+        if not df_v15_test.empty:
+            df_ric_ng = df_v15_test.copy()
+            # Valori numerici robusti e controllo dell'esito reale senza affidarsi a NG y,
+            # che viene inizializzata a zero anche quando l'etichetta sorgente è mancante.
+            if "P(NG) raw" not in df_ric_ng.columns:
+                df_ric_ng["P(NG) raw"] = np.nan
+            if "P(NG) calibrata WF" not in df_ric_ng.columns:
+                df_ric_ng["P(NG) calibrata WF"] = np.nan
+            if "Training usato V15" not in df_ric_ng.columns:
+                df_ric_ng["Training usato V15"] = 0
+            df_ric_ng["P(NG) raw"] = pd.to_numeric(df_ric_ng["P(NG) raw"], errors="coerce")
+            df_ric_ng["P(NG) calibrata WF"] = pd.to_numeric(df_ric_ng["P(NG) calibrata WF"], errors="coerce")
+            df_ric_ng["Training usato V15"] = pd.to_numeric(df_ric_ng["Training usato V15"], errors="coerce").fillna(0)
+            df_ric_ng["NG y"] = pd.to_numeric(df_ric_ng.get("NG y", pd.Series(np.nan, index=df_ric_ng.index)), errors="coerce")
+
+            esito_valido = df_ric_ng["No Goal reale"].notna() if "No Goal reale" in df_ric_ng.columns else df_ric_ng["NG y"].notna()
+            if "Gol casa reali" in df_ric_ng.columns:
+                esito_valido &= pd.to_numeric(df_ric_ng["Gol casa reali"], errors="coerce").notna()
+            if "Gol trasferta reali" in df_ric_ng.columns:
+                esito_valido &= pd.to_numeric(df_ric_ng["Gol trasferta reali"], errors="coerce").notna()
+            raw_valida = np.isfinite(df_ric_ng["P(NG) raw"].to_numpy(dtype=float))
+            wf_valida = np.isfinite(df_ric_ng["P(NG) calibrata WF"].to_numpy(dtype=float))
+            training_insuff = df_ric_ng["Training usato V15"].to_numpy(dtype=float) < 100
+
+            # Categorie esclusive, ordinate per evitare doppi conteggi.
+            df_ric_ng["_esito_non_valido"] = ~np.asarray(esito_valido, dtype=bool)
+            df_ric_ng["_raw_non_valida"] = np.asarray(esito_valido, dtype=bool) & ~raw_valida
+            df_ric_ng["_wf_training_insuff"] = np.asarray(esito_valido, dtype=bool) & raw_valida & ~wf_valida & training_insuff
+            df_ric_ng["_wf_fit_non_valido"] = np.asarray(esito_valido, dtype=bool) & raw_valida & ~wf_valida & ~training_insuff
+            df_ric_ng["_appaiata"] = np.asarray(esito_valido, dtype=bool) & raw_valida & wf_valida
+
+            def _riga_ric_ng(gruppo, nome):
+                n = int(len(gruppo))
+                app = int(gruppo["_appaiata"].sum())
+                esclusioni = int(gruppo["_esito_non_valido"].sum() + gruppo["_raw_non_valida"].sum() + gruppo["_wf_training_insuff"].sum() + gruppo["_wf_fit_non_valido"].sum())
+                return {
+                    "Competizione": nome,
+                    "Partite controllate": n,
+                    "Partite appaiate RAW/WF": app,
+                    "Esito reale mancante/non valido": int(gruppo["_esito_non_valido"].sum()),
+                    "P(NG) RAW mancante/non valida": int(gruppo["_raw_non_valida"].sum()),
+                    "WF assente: training <100": int(gruppo["_wf_training_insuff"].sum()),
+                    "WF assente: fit non valido/altro": int(gruppo["_wf_fit_non_valido"].sum()),
+                    "Escluse totali": esclusioni,
+                    "Controllo somma": "PASS" if app + esclusioni == n else f"VERIFICARE ({app + esclusioni}/{n})",
+                }
+
+            righe_ric_ng = [_riga_ric_ng(g, str(comp)) for comp, g in df_ric_ng.groupby("Competizione", dropna=False)] if "Competizione" in df_ric_ng.columns else []
+            righe_ric_ng.append(_riga_ric_ng(df_ric_ng, "TOTALE"))
+            df_ric_ng_riepilogo = pd.DataFrame(righe_ric_ng)
+            str_lit.dataframe(df_ric_ng_riepilogo, use_container_width=True, hide_index=True)
+            totale = df_ric_ng_riepilogo[df_ric_ng_riepilogo["Competizione"] == "TOTALE"].iloc[0]
+            if totale["Controllo somma"] == "PASS":
+                str_lit.success(
+                    f"Riconciliazione completata: {int(totale['Partite controllate']):,} controllate = "
+                    f"{int(totale['Partite appaiate RAW/WF']):,} appaiate + {int(totale['Escluse totali']):,} escluse.".replace(",", ".")
+                )
+            else:
+                str_lit.error("Riconciliazione non completa: controllare le categorie e i dati sorgente.")
+            str_lit.download_button(
+                "📥 Scarica riconciliazione esclusioni No Goal",
+                df_ric_ng_riepilogo.to_csv(index=False).encode("utf-8-sig"),
+                "v19_7_2_riconciliazione_esclusioni_nogoal.csv",
+                "text/csv",
+                key="download_v1972_riconciliazione_nogoal",
+            )
+        else:
+            str_lit.info("Nessuna riga Audit disponibile per la riconciliazione No Goal.")
 
         # Riconciliazione: partite valutate per competizione contro partite caricate dalla fonte gratuita.
         if matches_audit:
