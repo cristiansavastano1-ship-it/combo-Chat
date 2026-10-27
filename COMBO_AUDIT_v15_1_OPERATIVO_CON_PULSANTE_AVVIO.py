@@ -1980,6 +1980,82 @@ with tab_audit:
         str_lit.dataframe(df_score_comp.round(2), use_container_width=True, hide_index=True)
         str_lit.download_button("📥 Scarica audit score esatto per competizione CSV", df_score_comp.to_csv(index=False).encode("utf-8-sig"), "v1973_audit_score_esatto_per_competizione.csv", "text/csv")
 
+        # V19.7.4: calibrazione descrittiva dello score esatto top per competizione.
+        # Solo diagnostica; non modifica probabilità, lambda, segno 1X2 o ranking Combo.
+        str_lit.markdown("##### V19.7.4 — Calibrazione score esatto per competizione")
+        str_lit.caption(
+            "Per ogni competizione e punteggio esatto più probabile, confronta la probabilità media assegnata "
+            "con la frequenza con cui quel punteggio si è verificato davvero. Delta = tasso corretto meno "
+            "probabilità media (in punti percentuali). Campioni piccoli vanno interpretati con cautela. "
+            "Questa analisi riguarda solo le partite in cui quel punteggio era lo score top."
+        )
+        df_score_cal = df_score_audit.copy()
+        df_score_cal["Probabilità score top numerica (%)"] = pd.to_numeric(
+            df_score_cal["Probabilità risultato esatto top (%)"], errors="coerce"
+        )
+        score_cal_rows = []
+        for (comp_cal, score_cal), gg_cal in df_score_cal.groupby(
+            ["Competizione", "Risultato esatto più probabile"], dropna=False
+        ):
+            n_cal = int(gg_cal["Score top corretto"].notna().sum())
+            p_cal = gg_cal["Probabilità score top numerica (%)"].mean()
+            hit_cal = 100 * gg_cal["Score top corretto"].mean() if n_cal else np.nan
+            score_cal_rows.append({
+                "Competizione": comp_cal,
+                "Score top": score_cal,
+                "Partite": n_cal,
+                "Probabilità media (%)": p_cal,
+                "Tasso corretto reale (%)": hit_cal,
+                "Delta reale - previsto (pp)": hit_cal - p_cal if pd.notna(hit_cal) and pd.notna(p_cal) else np.nan,
+                "Affidabilità campione": "Limitato (<30)" if n_cal < 30 else "Almeno 30",
+            })
+        df_score_calibration = pd.DataFrame(score_cal_rows).sort_values(
+            ["Competizione", "Partite", "Score top"], ascending=[True, False, True]
+        )
+        str_lit.dataframe(df_score_calibration.round(2), use_container_width=True, hide_index=True)
+        str_lit.download_button(
+            "📥 Scarica calibrazione score per competizione CSV",
+            df_score_calibration.to_csv(index=False).encode("utf-8-sig"),
+            "v1974_calibrazione_score_per_competizione.csv", "text/csv"
+        )
+
+        str_lit.markdown("##### Focus 0-0 — confronto per competizione")
+        df_zero_zero = df_score_cal[df_score_cal["Risultato esatto più probabile"].astype(str).eq("0-0")].copy()
+        if not df_zero_zero.empty:
+            zero_rows = []
+            for comp_zero, gg_zero in df_zero_zero.groupby("Competizione", dropna=False):
+                n_zero = int(gg_zero["Score top corretto"].notna().sum())
+                p_zero = gg_zero["Probabilità score top numerica (%)"].mean()
+                hit_zero = 100 * gg_zero["Score top corretto"].mean() if n_zero else np.nan
+                zero_rows.append({
+                    "Competizione": comp_zero,
+                    "Partite con score top 0-0": n_zero,
+                    "Probabilità media 0-0 (%)": p_zero,
+                    "0-0 realmente verificato (%)": hit_zero,
+                    "Delta reale - previsto (pp)": hit_zero - p_zero if pd.notna(hit_zero) and pd.notna(p_zero) else np.nan,
+                    "Affidabilità campione": "Limitato (<30)" if n_zero < 30 else "Almeno 30",
+                })
+            n_zero_all = int(df_zero_zero["Score top corretto"].notna().sum())
+            p_zero_all = df_zero_zero["Probabilità score top numerica (%)"].mean()
+            hit_zero_all = 100 * df_zero_zero["Score top corretto"].mean() if n_zero_all else np.nan
+            zero_rows.append({
+                "Competizione": "TOTALE",
+                "Partite con score top 0-0": n_zero_all,
+                "Probabilità media 0-0 (%)": p_zero_all,
+                "0-0 realmente verificato (%)": hit_zero_all,
+                "Delta reale - previsto (pp)": hit_zero_all - p_zero_all if pd.notna(hit_zero_all) and pd.notna(p_zero_all) else np.nan,
+                "Affidabilità campione": "Almeno 30" if n_zero_all >= 30 else "Limitato (<30)",
+            })
+            df_zero_zero_comp = pd.DataFrame(zero_rows)
+            str_lit.dataframe(df_zero_zero_comp.round(2), use_container_width=True, hide_index=True)
+            str_lit.download_button(
+                "📥 Scarica focus 0-0 per competizione CSV",
+                df_zero_zero_comp.to_csv(index=False).encode("utf-8-sig"),
+                "v1974_focus_0_0_per_competizione.csv", "text/csv"
+            )
+        else:
+            str_lit.info("Nessuna partita disponibile con 0-0 come risultato esatto più probabile.")
+
         cols_score = ["Data", "Competizione", "Casa", "Trasferta", "P(1) %", "P(X) %", "P(2) %", "Scarto P(X) - migliore vittoria (pp)", "Segno previsto", "Risultato esatto più probabile", "Probabilità risultato esatto top (%)", "Risultato esatto reale", "Score top corretto", "Esito reale"]
         with str_lit.expander("Dettaglio diagnostico X e punteggio esatto", expanded=False):
             str_lit.dataframe(df_score_audit[cols_score].sort_values("Scarto P(X) - migliore vittoria (pp)", ascending=False).round(3), use_container_width=True, hide_index=True)
