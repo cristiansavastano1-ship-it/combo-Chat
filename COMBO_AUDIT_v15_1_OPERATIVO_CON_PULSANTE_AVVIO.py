@@ -461,6 +461,8 @@ def crea_test_v15_walk_forward(df_audit, min_train=100, max_train=300, max_gol=1
     d['P(X) lambda corretta WF'] = np.nan
     d['P(2) lambda corretta WF'] = np.nan
     d['P(NG) lambda corretta WF'] = np.nan
+    # V19.8: probabilità esatta 0-0 dalla matrice Poisson con lambda corrette WF.
+    d['P(0-0) lambda corretta WF'] = np.nan
     d['Training usato V15'] = 0
     # V19.7: audit trasparente del training effettivamente passato al fit Platt No Goal.
     # Queste colonne sono esclusivamente diagnostiche e non cambiano il fit né le previsioni.
@@ -563,6 +565,7 @@ def crea_test_v15_walk_forward(df_audit, min_train=100, max_train=300, max_gol=1
                 d.at[idx, 'P(X) lambda corretta WF'] = float(np.trace(mat))
                 d.at[idx, 'P(2) lambda corretta WF'] = float(np.triu(mat, 1).sum())
                 d.at[idx, 'P(NG) lambda corretta WF'] = float(1.0 - mat[1:, 1:].sum())
+                d.at[idx, 'P(0-0) lambda corretta WF'] = float(mat[0, 0])
                 d.at[idx, 'Training usato V15'] = len(train)
             # Aggiungi la riga target allo storico solo dopo avere calcolato la previsione.
             prior_idxs.append(idx)
@@ -2149,6 +2152,106 @@ with tab_audit:
             )
         else:
             str_lit.warning("La probabilità esatta 0-0 non è disponibile nel campione corrente; impossibile calcolare la calibrazione complessiva.")
+
+        # V19.8: confronto appaiato della probabilità esatta 0-0 RAW vs WF.
+        # WF qui significa matrice Poisson ricalcolata con lambda corrette esclusivamente
+        # usando risultati precedenti della stessa competizione; non è Platt sul solo evento 0-0.
+        str_lit.markdown("##### V19.8 — Confronto statistico 0-0: RAW vs Walk-Forward")
+        str_lit.caption(
+            "Confronto sulle stesse partite con P(0-0) RAW, P(0-0) WF ed esito reale disponibili. "
+            "La probabilità WF deriva dalla matrice Poisson con lambda corrette walk-forward, "
+            "stimate solo su partite precedenti della stessa competizione (fino a 300 righe, minimo 100). "
+            "Non è una calibrazione Platt specifica dello 0-0. Brier Score e Log Loss più bassi sono migliori; "
+            "Delta WF − RAW negativo favorisce WF. Solo Audit: nessun effetto sulle previsioni operative."
+        )
+        df_00_wf = df_v15_test.copy() if isinstance(df_v15_test, pd.DataFrame) else pd.DataFrame()
+        cols00_need = ["P(0-0) %", "P(0-0) lambda corretta WF", "0-0 reale", "Data", "Competizione"]
+        if not df_00_wf.empty and all(c in df_00_wf.columns for c in cols00_need):
+            for c in ["P(0-0) %", "P(0-0) lambda corretta WF", "0-0 reale"]:
+                df_00_wf[c] = pd.to_numeric(df_00_wf[c], errors="coerce")
+            df_00_wf["Data"] = pd.to_datetime(df_00_wf["Data"], errors="coerce", utc=True)
+            df_00_wf["P(0-0) RAW"] = df_00_wf["P(0-0) %"] / 100.0
+            # L'esito binario è 0-0 sì/no; il target viene da gol reali, se disponibili.
+            if "Gol casa reali" in df_00_wf.columns and "Gol trasferta reali" in df_00_wf.columns:
+                gh00 = pd.to_numeric(df_00_wf["Gol casa reali"], errors="coerce")
+                ga00 = pd.to_numeric(df_00_wf["Gol trasferta reali"], errors="coerce")
+                target_valido00 = gh00.notna() & ga00.notna()
+                df_00_wf.loc[target_valido00, "0-0 reale"] = ((gh00[target_valido00] == 0) & (ga00[target_valido00] == 0)).astype(int)
+            df_00_wf["Anno test"] = df_00_wf["Data"].dt.year
+            raw_ok00 = np.isfinite(df_00_wf["P(0-0) RAW"].to_numpy(dtype=float))
+            wf_ok00 = np.isfinite(df_00_wf["P(0-0) lambda corretta WF"].to_numpy(dtype=float))
+            y_ok00 = np.isfinite(df_00_wf["0-0 reale"].to_numpy(dtype=float))
+            date_ok00 = df_00_wf["Data"].notna().to_numpy()
+            comp_ok00 = df_00_wf["Competizione"].notna().to_numpy()
+            paired_mask00 = raw_ok00 & wf_ok00 & y_ok00 & date_ok00 & comp_ok00
+            z00 = df_00_wf.loc[paired_mask00].copy()
+            n_tot00 = len(df_00_wf)
+            n_raw_miss00 = int((~raw_ok00).sum())
+            n_wf_miss00 = int((~wf_ok00).sum())
+            n_y_miss00 = int((~y_ok00).sum())
+            n_train_short00 = int((pd.to_numeric(df_00_wf.get("Training usato V15", pd.Series(0, index=df_00_wf.index)), errors="coerce").fillna(0) < 100).sum())
+            a1, a2, a3, a4 = str_lit.columns(4)
+            a1.metric("Righe audit disponibili", f"{n_tot00:,}".replace(",", "."))
+            a2.metric("Partite appaiate RAW/WF", f"{len(z00):,}".replace(",", "."))
+            a3.metric("WF non disponibile", f"{n_wf_miss00:,}".replace(",", "."))
+            a4.metric("Training sotto 100", f"{n_train_short00:,}".replace(",", "."))
+            str_lit.caption(
+                f"Esclusioni diagnostiche (conteggi potenzialmente sovrapposti): RAW mancante {n_raw_miss00}; "
+                f"WF mancante {n_wf_miss00}; esito 0-0 mancante {n_y_miss00}. "
+                "Le partite senza almeno 100 osservazioni precedenti della stessa competizione non ricevono una correzione WF."
+            )
+            if not z00.empty:
+                y00w = z00["0-0 reale"].to_numpy(dtype=float)
+                p00raw = np.clip(z00["P(0-0) RAW"].to_numpy(dtype=float), 1e-12, 1-1e-12)
+                p00wf = np.clip(z00["P(0-0) lambda corretta WF"].to_numpy(dtype=float), 1e-12, 1-1e-12)
+                b00raw, ll00raw = _calcola_metriche_binaria(p00raw, y00w)
+                b00wf, ll00wf = _calcola_metriche_binaria(p00wf, y00w)
+                tot00 = pd.DataFrame([{
+                    "Gruppo": "TOTALE", "Partite appaiate": len(z00),
+                    "P(0-0) RAW media (%)": 100*float(np.mean(p00raw)),
+                    "P(0-0) WF media (%)": 100*float(np.mean(p00wf)),
+                    "0-0 reale (%)": 100*float(np.mean(y00w)),
+                    "Brier 0-0 RAW": b00raw, "Brier 0-0 WF": b00wf, "Delta Brier WF - RAW": b00wf-b00raw,
+                    "LogLoss 0-0 RAW": ll00raw, "LogLoss 0-0 WF": ll00wf, "Delta LogLoss WF - RAW": ll00wf-ll00raw,
+                }])
+                str_lit.markdown("###### Confronto complessivo 0-0 RAW vs WF")
+                str_lit.dataframe(tot00.round(5), use_container_width=True, hide_index=True)
+
+                def _riepilogo_00_wf(gruppi, nome):
+                    righe00 = []
+                    for chiave00, grp00 in z00.groupby(gruppi, dropna=False):
+                        if not isinstance(chiave00, tuple):
+                            chiave00 = (chiave00,)
+                        yy00 = grp00["0-0 reale"].to_numpy(dtype=float)
+                        rr00 = np.clip(grp00["P(0-0) RAW"].to_numpy(dtype=float), 1e-12, 1-1e-12)
+                        ww00 = np.clip(grp00["P(0-0) lambda corretta WF"].to_numpy(dtype=float), 1e-12, 1-1e-12)
+                        br00, lr00 = _calcola_metriche_binaria(rr00, yy00)
+                        bw00, lw00 = _calcola_metriche_binaria(ww00, yy00)
+                        righe00.append({
+                            nome: " / ".join(str(v) for v in chiave00), "Partite appaiate": int(len(grp00)),
+                            "P(0-0) RAW media (%)": 100*float(np.mean(rr00)), "P(0-0) WF media (%)": 100*float(np.mean(ww00)),
+                            "0-0 reale (%)": 100*float(np.mean(yy00)), "Brier 0-0 RAW": br00, "Brier 0-0 WF": bw00,
+                            "Delta Brier WF - RAW": bw00-br00, "LogLoss 0-0 RAW": lr00, "LogLoss 0-0 WF": lw00,
+                            "Delta LogLoss WF - RAW": lw00-lr00,
+                        })
+                    return pd.DataFrame(righe00)
+
+                comp00_wf = _riepilogo_00_wf(["Competizione"], "Competizione")
+                anno00_wf = _riepilogo_00_wf(["Anno test"], "Anno")
+                str_lit.markdown("###### Confronto 0-0 per competizione")
+                str_lit.dataframe(comp00_wf.round(5), use_container_width=True, hide_index=True)
+                str_lit.markdown("###### Confronto 0-0 per anno")
+                str_lit.dataframe(anno00_wf.round(5), use_container_width=True, hide_index=True)
+                csv00 = pd.concat([tot00.assign(Tipo="TOTALE"), comp00_wf.assign(Tipo="COMPETIZIONE"), anno00_wf.assign(Tipo="ANNO")], ignore_index=True, sort=False)
+                str_lit.download_button(
+                    "📥 Scarica confronto 0-0 RAW vs WF CSV",
+                    csv00.to_csv(index=False).encode("utf-8-sig"),
+                    "v198_confronto_0_0_RAW_vs_WF.csv", "text/csv"
+                )
+            else:
+                str_lit.warning("Nessuna partita con probabilità 0-0 RAW e WF ed esito reale validi: confronto non calcolabile.")
+        else:
+            str_lit.info("Confronto 0-0 RAW vs WF non disponibile: mancano colonne necessarie nel test walk-forward.")
 
         cols_score = ["Data", "Competizione", "Casa", "Trasferta", "P(1) %", "P(X) %", "P(2) %", "Scarto P(X) - migliore vittoria (pp)", "Segno previsto", "Risultato esatto più probabile", "Probabilità risultato esatto top (%)", "Risultato esatto reale", "Score top corretto", "Esito reale"]
         with str_lit.expander("Dettaglio diagnostico X e punteggio esatto", expanded=False):
