@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V19.7.2",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V19.7.5",
     layout="wide",
     page_icon="⚽",
 )
@@ -359,6 +359,11 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
                 "Risultato esatto più probabile": f"{score_c}-{score_t}",
                 "Probabilità risultato esatto top (%)": 100 * prob_score_top,
                 "Punteggio esatto top è pareggio": int(score_c == score_t),
+                # V19.7.5: probabilità dello 0-0 su TUTTE le partite, non solo score top.
+                "P(0-0) %": 100 * float(matrice[0, 0]),
+                "0-0 reale": int(partita["gol_casa"] == 0 and partita["gol_trasferta"] == 0),
+                "Brier 0-0": (float(matrice[0, 0]) - int(partita["gol_casa"] == 0 and partita["gol_trasferta"] == 0)) ** 2,
+                "Log Loss 0-0": -math.log(max(1e-12, float(matrice[0, 0]) if (partita["gol_casa"] == 0 and partita["gol_trasferta"] == 0) else 1.0 - float(matrice[0, 0]))),
                 "P(No Goal) %": 100*p_nogoal, "No Goal favorito": int(p_nogoal > p_goal),
                 "No Goal reale": reale_nogoal,
                 "Gol casa reali": partita["gol_casa"], "Gol trasferta reali": partita["gol_trasferta"],
@@ -1003,7 +1008,7 @@ with tab_monte_carlo:
 # --- TAB 8: AUDIT ---
 with tab_audit:
     str_lit.subheader("🛡️ Audit statistico: Pareggio X e Goal / No Goal")
-    str_lit.info("Versione diagnostica V19.7.3: riconciliazione partite non valutate e audit score esatto. Modello operativo invariato.")
+    str_lit.info("Versione diagnostica V19.7.5: calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
     str_lit.caption(
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
@@ -2055,6 +2060,95 @@ with tab_audit:
             )
         else:
             str_lit.info("Nessuna partita disponibile con 0-0 come risultato esatto più probabile.")
+
+        # V19.7.5: calibrazione dello 0-0 su tutte le partite valutate.
+        # Questa sezione è diagnostica: non modifica lambda, matrici o previsioni operative.
+        str_lit.markdown("##### V19.7.5 — Calibrazione dello 0-0 su tutte le partite valutate")
+        str_lit.caption(
+            "A differenza del focus precedente, qui entrano tutte le partite con probabilità 0-0 disponibile, "
+            "anche quando 0-0 NON è lo score esatto più probabile. Le fasce confrontano probabilità media e frequenza reale. "
+            "Brier Score e Log Loss sono calcolati come evento binario: 0-0 sì/no. Nessuna modifica al modello operativo."
+        )
+        df_cal00 = df_score_audit.copy()
+        df_cal00["P(0-0) %"] = pd.to_numeric(df_cal00.get("P(0-0) %"), errors="coerce")
+        df_cal00["0-0 reale"] = pd.to_numeric(df_cal00.get("0-0 reale"), errors="coerce")
+        df_cal00 = df_cal00.dropna(subset=["P(0-0) %", "0-0 reale"]).copy()
+        if not df_cal00.empty:
+            p00 = (df_cal00["P(0-0) %"] / 100.0).clip(1e-12, 1 - 1e-12)
+            y00 = df_cal00["0-0 reale"].astype(int)
+            df_cal00["Brier 0-0"] = (p00 - y00) ** 2
+            df_cal00["Log Loss 0-0"] = -(y00 * np.log(p00) + (1 - y00) * np.log(1 - p00))
+            n00 = len(df_cal00)
+            p00_mean = float(df_cal00["P(0-0) %"].mean())
+            y00_rate = float(100 * df_cal00["0-0 reale"].mean())
+            m1, m2, m3, m4 = str_lit.columns(4)
+            m1.metric("Partite valutate", f"{n00:,}".replace(",", "."))
+            m2.metric("P(0-0) media", f"{p00_mean:.2f}%")
+            m3.metric("0-0 realmente verificati", f"{y00_rate:.2f}%")
+            m4.metric("Delta reale − previsto", f"{y00_rate-p00_mean:+.2f} pp")
+            m5, m6 = str_lit.columns(2)
+            m5.metric("Brier Score 0-0", f"{df_cal00['Brier 0-0'].mean():.5f}")
+            m6.metric("Log Loss 0-0", f"{df_cal00['Log Loss 0-0'].mean():.5f}")
+
+            bins00 = [0, 5, 10, 15, 20, 25, 30, 40, 50, 100.000001]
+            labels00 = ["0–5%", "5–10%", "10–15%", "15–20%", "20–25%", "25–30%", "30–40%", "40–50%", "50%+"]
+            df_cal00["Fascia P(0-0)"] = pd.cut(
+                df_cal00["P(0-0) %"].clip(0, 100), bins=bins00, labels=labels00,
+                right=False, include_lowest=True
+            )
+            df_cal00_fasce = df_cal00.groupby("Fascia P(0-0)", observed=False).agg(
+                Partite=("0-0 reale", "size"),
+                **{
+                    "P(0-0) media (%)": ("P(0-0) %", "mean"),
+                    "0-0 reale (%)": ("0-0 reale", lambda x: 100*x.mean()),
+                    "Brier Score": ("Brier 0-0", "mean"),
+                    "Log Loss": ("Log Loss 0-0", "mean"),
+                }
+            ).reset_index()
+            df_cal00_fasce["Delta reale - previsto (pp)"] = df_cal00_fasce["0-0 reale (%)"] - df_cal00_fasce["P(0-0) media (%)"]
+            df_cal00_fasce["Affidabilità campione"] = np.where(df_cal00_fasce["Partite"] < 30, "Limitato (<30)", "Almeno 30")
+            str_lit.markdown("###### Calibrazione per fasce di probabilità 0-0")
+            str_lit.dataframe(df_cal00_fasce.round(3), use_container_width=True, hide_index=True)
+            str_lit.download_button(
+                "📥 Scarica calibrazione 0-0 per fasce CSV",
+                df_cal00_fasce.to_csv(index=False).encode("utf-8-sig"),
+                "v1975_calibrazione_0_0_per_fasce.csv", "text/csv"
+            )
+
+            comp00_rows = []
+            for comp00, gg00 in df_cal00.groupby("Competizione", dropna=False):
+                pp = (gg00["P(0-0) %"] / 100.0).clip(1e-12, 1 - 1e-12)
+                yy = gg00["0-0 reale"].astype(int)
+                comp00_rows.append({
+                    "Competizione": comp00,
+                    "Partite": int(len(gg00)),
+                    "P(0-0) media (%)": gg00["P(0-0) %"].mean(),
+                    "0-0 reale (%)": 100 * yy.mean(),
+                    "Delta reale - previsto (pp)": 100 * yy.mean() - gg00["P(0-0) %"].mean(),
+                    "Brier Score": float(((pp - yy) ** 2).mean()),
+                    "Log Loss": float((-(yy * np.log(pp) + (1 - yy) * np.log(1 - pp))).mean()),
+                    "Affidabilità campione": "Limitato (<30)" if len(gg00) < 30 else "Almeno 30",
+                })
+            comp00_df = pd.DataFrame(comp00_rows).sort_values("Competizione")
+            comp00_df = pd.concat([comp00_df, pd.DataFrame([{
+                "Competizione": "TOTALE",
+                "Partite": int(len(df_cal00)),
+                "P(0-0) media (%)": df_cal00["P(0-0) %"].mean(),
+                "0-0 reale (%)": 100 * df_cal00["0-0 reale"].mean(),
+                "Delta reale - previsto (pp)": 100 * df_cal00["0-0 reale"].mean() - df_cal00["P(0-0) %"].mean(),
+                "Brier Score": df_cal00["Brier 0-0"].mean(),
+                "Log Loss": df_cal00["Log Loss 0-0"].mean(),
+                "Affidabilità campione": "Almeno 30" if len(df_cal00) >= 30 else "Limitato (<30)",
+            }])], ignore_index=True)
+            str_lit.markdown("###### Calibrazione 0-0 per competizione — tutte le partite")
+            str_lit.dataframe(comp00_df.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button(
+                "📥 Scarica calibrazione 0-0 per competizione CSV",
+                comp00_df.to_csv(index=False).encode("utf-8-sig"),
+                "v1975_calibrazione_0_0_per_competizione.csv", "text/csv"
+            )
+        else:
+            str_lit.warning("La probabilità esatta 0-0 non è disponibile nel campione corrente; impossibile calcolare la calibrazione complessiva.")
 
         cols_score = ["Data", "Competizione", "Casa", "Trasferta", "P(1) %", "P(X) %", "P(2) %", "Scarto P(X) - migliore vittoria (pp)", "Segno previsto", "Risultato esatto più probabile", "Probabilità risultato esatto top (%)", "Risultato esatto reale", "Score top corretto", "Esito reale"]
         with str_lit.expander("Dettaglio diagnostico X e punteggio esatto", expanded=False):
