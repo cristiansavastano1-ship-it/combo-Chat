@@ -143,8 +143,9 @@ def scarica_classifica_club(chiave, league_code):
 
 @str_lit.cache_data(ttl=21600, show_spinner=False)
 def carica_storico_audit_gratuito():
-    """Carica fino a 3 stagioni da football-data.co.uk per l'audit multi-campionato.
-    Questa fonte è separata dai dati operativi/API della app e non modifica i pronostici live.
+    """Carica risultati e statistiche reali gratuite per l'Audit.
+    I campi statistici sono conservati separatamente dai dati operativi.
+    Valori mancanti restano None: non vengono mai trasformati in zero.
     """
     leghe_csv = {
         "Serie A (Italia)": "I1",
@@ -154,40 +155,61 @@ def carica_storico_audit_gratuito():
         "Ligue 1 (Francia)": "F1",
         "Eredivisie (Olanda)": "N1",
     }
+    metriche = {
+        "Tiri casa": "HS", "Tiri trasferta": "AS",
+        "Tiri in porta casa": "HST", "Tiri in porta trasferta": "AST",
+        "Angoli casa": "HC", "Angoli trasferta": "AC",
+        "Falli casa": "HF", "Falli trasferta": "AF",
+        "Ammonizioni casa": "HY", "Ammonizioni trasferta": "AY",
+        "Espulsioni casa": "HR", "Espulsioni trasferta": "AR",
+    }
     anno_corrente = datetime.now().year
-    # La stagione calcistica inizia normalmente ad agosto.
     anno_inizio = anno_corrente if datetime.now().month >= 8 else anno_corrente - 1
     stagioni = [f"{str(y)[-2:]}{str(y + 1)[-2:]}" for y in range(anno_inizio, anno_inizio - 3, -1)]
-    risultati = []
-    diagnostica = []
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; COMBO-Audit/14.0)"}
+    risultati, diagnostica, copertura = [], [], []
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; COMBO-Audit/20.0)"}
+
     for nome_lega, codice in leghe_csv.items():
-        righe_lega = 0
-        errori = []
+        righe_lega, errori = 0, []
         for stagione in stagioni:
             url = f"https://football-data.co.uk/mmz4281/{stagione}/{codice}.csv"
             try:
-                response = requests.get(url, headers=headers, timeout=15)
+                response = requests.get(url, headers=headers, timeout=20)
                 if response.status_code != 200 or not response.content:
                     errori.append(f"{stagione}: HTTP {response.status_code}")
                     continue
                 from io import BytesIO
                 df = pd.read_csv(BytesIO(response.content), encoding="latin1", on_bad_lines="skip")
-                colonne = {str(c).strip(): c for c in df.columns}
-                richieste = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]
+                colonne = {str(c).strip().upper(): c for c in df.columns}
+                richieste = ["DATE", "HOMETEAM", "AWAYTEAM", "FTHG", "FTAG"]
                 if not all(c in colonne for c in richieste):
-                    errori.append(f"{stagione}: colonne richieste mancanti")
+                    errori.append(f"{stagione}: colonne risultati mancanti")
                     continue
+
+                valide_stagione = []
                 for _, r in df.iterrows():
-                    if pd.isna(r[colonne["FTHG"]]) or pd.isna(r[colonne["FTAG"]]) or pd.isna(r[colonne["Date"]]):
+                    if pd.isna(r[colonne["FTHG"]]) or pd.isna(r[colonne["FTAG"]]) or pd.isna(r[colonne["DATE"]]):
                         continue
                     try:
-                        data = pd.to_datetime(str(r[colonne["Date"]]).strip(), dayfirst=True, errors="coerce")
+                        data = pd.to_datetime(str(r[colonne["DATE"]]).strip(), dayfirst=True, errors="coerce")
                         gc, gt = int(r[colonne["FTHG"]]), int(r[colonne["FTAG"]])
-                        casa, trasf = str(r[colonne["HomeTeam"]]).strip(), str(r[colonne["AwayTeam"]]).strip()
+                        casa, trasf = str(r[colonne["HOMETEAM"]]).strip(), str(r[colonne["AWAYTEAM"]]).strip()
                         if pd.isna(data) or not casa or not trasf or gc < 0 or gt < 0:
                             continue
-                        risultati.append({
+
+                        stats = {}
+                        for nome_stat, colonna in metriche.items():
+                            valore = None
+                            if colonna in colonne and pd.notna(r[colonne[colonna]]):
+                                try:
+                                    numero = float(r[colonne[colonna]])
+                                    if np.isfinite(numero) and numero >= 0:
+                                        valore = numero
+                                except (TypeError, ValueError, OverflowError):
+                                    pass
+                            stats[nome_stat] = valore
+
+                        record = {
                             "status": "FINISHED",
                             "utcDate": data.strftime("%Y-%m-%dT12:00:00Z"),
                             "Competizione": nome_lega,
@@ -195,16 +217,35 @@ def carica_storico_audit_gratuito():
                             "awayTeam": {"name": trasf},
                             "score": {"fullTime": {"home": gc, "away": gt}},
                             "Stagione audit": stagione,
-                        })
+                            "statistichePartita": stats,
+                        }
+                        risultati.append(record)
+                        valide_stagione.append(record)
                         righe_lega += 1
                     except (TypeError, ValueError, OverflowError):
                         continue
+
+                n = len(valide_stagione)
+                for nome_stat in metriche:
+                    presenti = sum(x["statistichePartita"][nome_stat] is not None for x in valide_stagione)
+                    copertura.append({
+                        "Competizione": nome_lega, "Stagione": stagione,
+                        "Statistica": nome_stat, "Partite": n,
+                        "Valori disponibili": presenti,
+                        "Valori mancanti": n - presenti,
+                        "Copertura (%)": round(100 * presenti / n, 1) if n else 0.0,
+                    })
             except Exception as exc:
                 errori.append(f"{stagione}: {type(exc).__name__}")
-        diagnostica.append({"Competizione": nome_lega, "Partite storiche caricate": righe_lega,
-                            "Stagioni richieste": ", ".join(stagioni),
-                            "Note caricamento": "; ".join(errori) if errori else "OK"})
-    return risultati, pd.DataFrame(diagnostica)
+
+        diagnostica.append({
+            "Competizione": nome_lega,
+            "Partite storiche caricate": righe_lega,
+            "Stagioni richieste": ", ".join(stagioni),
+            "Note caricamento": "; ".join(errori) if errori else "OK",
+        })
+
+    return risultati, pd.DataFrame(diagnostica), pd.DataFrame(copertura)
 
 
 def poisson_prob(lmbda, k):
@@ -1023,9 +1064,34 @@ with tab_audit:
         "Per ogni partita, le stime usano soltanto risultati precedenti della stessa competizione."
     )
     with str_lit.spinner("Caricamento dello storico gratuito per tutti i campionati..."):
-        matches_audit, df_caricamento = carica_storico_audit_gratuito()
+        matches_audit, df_caricamento, df_copertura_statistiche = carica_storico_audit_gratuito()
     str_lit.markdown("##### Stato caricamento storico")
     str_lit.dataframe(df_caricamento, use_container_width=True, hide_index=True)
+    str_lit.markdown("#### 📊 V20.0 — Copertura delle statistiche reali")
+    str_lit.caption(
+        "Controllo dei dati effettivamente presenti nei CSV gratuiti: angoli, tiri, tiri in porta, "
+        "falli e cartellini. Le celle vuote sono conteggiate come mancanti, mai come zero."
+    )
+    if not df_copertura_statistiche.empty:
+        str_lit.dataframe(df_copertura_statistiche, use_container_width=True, hide_index=True)
+        df_riepilogo_copertura = (
+            df_copertura_statistiche.groupby("Statistica", as_index=False)
+            .agg({"Partite": "sum", "Valori disponibili": "sum", "Valori mancanti": "sum"})
+        )
+        df_riepilogo_copertura["Copertura (%)"] = (
+            100 * df_riepilogo_copertura["Valori disponibili"] /
+            df_riepilogo_copertura["Partite"].replace(0, np.nan)
+        ).round(1).fillna(0)
+        str_lit.markdown("##### Riepilogo copertura per statistica")
+        str_lit.dataframe(df_riepilogo_copertura, use_container_width=True, hide_index=True)
+        str_lit.download_button(
+            "⬇️ Scarica copertura statistiche CSV",
+            data=df_copertura_statistiche.to_csv(index=False).encode("utf-8-sig"),
+            file_name="V20_0_copertura_statistiche.csv",
+            mime="text/csv",
+        )
+    else:
+        str_lit.warning("Nessun dato statistico disponibile per il controllo della copertura.")
     if matches_audit:
         df_audit = crea_audit_walk_forward(matches_audit)
     else:
