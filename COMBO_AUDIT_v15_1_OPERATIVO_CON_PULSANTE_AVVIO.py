@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V19.7.5",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V19.9",
     layout="wide",
     page_icon="⚽",
 )
@@ -2242,11 +2242,72 @@ with tab_audit:
                 str_lit.dataframe(comp00_wf.round(5), use_container_width=True, hide_index=True)
                 str_lit.markdown("###### Confronto 0-0 per anno")
                 str_lit.dataframe(anno00_wf.round(5), use_container_width=True, hide_index=True)
+                # V19.9: bootstrap appaiato sulle differenze di loss partita per partita.
+                # Le stesse partite vengono ricampionate per RAW e WF: si preserva
+                # l'appaiamento e si stima l'IC percentile al 95% della differenza media.
+                str_lit.markdown("##### V19.9 — Bootstrap appaiato: incertezza del vantaggio WF")
+                str_lit.caption(
+                    "Ricampionamento appaiato delle partite (RAW e WF sempre insieme), 2.000 repliche, "
+                    "seed fisso 20261030. Per ogni replica si ricalcola la differenza media WF − RAW. "
+                    "IC percentile 95%: se resta interamente sotto zero, il risultato favorisce WF; "
+                    "se comprende zero, il vantaggio non è conclusivo. È un bootstrap sulle partite, "
+                    "non corregge da solo eventuali dipendenze temporali tra match della stessa squadra/stagione."
+                )
+                _rng_boot00 = np.random.default_rng(20261030)
+                _B_BOOT00 = 2000
+
+                def _bootstrap_appaiato_00(grp_boot00):
+                    yyb = grp_boot00["0-0 reale"].to_numpy(dtype=float)
+                    rb = np.clip(grp_boot00["P(0-0) RAW"].to_numpy(dtype=float), 1e-12, 1-1e-12)
+                    wb = np.clip(grp_boot00["P(0-0) lambda corretta WF"].to_numpy(dtype=float), 1e-12, 1-1e-12)
+                    nb = len(yyb)
+                    if nb == 0:
+                        return {"Bootstrap repliche": 0, "IC95 Delta Brier inf": np.nan,
+                                "IC95 Delta Brier sup": np.nan, "P(Delta Brier < 0) bootstrap (%)": np.nan,
+                                "IC95 Delta LogLoss inf": np.nan, "IC95 Delta LogLoss sup": np.nan,
+                                "P(Delta LogLoss < 0) bootstrap (%)": np.nan}
+                    loss_br = (wb - yyb) ** 2 - (rb - yyb) ** 2
+                    loss_ll = -(yyb*np.log(wb) + (1-yyb)*np.log(1-wb)) + (yyb*np.log(rb) + (1-yyb)*np.log(1-rb))
+                    boot_br = np.empty(_B_BOOT00, dtype=float)
+                    boot_ll = np.empty(_B_BOOT00, dtype=float)
+                    # Blocchi limitano l'uso di memoria anche su campioni molto grandi.
+                    for start_boot in range(0, _B_BOOT00, 100):
+                        stop_boot = min(start_boot + 100, _B_BOOT00)
+                        idx_boot = _rng_boot00.integers(0, nb, size=(stop_boot-start_boot, nb))
+                        boot_br[start_boot:stop_boot] = loss_br[idx_boot].mean(axis=1)
+                        boot_ll[start_boot:stop_boot] = loss_ll[idx_boot].mean(axis=1)
+                    return {
+                        "Bootstrap repliche": _B_BOOT00,
+                        "IC95 Delta Brier inf": float(np.quantile(boot_br, 0.025)),
+                        "IC95 Delta Brier sup": float(np.quantile(boot_br, 0.975)),
+                        "P(Delta Brier < 0) bootstrap (%)": 100.0*float(np.mean(boot_br < 0)),
+                        "IC95 Delta LogLoss inf": float(np.quantile(boot_ll, 0.025)),
+                        "IC95 Delta LogLoss sup": float(np.quantile(boot_ll, 0.975)),
+                        "P(Delta LogLoss < 0) bootstrap (%)": 100.0*float(np.mean(boot_ll < 0)),
+                    }
+
+                bootstrap_rows00 = []
+                gruppi_boot00 = [("TOTALE", "TOTALE", z00)]
+                gruppi_boot00 += [("COMPETIZIONE", str(k), g.copy()) for k, g in z00.groupby("Competizione", dropna=False)]
+                gruppi_boot00 += [("ANNO", str(k), g.copy()) for k, g in z00.groupby("Anno test", dropna=False)]
+                for tipo_boot00, nome_boot00, gruppo_boot00 in gruppi_boot00:
+                    esito_boot00 = _bootstrap_appaiato_00(gruppo_boot00)
+                    bootstrap_rows00.append({"Tipo": tipo_boot00, "Gruppo": nome_boot00,
+                                             "Partite appaiate": int(len(gruppo_boot00)), **esito_boot00})
+                bootstrap00 = pd.DataFrame(bootstrap_rows00)
+                str_lit.dataframe(bootstrap00.round(6), use_container_width=True, hide_index=True)
+                str_lit.caption(
+                    "Lettura: un IC95% interamente negativo indica evidenza bootstrap a favore di WF; "
+                    "un intervallo che attraversa zero indica che il vantaggio osservato resta incerto. "
+                    "La percentuale bootstrap sotto zero è descrittiva e non va interpretata come probabilità "
+                    "che WF sia migliore in futuro. I gruppi con pochi casi sono particolarmente instabili."
+                )
                 csv00 = pd.concat([tot00.assign(Tipo="TOTALE"), comp00_wf.assign(Tipo="COMPETIZIONE"), anno00_wf.assign(Tipo="ANNO")], ignore_index=True, sort=False)
+                csv00_boot = bootstrap00.rename(columns={"Gruppo": "Competizione/Anno"})
                 str_lit.download_button(
-                    "📥 Scarica confronto 0-0 RAW vs WF CSV",
-                    csv00.to_csv(index=False).encode("utf-8-sig"),
-                    "v198_confronto_0_0_RAW_vs_WF.csv", "text/csv"
+                    "📥 Scarica confronto 0-0 RAW vs WF + Bootstrap CSV",
+                    pd.concat([csv00, csv00_boot], ignore_index=True, sort=False).to_csv(index=False).encode("utf-8-sig"),
+                    "v199_confronto_0_0_RAW_vs_WF_bootstrap.csv", "text/csv"
                 )
             else:
                 str_lit.warning("Nessuna partita con probabilità 0-0 RAW e WF ed esito reale validi: confronto non calcolabile.")
