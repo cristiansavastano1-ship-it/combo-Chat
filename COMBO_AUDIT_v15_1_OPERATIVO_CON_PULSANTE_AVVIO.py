@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V20.3",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V20.4",
     layout="wide",
     page_icon="⚽",
 )
@@ -529,6 +529,58 @@ def crea_audit_statistiche_v203(df_pred):
                     err=np.concatenate([(g[pc]-g[rc]).to_numpy(),(g[pt]-g[rt]).to_numpy()])
                     tempo.append({"Statistica":nome,"Periodo":label,"Partite":len(g),"Date distinte":len(chunk),"MAE pooled":float(np.mean(np.abs(err))),"RMSE pooled":float(np.sqrt(np.mean(err**2))),"Bias pooled":float(np.mean(err)),"Data iniziale":g["Data"].min(),"Data finale":g["Data"].max()})
     return pd.DataFrame(pooled),pd.DataFrame(baseline),pd.DataFrame(soglie),pd.DataFrame(tempo),pd.DataFrame(sintesi)
+
+
+def crea_audit_statistiche_v204(df_pred, bootstrap_reps=1000, seed=204):
+    """V20.4: analisi per competizione/stagione, CI bootstrap appaiati per match,
+    e probabilita' Over/Under esplorative da Poisson sui totali previsti.
+    Solo Audit: non modifica il modello operativo.
+    """
+    if df_pred is None or df_pred.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    specs = {
+        "Tiri totali": ("Tiri totali casa prevista", "Tiri totali trasferta prevista", "Tiri totali casa baseline", "Tiri totali trasferta baseline", "Tiri totali casa reale", "Tiri totali trasferta reale", [19.5,21.5,23.5]),
+        "Tiri in porta": ("Tiri in porta casa prevista", "Tiri in porta trasferta prevista", "Tiri in porta casa baseline", "Tiri in porta trasferta baseline", "Tiri in porta casa reale", "Tiri in porta trasferta reale", [7.5,8.5,9.5]),
+        "Angoli": ("Angoli casa prevista", "Angoli trasferta prevista", "Angoli casa baseline", "Angoli trasferta baseline", "Angoli casa reale", "Angoli trasferta reale", [8.5,9.5,10.5]),
+    }
+    gruppi=[]; ci=[]; prob=[]; rng=np.random.default_rng(seed)
+    def poisson_tail(lam, threshold):
+        # P(X > soglia), con soglie .5 e conteggi interi.
+        k=int(np.floor(threshold))
+        lam=max(0.0, float(lam))
+        term=np.exp(-lam); cdf=term
+        for j in range(1,k+1):
+            term *= lam/j; cdf += term
+        return float(np.clip(1.0-cdf, 1e-9, 1-1e-9))
+    for nome, cols in specs.items():
+        pc,pt,bc,bt,rc,rt,levels=cols
+        needed=["Competizione","Stagione",pc,pt,bc,bt,rc,rt]
+        if not all(c in df_pred.columns for c in needed):
+            continue
+        z=df_pred[needed].copy().dropna(subset=[pc,pt,bc,bt,rc,rt])
+        if z.empty: continue
+        z["err_mod"]=(np.abs(z[pc]-z[rc])+np.abs(z[pt]-z[rt]))/2
+        z["err_base"]=(np.abs(z[bc]-z[rc])+np.abs(z[bt]-z[rt]))/2
+        for (comp,stag),g in z.groupby(["Competizione","Stagione"],dropna=False):
+            if len(g)<10: continue
+            mm=float(g.err_mod.mean()); mb=float(g.err_base.mean())
+            gruppi.append({"Statistica":nome,"Competizione":comp,"Stagione":stag,"Partite appaiate":len(g),"MAE modello per match":mm,"MAE baseline per match":mb,"Miglioramento MAE (%)":100*(mb-mm)/mb if mb else np.nan,"Delta MAE modello-baseline":mm-mb})
+        # Bootstrap appaiato a livello partita, non singola squadra.
+        a=z.err_mod.to_numpy(); b=z.err_base.to_numpy(); n=len(z)
+        if n>=30:
+            ix=rng.integers(0,n,size=(bootstrap_reps,n))
+            d=(b[ix]-a[ix]).mean(axis=1)
+            ci.append({"Statistica":nome,"N partite appaiate":n,"Miglioramento MAE medio":float((b-a).mean()),"IC 95% inferiore":float(np.quantile(d,.025)),"IC 95% superiore":float(np.quantile(d,.975)),"Prob. bootstrap miglioramento (%)":float((d>0).mean()*100),"Interpretazione":"IC sopra zero: evidenza a favore modello" if np.quantile(d,.025)>0 else ("IC attraversa zero: risultato incerto" if np.quantile(d,.025)<=0<=np.quantile(d,.975) else "IC sotto zero: baseline favorita")})
+        # Probabilita' esplorative: totale ~ Poisson(lambda casa prevista + lambda trasferta prevista).
+        for th in levels:
+            lam=(z[pc]+z[pt]).clip(lower=0).to_numpy(); y=(z[rc]+z[rt]).to_numpy()>th
+            pm=np.array([poisson_tail(v,th) for v in lam])
+            lb=(z[bc]+z[bt]).clip(lower=0).to_numpy(); pb=np.array([poisson_tail(v,th) for v in lb])
+            def metrics(pv):
+                return float(np.mean((pv-y.astype(float))**2)), float(-np.mean(y*np.log(pv)+(1-y)*np.log(1-pv)))
+            bm,lm=metrics(pm); bb,lll=metrics(pb)
+            prob.append({"Statistica":nome,"Soglia Over":th,"N":len(z),"Brier Poisson modello":bm,"Brier baseline Poisson":bb,"Delta Brier modello-baseline":bm-bb,"LogLoss Poisson modello":lm,"LogLoss baseline Poisson":lll,"Delta LogLoss modello-baseline":lm-lll,"Prevalenza Over reale (%)":100*float(y.mean()),"Nota":"Probabilita' esplorative da ipotesi Poisson; non calibrate e non utilizzabili come value bet"})
+    return pd.DataFrame(gruppi),pd.DataFrame(ci),pd.DataFrame(prob)
 
 def poisson_prob(lmbda, k):
     return (math.exp(-lmbda) * (lmbda**k)) / math.factorial(k)
@@ -1334,7 +1386,7 @@ with tab_monte_carlo:
 # --- TAB 8: AUDIT ---
 with tab_audit:
     str_lit.subheader("🛡️ Audit statistico: Pareggio X e Goal / No Goal")
-    str_lit.info("Versione diagnostica V20.3: audit storico e test statistici completi; calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
+    str_lit.info("Versione diagnostica V20.4: audit storico e test statistici completi; calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
     str_lit.caption(
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
@@ -1462,6 +1514,24 @@ with tab_audit:
                 _obj={"df20_pool":df20_pool,"df20_base":df20_base,"df20_soglie":df20_soglie,"df20_tempo":df20_tempo,"df20_sintesi":df20_sintesi}[_df]
                 if not _obj.empty:
                     str_lit.download_button(f"⬇️ Scarica {_nome} V20.3 CSV",data=_obj.to_csv(index=False).encode("utf-8-sig"),file_name=_file,mime="text/csv")
+            # V20.4: approfondimenti statistici esclusivamente nell'Audit.
+            str_lit.markdown("## 🧪 V20.4 — Campionati, intervalli di confidenza e probabilità esplorative")
+            str_lit.caption("Analisi aggiuntive solo diagnostiche. Bootstrap appaiato per partita; probabilità Over ottenute assumendo una distribuzione Poisson del totale previsto: non sono probabilità calibrate né suggerimenti di scommessa.")
+            df204_gruppi, df204_ci, df204_prob = crea_audit_statistiche_v204(df_stat_pred)
+            if not df204_gruppi.empty:
+                str_lit.markdown("### Prestazioni per campionato e stagione")
+                str_lit.dataframe(df204_gruppi.round(4), use_container_width=True, hide_index=True)
+                str_lit.download_button("⬇️ Scarica V20.4 per campionato/stagione CSV",data=df204_gruppi.to_csv(index=False).encode("utf-8-sig"),file_name="V20_4_per_campionato_stagione.csv",mime="text/csv")
+            if not df204_ci.empty:
+                str_lit.markdown("### Intervalli di confidenza bootstrap 95% — modello contro baseline")
+                str_lit.dataframe(df204_ci.round(5), use_container_width=True, hide_index=True)
+                str_lit.caption("Valore positivo del miglioramento MAE favorisce il modello. Le partite, non i singoli lati casa/trasferta, sono ricampionate come unità appaiata.")
+                str_lit.download_button("⬇️ Scarica V20.4 intervalli bootstrap CSV",data=df204_ci.to_csv(index=False).encode("utf-8-sig"),file_name="V20_4_bootstrap_IC95.csv",mime="text/csv")
+            if not df204_prob.empty:
+                str_lit.markdown("### Test probabilistico esplorativo Over/Under — ipotesi Poisson")
+                str_lit.dataframe(df204_prob.round(5), use_container_width=True, hide_index=True)
+                str_lit.caption("Delta negativi Brier/LogLoss favoriscono il modello. L'ipotesi Poisson è esplorativa: prima di qualsiasi uso operativo servono calibrazione out-of-sample e verifica di valore contro quote reali.")
+                str_lit.download_button("⬇️ Scarica V20.4 probabilità esplorative CSV",data=df204_prob.to_csv(index=False).encode("utf-8-sig"),file_name="V20_4_over_under_probabilita_esplorative.csv",mime="text/csv")
         else:
             str_lit.warning(
                 "Non ci sono ancora abbastanza osservazioni precedenti per valutare le statistiche. "
