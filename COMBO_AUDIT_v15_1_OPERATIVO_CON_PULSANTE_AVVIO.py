@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V20.1",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V20.2",
     layout="wide",
     page_icon="⚽",
 )
@@ -351,6 +351,11 @@ def crea_test_statistiche_v201(matches_list, finestra=10, minimo_storico=3):
                 reale_c, reale_t = m["valori"].get(col_casa), m["valori"].get(col_trasf)
                 out[f"{nome} casa prevista"] = float(stima_c) if stima_c is not None else np.nan
                 out[f"{nome} trasferta prevista"] = float(stima_t) if stima_t is not None else np.nan
+                # Baseline semplice e causale: media recente della sola squadra nel proprio ruolo.
+                base_c = _media_recenti_v201(hc["fatti"], finestra, minimo_storico)
+                base_t = _media_recenti_v201(at["fatti"], finestra, minimo_storico)
+                out[f"{nome} casa baseline"] = float(base_c) if base_c is not None else np.nan
+                out[f"{nome} trasferta baseline"] = float(base_t) if base_t is not None else np.nan
                 out[f"{nome} casa reale"] = reale_c if reale_c is not None else np.nan
                 out[f"{nome} trasferta reale"] = reale_t if reale_t is not None else np.nan
                 out[f"{nome} storico casa"] = min(len(hc["fatti"]), finestra)
@@ -466,6 +471,55 @@ def crea_test_statistiche_v201(matches_list, finestra=10, minimo_storico=3):
     df_gruppi = pd.DataFrame(righe_gruppi)
     return df_pred, df_metriche, df_dettaglio, df_gruppi
 
+
+
+def crea_audit_statistiche_v202(df_pred):
+    """Audit V20.2: baseline, RMSE pooled, soglie e stabilita' cronologica.
+    Tutte le valutazioni sono descrittive e usano esclusivamente previsioni WF gia' generate.
+    Le soglie sono totali partita: tiri 19.5/21.5/23.5, tiri in porta 7.5/8.5/9.5,
+    angoli 8.5/9.5/10.5. La classificazione usa il punto previsto, non probabilita' di mercato.
+    """
+    if df_pred is None or df_pred.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    pooled, baseline, soglie, tempo = [], [], [], []
+    specs = {
+        "Tiri totali": ("Tiri totali casa prevista", "Tiri totali trasferta prevista", "Tiri totali casa reale", "Tiri totali trasferta reale", [19.5,21.5,23.5]),
+        "Tiri in porta": ("Tiri in porta casa prevista", "Tiri in porta trasferta prevista", "Tiri in porta casa reale", "Tiri in porta trasferta reale", [7.5,8.5,9.5]),
+        "Angoli": ("Angoli casa prevista", "Angoli trasferta prevista", "Angoli casa reale", "Angoli trasferta reale", [8.5,9.5,10.5]),
+    }
+    for nome,(pc,pt,rc,rt,levels) in specs.items():
+        parts=[]
+        for pred,real in ((pc,rc),(pt,rt)):
+            if pred in df_pred and real in df_pred:
+                z=df_pred[[pred,real]].dropna().copy()
+                z.columns=["prev","reale"]
+                parts.append(z)
+        if parts:
+            z=pd.concat(parts,ignore_index=True); e=z.prev-z.reale
+            pooled.append({"Statistica":nome,"N osservazioni":len(z),"MAE pooled":float(np.mean(np.abs(e))),"RMSE pooled":float(np.sqrt(np.mean(e**2))),"Bias pooled":float(e.mean())})
+        # Confronto paired model vs baseline sulle stesse osservazioni per lato.
+        model_vals=[]; base_vals=[]; real_vals=[]
+        for pred,base,real in ((pc,pc.replace("prevista","baseline"),rc),(pt,pt.replace("prevista","baseline"),rt)):
+            if all(c in df_pred for c in (pred,base,real)):
+                z=df_pred[[pred,base,real]].dropna(); model_vals.extend((z[pred]-z[real]).tolist()); base_vals.extend((z[base]-z[real]).tolist()); real_vals.extend(z[real].tolist())
+        if model_vals:
+            baseline.append({"Statistica":nome,"N appaiato":len(model_vals),"MAE modello":float(np.mean(np.abs(model_vals))),"MAE baseline":float(np.mean(np.abs(base_vals))),"Delta MAE modello-baseline":float(np.mean(np.abs(model_vals))-np.mean(np.abs(base_vals))),"RMSE modello":float(np.sqrt(np.mean(np.square(model_vals)))),"RMSE baseline":float(np.sqrt(np.mean(np.square(base_vals)))),"Delta RMSE modello-baseline":float(np.sqrt(np.mean(np.square(model_vals)))-np.sqrt(np.mean(np.square(base_vals))))})
+        # Soglie totali partita: classificazione deterministica sopra/sotto il valore.
+        tot_pred=df_pred[pc]+df_pred[pt]; tot_real=df_pred[rc]+df_pred[rt]
+        for th in levels:
+            z=pd.DataFrame({"pred":tot_pred,"real":tot_real}).dropna()
+            if z.empty: continue
+            y=(z.real>th).astype(int); yh=(z.pred>th).astype(int)
+            tp=int(((y==1)&(yh==1)).sum()); fp=int(((y==0)&(yh==1)).sum()); fn=int(((y==1)&(yh==0)).sum()); tn=int(((y==0)&(yh==0)).sum())
+            soglie.append({"Statistica":nome,"Soglia totale":th,"N":len(z),"Accuratezza (%)":100*float((y==yh).mean()),"Precisione Over (%)":100*tp/(tp+fp) if tp+fp else np.nan,"Recall Over (%)":100*tp/(tp+fn) if tp+fn else np.nan,"Over reali (%)":100*float(y.mean()),"TP":tp,"FP":fp,"FN":fn,"TN":tn})
+        # Stabilita' in tre blocchi cronologici, senza mescolare le date.
+        z=df_pred[["Data",pc,pt,rc,rt]].dropna().sort_values("Data").copy()
+        if len(z)>=30:
+            z["Blocco temporale"]=pd.qcut(np.arange(len(z)),q=3,labels=["Primo terzo","Terzo centrale","Ultimo terzo"])
+            for blocco,g in z.groupby("Blocco temporale",observed=False):
+                err=np.concatenate([(g[pc]-g[rc]).to_numpy(),(g[pt]-g[rt]).to_numpy()])
+                tempo.append({"Statistica":nome,"Periodo":str(blocco),"Partite":len(g),"MAE pooled":float(np.mean(np.abs(err))),"RMSE pooled":float(np.sqrt(np.mean(err**2))),"Bias pooled":float(np.mean(err)),"Data iniziale":g["Data"].min(),"Data finale":g["Data"].max()})
+    return pd.DataFrame(pooled),pd.DataFrame(baseline),pd.DataFrame(soglie),pd.DataFrame(tempo)
 
 def poisson_prob(lmbda, k):
     return (math.exp(-lmbda) * (lmbda**k)) / math.factorial(k)
@@ -1271,7 +1325,7 @@ with tab_monte_carlo:
 # --- TAB 8: AUDIT ---
 with tab_audit:
     str_lit.subheader("🛡️ Audit statistico: Pareggio X e Goal / No Goal")
-    str_lit.info("Versione diagnostica V20.1: audit storico e test statistici completi; calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
+    str_lit.info("Versione diagnostica V20.2: audit storico e test statistici completi; calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
     str_lit.caption(
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
@@ -1313,7 +1367,7 @@ with tab_audit:
         str_lit.warning("Nessun dato statistico disponibile per il controllo della copertura.")
 
     # V20.1: tutti i mercati statistici vengono testati insieme, solo in modalità Audit.
-    str_lit.markdown("## 🧪 V20.1 — Test walk-forward completo statistiche squadre")
+    str_lit.markdown("## 🧪 V20.1 — Test walk-forward completo statistiche squadre + verifiche V20.2")
     str_lit.caption(
         "Test unico per angoli, tiri, tiri in porta, falli, ammonizioni, espulsioni e cartellini totali. "
         "Le previsioni di ogni data sono calcolate prima di aggiornare lo storico con i risultati di quella stessa data. "
@@ -1328,16 +1382,21 @@ with tab_audit:
             str_lit.markdown("### Risultati aggregati")
             str_lit.dataframe(df_stat_metriche.round(4), use_container_width=True, hide_index=True)
             str_lit.caption(
-                "MAE/RMSE sono espressi nelle unità della statistica (es. numero di angoli). "
+                "MAE/RMSE sono espressi nelle unità della statistica (es. numero di angoli); la classifica usa RMSE pooled corretto. "
                 "Bias positivo = sovrastima; bias negativo = sottostima. "
                 "L'accuratezza del confronto squadre esclude i pareggi reali."
             )
-            riepilogo = (
-                df_stat_metriche[df_stat_metriche["Lato"] != "Confronto squadre"]
-                .groupby("Statistica", as_index=False)
-                .agg({"Previsioni valutate": "sum", "MAE": "mean", "RMSE": "mean",
-                      "Bias previsto-reale": "mean"})
-            )
+            _base_riep = df_stat_metriche[df_stat_metriche["Lato"] != "Confronto squadre"].copy()
+            _base_riep["somma_quadrati_errore"] = _base_riep["Previsioni valutate"] * (_base_riep["RMSE"] ** 2)
+            _base_riep["somma_assoluta_errore"] = _base_riep["Previsioni valutate"] * _base_riep["MAE"]
+            _base_riep["somma_errore"] = _base_riep["Previsioni valutate"] * _base_riep["Bias previsto-reale"]
+            riepilogo = _base_riep.groupby("Statistica", as_index=False).agg(
+                {"Previsioni valutate":"sum", "somma_quadrati_errore":"sum",
+                 "somma_assoluta_errore":"sum", "somma_errore":"sum"})
+            riepilogo["MAE"] = riepilogo["somma_assoluta_errore"] / riepilogo["Previsioni valutate"]
+            riepilogo["RMSE pooled"] = np.sqrt(riepilogo["somma_quadrati_errore"] / riepilogo["Previsioni valutate"])
+            riepilogo["Bias previsto-reale"] = riepilogo["somma_errore"] / riepilogo["Previsioni valutate"]
+            riepilogo.drop(columns=["somma_quadrati_errore","somma_assoluta_errore","somma_errore"],inplace=True)
             confronto = df_stat_metriche[df_stat_metriche["Lato"] == "Confronto squadre"][
                 ["Statistica", "Accuratezza squadra con valore maggiore (%)",
                  "Partite senza parità reale", "Parità reale escluse"]
@@ -1368,6 +1427,28 @@ with tab_audit:
             )
             with str_lit.expander("Dettaglio previsioni e risultati partita per partita"):
                 str_lit.dataframe(df_stat_dettaglio, use_container_width=True, hide_index=True)
+            # V20.2: ulteriori verifiche solo Audit, senza effetti sul modello operativo.
+            str_lit.markdown("## 🧪 V20.2 — Baseline, soglie e stabilità temporale")
+            str_lit.caption("Confronto causale con la media recente della sola squadra nel proprio ruolo. Le soglie sono classificazioni deterministiche basate sul totale previsto, non probabilità di mercato.")
+            df20_pool, df20_base, df20_soglie, df20_tempo = crea_audit_statistiche_v202(df_stat_pred)
+            if not df20_pool.empty:
+                str_lit.markdown("### RMSE pooled corretto — tre statistiche principali")
+                str_lit.dataframe(df20_pool.round(4), use_container_width=True, hide_index=True)
+            if not df20_base.empty:
+                str_lit.markdown("### Modello V20.1 contro baseline semplice")
+                str_lit.dataframe(df20_base.round(4), use_container_width=True, hide_index=True)
+                str_lit.caption("Delta negativo favorisce il modello V20.1; delta positivo favorisce la baseline. Il confronto usa soltanto righe appaiate.")
+            if not df20_soglie.empty:
+                str_lit.markdown("### Verifica soglie totali")
+                str_lit.dataframe(df20_soglie.round(3), use_container_width=True, hide_index=True)
+                str_lit.caption("Soglie testate: tiri 19,5/21,5/23,5; tiri in porta 7,5/8,5/9,5; angoli 8,5/9,5/10,5. Over significa totale reale strettamente superiore alla soglia.")
+            if not df20_tempo.empty:
+                str_lit.markdown("### Stabilità cronologica in tre blocchi")
+                str_lit.dataframe(df20_tempo.round(4), use_container_width=True, hide_index=True)
+            for _nome,_df,_file in (("metriche pooled","df20_pool","V20_2_metriche_pooled.csv"),("confronto baseline","df20_base","V20_2_confronto_baseline.csv"),("soglie","df20_soglie","V20_2_test_soglie.csv"),("stabilita temporale","df20_tempo","V20_2_stabilita_temporale.csv")):
+                _obj={"df20_pool":df20_pool,"df20_base":df20_base,"df20_soglie":df20_soglie,"df20_tempo":df20_tempo}[_df]
+                if not _obj.empty:
+                    str_lit.download_button(f"⬇️ Scarica {_nome} V20.2 CSV",data=_obj.to_csv(index=False).encode("utf-8-sig"),file_name=_file,mime="text/csv")
         else:
             str_lit.warning(
                 "Non ci sono ancora abbastanza osservazioni precedenti per valutare le statistiche. "
