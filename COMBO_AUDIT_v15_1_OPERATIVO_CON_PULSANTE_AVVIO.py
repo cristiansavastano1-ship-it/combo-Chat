@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V20.5",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V20.5.1",
     layout="wide",
     page_icon="⚽",
 )
@@ -619,18 +619,32 @@ def crea_audit_v205_calibrazione(df_pred, bootstrap_reps=1000, seed=205, blocco_
                 if len(g)<10: continue
                 bm,lm=losses(g.p_model,g.y); bb,lb=losses(g.p_base,g.y)
                 gruppi.append({"Statistica":nome,"Soglia Over":th,"Competizione":comp,"Stagione":stag,"N":len(g),"Brier modello":bm.mean(),"Brier baseline":bb.mean(),"Delta Brier":(bm-bb).mean(),"LogLoss modello":lm.mean(),"LogLoss baseline":lb.mean(),"Delta LogLoss":(lm-lb).mean(),"Scarto calibrazione assoluto (pp)":abs(100*(g.p_model.mean()-g.y.mean()))})
-            # Bootstrap a blocchi di 7 date distinte, mantenendo unite tutte le partite della stessa data.
-            z=z.sort_values("Data"); dates=np.array(sorted(z.Data.unique())); date_groups={d:z[z.Data==d] for d in dates}
-            if len(dates)<20: continue
-            blocks=[dates[i:i+blocco_date] for i in range(0,len(dates),blocco_date)]
-            if len(blocks)<3: continue
-            dif_b=[]; dif_l=[]
-            for _ in range(bootstrap_reps):
-                chosen=rng.integers(0,len(blocks),size=len(blocks))
-                sample=pd.concat([date_groups[d] for bi in chosen for d in blocks[bi]],ignore_index=True)
-                mbr,mlr=losses(sample.p_model,sample.y); bbr,blr=losses(sample.p_base,sample.y)
-                dif_b.append(float(np.mean(mbr-bbr))); dif_l.append(float(np.mean(mlr-blr)))
-            boot.append({"Statistica":nome,"Soglia Over":th,"N partite":len(z),"N blocchi date":len(blocks),"Date per blocco":blocco_date,"Delta Brier medio modello-baseline":float(np.mean(dif_b)),"IC95 Delta Brier inf":float(np.quantile(dif_b,.025)),"IC95 Delta Brier sup":float(np.quantile(dif_b,.975)),"Bootstrap Brier modello migliore (%)":100*float(np.mean(np.array(dif_b)<0)),"Delta LogLoss medio modello-baseline":float(np.mean(dif_l)),"IC95 Delta LogLoss inf":float(np.quantile(dif_l,.025)),"IC95 Delta LogLoss sup":float(np.quantile(dif_l,.975)),"Bootstrap LogLoss modello migliore (%)":100*float(np.mean(np.array(dif_l)<0))})
+            # Bootstrap temporale ottimizzato: prima aggrega le differenze di loss per data,
+            # poi ricampiona blocchi contigui di date senza ricostruire DataFrame ad ogni replica.
+            z=z.sort_values("Data").copy()
+            dates=np.array(sorted(z["Data"].dropna().unique()))
+            if len(dates)<20:
+                continue
+            date_values=z["Data"].to_numpy()
+            model_brier, model_ll=losses(z.p_model.to_numpy(),z.y.to_numpy())
+            base_brier, base_ll=losses(z.p_base.to_numpy(),z.y.to_numpy())
+            tmp=pd.DataFrame({"Data":date_values,"d_brier":model_brier-base_brier,"d_logloss":model_ll-base_ll,"n":1})
+            per_date=tmp.groupby("Data",sort=True).agg(sum_brier=("d_brier","sum"),sum_logloss=("d_logloss","sum"),n=("n","sum")).reset_index()
+            blocks=[]
+            for start in range(0,len(per_date),blocco_date):
+                bg=per_date.iloc[start:start+blocco_date]
+                if not bg.empty:
+                    blocks.append((float(bg.sum_brier.sum()),float(bg.sum_logloss.sum()),int(bg.n.sum())))
+            if len(blocks)<3:
+                continue
+            block_b=np.asarray([v[0] for v in blocks],dtype=float)
+            block_l=np.asarray([v[1] for v in blocks],dtype=float)
+            block_n=np.asarray([v[2] for v in blocks],dtype=float)
+            chosen=rng.integers(0,len(blocks),size=(bootstrap_reps,len(blocks)))
+            den=block_n[chosen].sum(axis=1)
+            dif_b=block_b[chosen].sum(axis=1)/den
+            dif_l=block_l[chosen].sum(axis=1)/den
+            boot.append({"Statistica":nome,"Soglia Over":th,"N partite":len(z),"N blocchi date":len(blocks),"Date per blocco":blocco_date,"Delta Brier medio modello-baseline":float(np.mean(dif_b)),"IC95 Delta Brier inf":float(np.quantile(dif_b,.025)),"IC95 Delta Brier sup":float(np.quantile(dif_b,.975)),"Bootstrap Brier modello migliore (%)":100*float(np.mean(dif_b<0)),"Delta LogLoss medio modello-baseline":float(np.mean(dif_l)),"IC95 Delta LogLoss inf":float(np.quantile(dif_l,.025)),"IC95 Delta LogLoss sup":float(np.quantile(dif_l,.975)),"Bootstrap LogLoss modello migliore (%)":100*float(np.mean(dif_l<0))})
     return pd.DataFrame(calib),pd.DataFrame(gruppi),pd.DataFrame(boot)
 
 def poisson_prob(lmbda, k):
@@ -1583,10 +1597,11 @@ with tab_audit:
                 str_lit.dataframe(df204_prob.round(5), use_container_width=True, hide_index=True)
                 str_lit.caption("Delta negativi Brier/LogLoss favoriscono il modello. L'ipotesi Poisson è esplorativa: prima di qualsiasi uso operativo servono calibrazione out-of-sample e verifica di valore contro quote reali.")
                 str_lit.download_button("⬇️ Scarica V20.4 probabilità esplorative CSV",data=df204_prob.to_csv(index=False).encode("utf-8-sig"),file_name="V20_4_over_under_probabilita_esplorative.csv",mime="text/csv")
-            # V20.5: calibrazione descrittiva e robustezza temporale, sempre Audit-only.
-            str_lit.markdown("## 🧪 V20.5 — Calibrazione Over/Under e robustezza temporale")
+            # V20.5.1: stessa analisi V20.5, bootstrap temporale ottimizzato; Audit-only.
+            str_lit.markdown("## 🧪 V20.5.1 — Calibrazione Over/Under e robustezza temporale")
             str_lit.caption("Fasce di affidabilità per campionato/stagione e bootstrap appaiato a blocchi di 7 date distinte. Analisi diagnostica: nessuna probabilità viene attivata nelle schedine.")
-            df205_cal, df205_group, df205_block = crea_audit_v205_calibrazione(df_stat_pred)
+            with str_lit.spinner("Calcolo calibrazione Over/Under e bootstrap temporale V20.5..."):
+                df205_cal, df205_group, df205_block = crea_audit_v205_calibrazione(df_stat_pred)
             if not df205_cal.empty:
                 str_lit.markdown("### Affidabilità: probabilità previste contro frequenze Over osservate")
                 str_lit.dataframe(df205_cal.round(4), use_container_width=True, hide_index=True)
