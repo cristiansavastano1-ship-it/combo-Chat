@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V20.4",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V20.5",
     layout="wide",
     page_icon="⚽",
 )
@@ -581,6 +581,57 @@ def crea_audit_statistiche_v204(df_pred, bootstrap_reps=1000, seed=204):
             bm,lm=metrics(pm); bb,lll=metrics(pb)
             prob.append({"Statistica":nome,"Soglia Over":th,"N":len(z),"Brier Poisson modello":bm,"Brier baseline Poisson":bb,"Delta Brier modello-baseline":bm-bb,"LogLoss Poisson modello":lm,"LogLoss baseline Poisson":lll,"Delta LogLoss modello-baseline":lm-lll,"Prevalenza Over reale (%)":100*float(y.mean()),"Nota":"Probabilita' esplorative da ipotesi Poisson; non calibrate e non utilizzabili come value bet"})
     return pd.DataFrame(gruppi),pd.DataFrame(ci),pd.DataFrame(prob)
+
+
+def crea_audit_v205_calibrazione(df_pred, bootstrap_reps=1000, seed=205, blocco_date=7):
+    """V20.5 Audit-only: affidabilita' probabilita' Poisson e bootstrap a blocchi di date."""
+    if df_pred is None or df_pred.empty or "Data" not in df_pred.columns:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    specs = {
+        "Tiri totali": ("Tiri totali casa prevista", "Tiri totali trasferta prevista", "Tiri totali casa baseline", "Tiri totali trasferta baseline", "Tiri totali casa reale", "Tiri totali trasferta reale", [19.5,21.5,23.5]),
+        "Tiri in porta": ("Tiri in porta casa prevista", "Tiri in porta trasferta prevista", "Tiri in porta casa baseline", "Tiri in porta trasferta baseline", "Tiri in porta casa reale", "Tiri in porta trasferta reale", [7.5,8.5,9.5]),
+        "Angoli": ("Angoli casa prevista", "Angoli trasferta prevista", "Angoli casa baseline", "Angoli trasferta baseline", "Angoli casa reale", "Angoli trasferta reale", [8.5,9.5,10.5]),
+    }
+    def tail(lam, th):
+        lam=max(0.0,float(lam)); k=int(np.floor(th)); term=np.exp(-lam); cdf=term
+        for j in range(1,k+1): term*=lam/j; cdf+=term
+        return float(np.clip(1-cdf,1e-9,1-1e-9))
+    def losses(prob, y):
+        prob=np.clip(np.asarray(prob,dtype=float),1e-9,1-1e-9); y=np.asarray(y,dtype=float)
+        return (prob-y)**2, -(y*np.log(prob)+(1-y)*np.log(1-prob))
+    calib=[]; gruppi=[]; boot=[]; rng=np.random.default_rng(seed)
+    for nome, cols in specs.items():
+        pc,pt,bc,bt,rc,rt,levels=cols
+        required=["Data","Competizione","Stagione",pc,pt,bc,bt,rc,rt]
+        if not all(c in df_pred.columns for c in required): continue
+        base=df_pred[required].copy().dropna(subset=[pc,pt,bc,bt,rc,rt])
+        base["Data"]=pd.to_datetime(base["Data"],errors="coerce")
+        base=base.dropna(subset=["Data"])
+        for th in levels:
+            z=base.copy(); z["y"]=(z[rc]+z[rt]>th).astype(int)
+            z["p_model"]=[tail(v,th) for v in (z[pc]+z[pt])]
+            z["p_base"]=[tail(v,th) for v in (z[bc]+z[bt])]
+            z["Fascia probabilita"] = pd.cut(z.p_model, bins=[0,.2,.4,.6,.8,1.000001], labels=["0-20%","20-40%","40-60%","60-80%","80-100%"], include_lowest=True)
+            for (comp,stag,fascia),g in z.groupby(["Competizione","Stagione","Fascia probabilita"],observed=False,dropna=False):
+                if len(g)==0: continue
+                calib.append({"Statistica":nome,"Soglia Over":th,"Competizione":comp,"Stagione":stag,"Fascia probabilita":str(fascia),"N":len(g),"Probabilita media prevista (%)":100*g.p_model.mean(),"Over reali (%)":100*g.y.mean(),"Scarto calibrazione (pp)":100*(g.p_model.mean()-g.y.mean()),"Brier":np.mean((g.p_model-g.y)**2),"Affidabilita campione":"Adeguato (N≥30)" if len(g)>=30 else "Limitato (N<30)"})
+            for (comp,stag),g in z.groupby(["Competizione","Stagione"],dropna=False):
+                if len(g)<10: continue
+                bm,lm=losses(g.p_model,g.y); bb,lb=losses(g.p_base,g.y)
+                gruppi.append({"Statistica":nome,"Soglia Over":th,"Competizione":comp,"Stagione":stag,"N":len(g),"Brier modello":bm.mean(),"Brier baseline":bb.mean(),"Delta Brier":(bm-bb).mean(),"LogLoss modello":lm.mean(),"LogLoss baseline":lb.mean(),"Delta LogLoss":(lm-lb).mean(),"Scarto calibrazione assoluto (pp)":abs(100*(g.p_model.mean()-g.y.mean()))})
+            # Bootstrap a blocchi di 7 date distinte, mantenendo unite tutte le partite della stessa data.
+            z=z.sort_values("Data"); dates=np.array(sorted(z.Data.unique())); date_groups={d:z[z.Data==d] for d in dates}
+            if len(dates)<20: continue
+            blocks=[dates[i:i+blocco_date] for i in range(0,len(dates),blocco_date)]
+            if len(blocks)<3: continue
+            dif_b=[]; dif_l=[]
+            for _ in range(bootstrap_reps):
+                chosen=rng.integers(0,len(blocks),size=len(blocks))
+                sample=pd.concat([date_groups[d] for bi in chosen for d in blocks[bi]],ignore_index=True)
+                mbr,mlr=losses(sample.p_model,sample.y); bbr,blr=losses(sample.p_base,sample.y)
+                dif_b.append(float(np.mean(mbr-bbr))); dif_l.append(float(np.mean(mlr-blr)))
+            boot.append({"Statistica":nome,"Soglia Over":th,"N partite":len(z),"N blocchi date":len(blocks),"Date per blocco":blocco_date,"Delta Brier medio modello-baseline":float(np.mean(dif_b)),"IC95 Delta Brier inf":float(np.quantile(dif_b,.025)),"IC95 Delta Brier sup":float(np.quantile(dif_b,.975)),"Bootstrap Brier modello migliore (%)":100*float(np.mean(np.array(dif_b)<0)),"Delta LogLoss medio modello-baseline":float(np.mean(dif_l)),"IC95 Delta LogLoss inf":float(np.quantile(dif_l,.025)),"IC95 Delta LogLoss sup":float(np.quantile(dif_l,.975)),"Bootstrap LogLoss modello migliore (%)":100*float(np.mean(np.array(dif_l)<0))})
+    return pd.DataFrame(calib),pd.DataFrame(gruppi),pd.DataFrame(boot)
 
 def poisson_prob(lmbda, k):
     return (math.exp(-lmbda) * (lmbda**k)) / math.factorial(k)
@@ -1386,7 +1437,7 @@ with tab_monte_carlo:
 # --- TAB 8: AUDIT ---
 with tab_audit:
     str_lit.subheader("🛡️ Audit statistico: Pareggio X e Goal / No Goal")
-    str_lit.info("Versione diagnostica V20.4: audit storico e test statistici completi; calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
+    str_lit.info("Versione diagnostica V20.5: audit storico e test statistici completi; calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
     str_lit.caption(
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
@@ -1532,6 +1583,24 @@ with tab_audit:
                 str_lit.dataframe(df204_prob.round(5), use_container_width=True, hide_index=True)
                 str_lit.caption("Delta negativi Brier/LogLoss favoriscono il modello. L'ipotesi Poisson è esplorativa: prima di qualsiasi uso operativo servono calibrazione out-of-sample e verifica di valore contro quote reali.")
                 str_lit.download_button("⬇️ Scarica V20.4 probabilità esplorative CSV",data=df204_prob.to_csv(index=False).encode("utf-8-sig"),file_name="V20_4_over_under_probabilita_esplorative.csv",mime="text/csv")
+            # V20.5: calibrazione descrittiva e robustezza temporale, sempre Audit-only.
+            str_lit.markdown("## 🧪 V20.5 — Calibrazione Over/Under e robustezza temporale")
+            str_lit.caption("Fasce di affidabilità per campionato/stagione e bootstrap appaiato a blocchi di 7 date distinte. Analisi diagnostica: nessuna probabilità viene attivata nelle schedine.")
+            df205_cal, df205_group, df205_block = crea_audit_v205_calibrazione(df_stat_pred)
+            if not df205_cal.empty:
+                str_lit.markdown("### Affidabilità: probabilità previste contro frequenze Over osservate")
+                str_lit.dataframe(df205_cal.round(4), use_container_width=True, hide_index=True)
+                str_lit.caption("Scarto positivo: probabilità media superiore alla frequenza Over osservata; scarto negativo: probabilità media inferiore. Le fasce con N<30 sono indicative e poco stabili.")
+                str_lit.download_button("⬇️ Scarica V20.5 calibrazione per fascia CSV",data=df205_cal.to_csv(index=False).encode("utf-8-sig"),file_name="V20_5_calibrazione_fasce.csv",mime="text/csv")
+            if not df205_group.empty:
+                str_lit.markdown("### Metriche probabilistiche per campionato e stagione")
+                str_lit.dataframe(df205_group.round(5), use_container_width=True, hide_index=True)
+                str_lit.download_button("⬇️ Scarica V20.5 metriche campionato/stagione CSV",data=df205_group.to_csv(index=False).encode("utf-8-sig"),file_name="V20_5_metriche_campionato_stagione.csv",mime="text/csv")
+            if not df205_block.empty:
+                str_lit.markdown("### Bootstrap temporale a blocchi di 7 date")
+                str_lit.dataframe(df205_block.round(5), use_container_width=True, hide_index=True)
+                str_lit.caption("Delta negativi favoriscono il modello. I blocchi contengono tutte le partite delle date selezionate; IC che attraversa zero indicano evidenza non conclusiva. Il bootstrap a blocchi riduce, ma non elimina, il rischio di dipendenze temporali.")
+                str_lit.download_button("⬇️ Scarica V20.5 bootstrap temporale CSV",data=df205_block.to_csv(index=False).encode("utf-8-sig"),file_name="V20_5_bootstrap_blocchi_date.csv",mime="text/csv")
         else:
             str_lit.warning(
                 "Non ci sono ancora abbastanza osservazioni precedenti per valutare le statistiche. "
