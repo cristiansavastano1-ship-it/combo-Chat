@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V19.9",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V20.1",
     layout="wide",
     page_icon="⚽",
 )
@@ -246,6 +246,225 @@ def carica_storico_audit_gratuito():
         })
 
     return risultati, pd.DataFrame(diagnostica), pd.DataFrame(copertura)
+
+
+
+# --- V20.1: TEST WALK-FORWARD COMPLETO DELLE STATISTICHE DI SQUADRA ---
+STATISTICHE_V201 = {
+    "Angoli": ("Angoli casa", "Angoli trasferta"),
+    "Tiri totali": ("Tiri casa", "Tiri trasferta"),
+    "Tiri in porta": ("Tiri in porta casa", "Tiri in porta trasferta"),
+    "Falli": ("Falli casa", "Falli trasferta"),
+    "Ammonizioni": ("Ammonizioni casa", "Ammonizioni trasferta"),
+    "Espulsioni": ("Espulsioni casa", "Espulsioni trasferta"),
+}
+
+def _media_recenti_v201(valori, finestra=10, minimo=3):
+    """Media degli ultimi valori già osservati; None se lo storico è insufficiente."""
+    if len(valori) < minimo:
+        return None
+    campione = valori[-finestra:]
+    return float(np.mean(campione)) if campione else None
+
+
+def crea_test_statistiche_v201(matches_list, finestra=10, minimo_storico=3):
+    """
+    Testa tutte le statistiche in un unico walk-forward cronologico.
+    Le partite della stessa data sono tutte previste prima di aggiornare lo storico:
+    nessuna partita può quindi usare dati di un'altra partita dello stesso giorno.
+    Per ciascuna squadra/stadio la stima combina:
+      - media recente della squadra nel proprio ruolo (casa/trasferta);
+      - media recente concessa dall'avversaria nel ruolo opposto.
+    Il test è diagnostico: non modifica il modello operativo.
+    """
+    if not matches_list:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    righe = []
+    for m in matches_list:
+        try:
+            data = pd.to_datetime(m.get("utcDate"), utc=True, errors="coerce")
+            comp = m.get("Competizione", "N/D")
+            casa = m.get("homeTeam", {}).get("name", "")
+            trasf = m.get("awayTeam", {}).get("name", "")
+            stats = m.get("statistichePartita", {}) or {}
+            if pd.isna(data) or not casa or not trasf:
+                continue
+            valori = dict(stats)
+            # Totale cartellini = gialli + rossi; resta mancante se manca uno dei componenti.
+            for lato, giallo, rosso in (
+                ("casa", "Ammonizioni casa", "Espulsioni casa"),
+                ("trasferta", "Ammonizioni trasferta", "Espulsioni trasferta"),
+            ):
+                a, r = valori.get(giallo), valori.get(rosso)
+                valori[f"Cartellini totali {lato}"] = (
+                    float(a) + float(r) if a is not None and r is not None else None
+                )
+            righe.append({
+                "data": data.normalize(), "competizione": comp,
+                "stagione": m.get("Stagione audit", "N/D"),
+                "casa": casa, "trasferta": trasf, "valori": valori,
+            })
+        except Exception:
+            continue
+
+    if not righe:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    righe.sort(key=lambda x: (x["data"], x["competizione"], x["casa"], x["trasferta"]))
+    # Storico per competizione, squadra e ruolo: fatti e concessi.
+    storico = {}
+    metriche = dict(STATISTICHE_V201)
+    metriche["Cartellini totali"] = ("Cartellini totali casa", "Cartellini totali trasferta")
+    predizioni = []
+
+    def chiave(comp, team, ruolo):
+        return (comp, team, ruolo)
+
+    i = 0
+    while i < len(righe):
+        giorno = righe[i]["data"]
+        gruppo = []
+        while i < len(righe) and righe[i]["data"] == giorno:
+            gruppo.append(righe[i])
+            i += 1
+
+        # Prima si producono tutte le previsioni del giorno.
+        for m in gruppo:
+            comp, casa, trasf = m["competizione"], m["casa"], m["trasferta"]
+            out = {"Data": giorno, "Competizione": comp,
+                   "Stagione": m.get("stagione", "N/D"),
+                   "Casa": casa, "Trasferta": trasf}
+            for nome, (col_casa, col_trasf) in metriche.items():
+                hc = storico.get(chiave(comp, casa, "casa"), {}).get(nome, {"fatti": [], "concessi": []})
+                at = storico.get(chiave(comp, trasf, "trasferta"), {}).get(nome, {"fatti": [], "concessi": []})
+                ht = storico.get(chiave(comp, casa, "casa"), {}).get(nome, {"fatti": [], "concessi": []})
+                ac = storico.get(chiave(comp, trasf, "trasferta"), {}).get(nome, {"fatti": [], "concessi": []})
+                # Stima casa: attacco casa + concessi dell'avversaria in trasferta.
+                media_att_c = _media_recenti_v201(hc["fatti"], finestra, minimo_storico)
+                media_conc_t = _media_recenti_v201(at["concessi"], finestra, minimo_storico)
+                # Stima trasferta: attacco trasferta + concessi della squadra di casa.
+                media_att_t = _media_recenti_v201(at["fatti"], finestra, minimo_storico)
+                media_conc_c = _media_recenti_v201(hc["concessi"], finestra, minimo_storico)
+                stima_c = np.mean([media_att_c, media_conc_t]) if media_att_c is not None and media_conc_t is not None else None
+                stima_t = np.mean([media_att_t, media_conc_c]) if media_att_t is not None and media_conc_c is not None else None
+                reale_c, reale_t = m["valori"].get(col_casa), m["valori"].get(col_trasf)
+                out[f"{nome} casa prevista"] = float(stima_c) if stima_c is not None else np.nan
+                out[f"{nome} trasferta prevista"] = float(stima_t) if stima_t is not None else np.nan
+                out[f"{nome} casa reale"] = reale_c if reale_c is not None else np.nan
+                out[f"{nome} trasferta reale"] = reale_t if reale_t is not None else np.nan
+                out[f"{nome} storico casa"] = min(len(hc["fatti"]), finestra)
+                out[f"{nome} storico trasferta"] = min(len(at["fatti"]), finestra)
+            predizioni.append(out)
+
+        # Solo dopo aver previsto l'intera giornata, si aggiornano gli storici.
+        for m in gruppo:
+            comp, casa, trasf = m["competizione"], m["casa"], m["trasferta"]
+            for nome, (col_casa, col_trasf) in metriche.items():
+                vc, vt = m["valori"].get(col_casa), m["valori"].get(col_trasf)
+                if vc is not None:
+                    k = chiave(comp, casa, "casa")
+                    storico.setdefault(k, {}).setdefault(nome, {"fatti": [], "concessi": []})
+                    storico[k][nome]["fatti"].append(float(vc))
+                if vt is not None:
+                    k = chiave(comp, trasf, "trasferta")
+                    storico.setdefault(k, {}).setdefault(nome, {"fatti": [], "concessi": []})
+                    storico[k][nome]["fatti"].append(float(vt))
+                # Valori concessi aggiornati nello storico dell'altra squadra/ruolo.
+                if vt is not None:
+                    k = chiave(comp, casa, "casa")
+                    storico.setdefault(k, {}).setdefault(nome, {"fatti": [], "concessi": []})
+                    storico[k][nome]["concessi"].append(float(vt))
+                if vc is not None:
+                    k = chiave(comp, trasf, "trasferta")
+                    storico.setdefault(k, {}).setdefault(nome, {"fatti": [], "concessi": []})
+                    storico[k][nome]["concessi"].append(float(vc))
+
+    df_pred = pd.DataFrame(predizioni)
+    metriche_rows = []
+    dettaglio_rows = []
+    for nome in metriche:
+        pc, rc = f"{nome} casa prevista", f"{nome} casa reale"
+        pt, rt = f"{nome} trasferta prevista", f"{nome} trasferta reale"
+        coppie = []
+        for lato, cp, cr in (("Casa", pc, rc), ("Trasferta", pt, rt)):
+            sub = df_pred[[cp, cr]].dropna()
+            if not sub.empty:
+                err = sub[cp] - sub[cr]
+                metriche_rows.append({
+                    "Statistica": nome, "Lato": lato, "Previsioni valutate": len(sub),
+                    "MAE": float(np.mean(np.abs(err))),
+                    "RMSE": float(np.sqrt(np.mean(err ** 2))),
+                    "Bias previsto-reale": float(np.mean(err)),
+                    "Media prevista": float(sub[cp].mean()),
+                    "Media reale": float(sub[cr].mean()),
+                })
+        # Accuracy del confronto tra le due squadre solo sulle partite con entrambi i lati completi.
+        valid = df_pred[[pc, pt, rc, rt]].dropna()
+        if not valid.empty:
+            pred_segno = np.sign(valid[pc] - valid[pt])
+            reale_segno = np.sign(valid[rc] - valid[rt])
+            non_pari = reale_segno != 0
+            valutabili = int(non_pari.sum())
+            accuracy = float((pred_segno[non_pari] == reale_segno[non_pari]).mean() * 100) if valutabili else np.nan
+            metriche_rows.append({
+                "Statistica": nome, "Lato": "Confronto squadre",
+                "Previsioni valutate": len(valid),
+                "MAE": np.nan, "RMSE": np.nan, "Bias previsto-reale": np.nan,
+                "Media prevista": np.nan, "Media reale": np.nan,
+                "Accuratezza squadra con valore maggiore (%)": accuracy,
+                "Partite senza parità reale": valutabili,
+                "Parità reale escluse": int((~non_pari).sum()),
+            })
+    df_metriche = pd.DataFrame(metriche_rows)
+    # Dettaglio compatto: una riga per partita/statistica, utile per controlli ed export.
+    for nome in metriche:
+        for lato, cp, cr in (
+            ("Casa", f"{nome} casa prevista", f"{nome} casa reale"),
+            ("Trasferta", f"{nome} trasferta prevista", f"{nome} trasferta reale"),
+        ):
+            tmp = df_pred[["Data", "Competizione", "Casa", "Trasferta", cp, cr]].copy()
+            tmp["Statistica"] = nome
+            tmp["Lato"] = lato
+            tmp.rename(columns={cp: "Previsto", cr: "Reale"}, inplace=True)
+            tmp["Errore previsto-reale"] = tmp["Previsto"] - tmp["Reale"]
+            dettaglio_rows.append(tmp)
+    df_dettaglio = pd.concat(dettaglio_rows, ignore_index=True) if dettaglio_rows else pd.DataFrame()
+
+    # Metriche disaggregate per campionato e stagione, oltre al totale generale.
+    righe_gruppi = []
+    for (comp, stagione), grp in df_pred.groupby(["Competizione", "Stagione"], dropna=False):
+        for nome in metriche:
+            pc, rc = f"{nome} casa prevista", f"{nome} casa reale"
+            pt, rt = f"{nome} trasferta prevista", f"{nome} trasferta reale"
+            for lato, cp, cr in (("Casa", pc, rc), ("Trasferta", pt, rt)):
+                sub = grp[[cp, cr]].dropna()
+                if len(sub):
+                    err = sub[cp] - sub[cr]
+                    righe_gruppi.append({
+                        "Competizione": comp, "Stagione": stagione,
+                        "Statistica": nome, "Lato": lato,
+                        "Previsioni valutate": len(sub),
+                        "MAE": float(np.mean(np.abs(err))),
+                        "RMSE": float(np.sqrt(np.mean(err ** 2))),
+                        "Bias previsto-reale": float(np.mean(err)),
+                    })
+            valid = grp[[pc, pt, rc, rt]].dropna()
+            if len(valid):
+                ps = np.sign(valid[pc] - valid[pt])
+                rs = np.sign(valid[rc] - valid[rt])
+                mask = rs != 0
+                righe_gruppi.append({
+                    "Competizione": comp, "Stagione": stagione,
+                    "Statistica": nome, "Lato": "Confronto squadre",
+                    "Previsioni valutate": len(valid),
+                    "Accuratezza squadra con valore maggiore (%)":
+                        float((ps[mask] == rs[mask]).mean() * 100) if mask.any() else np.nan,
+                    "Partite senza parità reale": int(mask.sum()),
+                    "Parità reale escluse": int((~mask).sum()),
+                })
+    df_gruppi = pd.DataFrame(righe_gruppi)
+    return df_pred, df_metriche, df_dettaglio, df_gruppi
 
 
 def poisson_prob(lmbda, k):
@@ -1052,7 +1271,7 @@ with tab_monte_carlo:
 # --- TAB 8: AUDIT ---
 with tab_audit:
     str_lit.subheader("🛡️ Audit statistico: Pareggio X e Goal / No Goal")
-    str_lit.info("Versione diagnostica V19.7.5: calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
+    str_lit.info("Versione diagnostica V20.1: audit storico e test statistici completi; calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
     str_lit.caption(
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
@@ -1092,6 +1311,71 @@ with tab_audit:
         )
     else:
         str_lit.warning("Nessun dato statistico disponibile per il controllo della copertura.")
+
+    # V20.1: tutti i mercati statistici vengono testati insieme, solo in modalità Audit.
+    str_lit.markdown("## 🧪 V20.1 — Test walk-forward completo statistiche squadre")
+    str_lit.caption(
+        "Test unico per angoli, tiri, tiri in porta, falli, ammonizioni, espulsioni e cartellini totali. "
+        "Le previsioni di ogni data sono calcolate prima di aggiornare lo storico con i risultati di quella stessa data. "
+        "Nessuna modifica al modello operativo."
+    )
+    if matches_audit:
+        with str_lit.spinner("Esecuzione test walk-forward di tutte le statistiche..."):
+            df_stat_pred, df_stat_metriche, df_stat_dettaglio, df_stat_gruppi = crea_test_statistiche_v201(
+                matches_audit, finestra=10, minimo_storico=3
+            )
+        if not df_stat_metriche.empty:
+            str_lit.markdown("### Risultati aggregati")
+            str_lit.dataframe(df_stat_metriche.round(4), use_container_width=True, hide_index=True)
+            str_lit.caption(
+                "MAE/RMSE sono espressi nelle unità della statistica (es. numero di angoli). "
+                "Bias positivo = sovrastima; bias negativo = sottostima. "
+                "L'accuratezza del confronto squadre esclude i pareggi reali."
+            )
+            riepilogo = (
+                df_stat_metriche[df_stat_metriche["Lato"] != "Confronto squadre"]
+                .groupby("Statistica", as_index=False)
+                .agg({"Previsioni valutate": "sum", "MAE": "mean", "RMSE": "mean",
+                      "Bias previsto-reale": "mean"})
+            )
+            confronto = df_stat_metriche[df_stat_metriche["Lato"] == "Confronto squadre"][
+                ["Statistica", "Accuratezza squadra con valore maggiore (%)",
+                 "Partite senza parità reale", "Parità reale escluse"]
+            ]
+            riepilogo = riepilogo.merge(confronto, on="Statistica", how="left")
+            str_lit.markdown("### Classifica sintetica delle statistiche")
+            str_lit.dataframe(riepilogo.round(4), use_container_width=True, hide_index=True)
+            str_lit.markdown("### Risultati per campionato e stagione")
+            if not df_stat_gruppi.empty:
+                str_lit.dataframe(df_stat_gruppi.round(4), use_container_width=True, hide_index=True)
+                str_lit.download_button(
+                    "⬇️ Scarica metriche per campionato/stagione CSV",
+                    data=df_stat_gruppi.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="V20_1_metriche_per_campionato_stagione.csv",
+                    mime="text/csv",
+                )
+            str_lit.download_button(
+                "⬇️ Scarica metriche V20.1 CSV",
+                data=df_stat_metriche.to_csv(index=False).encode("utf-8-sig"),
+                file_name="V20_1_metriche_walk_forward_statistiche.csv",
+                mime="text/csv",
+            )
+            str_lit.download_button(
+                "⬇️ Scarica dettaglio previsioni V20.1 CSV",
+                data=df_stat_dettaglio.to_csv(index=False).encode("utf-8-sig"),
+                file_name="V20_1_dettaglio_walk_forward_statistiche.csv",
+                mime="text/csv",
+            )
+            with str_lit.expander("Dettaglio previsioni e risultati partita per partita"):
+                str_lit.dataframe(df_stat_dettaglio, use_container_width=True, hide_index=True)
+        else:
+            str_lit.warning(
+                "Non ci sono ancora abbastanza osservazioni precedenti per valutare le statistiche. "
+                "Servono almeno 3 partite storiche per squadra e ruolo."
+            )
+    else:
+        str_lit.warning("Test V20.1 non eseguito: storico gratuito non disponibile.")
+
     if matches_audit:
         df_audit = crea_audit_walk_forward(matches_audit)
     else:
