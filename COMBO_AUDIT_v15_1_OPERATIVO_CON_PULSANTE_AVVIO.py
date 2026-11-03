@@ -1642,6 +1642,48 @@ with tab_audit:
                     _summary207["Affidabilita campione"] = np.where(_summary207["Partite (N)"] >= 30, "Adeguato (N≥30)", "Limitato (N<30)")
                     str_lit.caption("Per ogni statistica, competizione e stagione: delta negativi favoriscono il modello. PASS di gruppo richiede N≥30 e tutte le soglie disponibili migliori della baseline sia in Brier sia in LogLoss. I gruppi piccoli restano indicativi.")
                     str_lit.dataframe(_summary207.round(5), use_container_width=True, hide_index=True)
+
+                    # V20.8 — lettura guidata delle criticità. Solo presentazione Audit:
+                    # usa i delta già calcolati da V20.5 e non modifica il modello.
+                    str_lit.markdown("### 🚦 V20.8 — Sintesi delle soglie da verificare")
+                    _both_bad208 = _g207[( _g207["Delta Brier"] > 0) & (_g207["Delta LogLoss"] > 0)].copy()
+                    _one_bad208 = _g207[((_g207["Delta Brier"] > 0) | (_g207["Delta LogLoss"] > 0)) & ~((_g207["Delta Brier"] > 0) & (_g207["Delta LogLoss"] > 0))].copy()
+                    _c1, _c2, _c3 = str_lit.columns(3)
+                    _c1.metric("Soglie valutate", int(len(_g207)))
+                    _c2.metric("Peggiori su entrambe", int(len(_both_bad208)))
+                    _c3.metric("Peggiori su almeno una", int(len(_both_bad208) + len(_one_bad208)))
+                    str_lit.caption("Una soglia è segnalata come criticità doppia solo quando Delta Brier e Delta LogLoss sono entrambi positivi: in quel caso il modello è peggiore della baseline su entrambe le metriche. Un solo delta positivo indica risultato misto, non un fallimento complessivo.")
+                    if not _both_bad208.empty:
+                        str_lit.warning("Attenzione: queste soglie risultano peggiori della baseline sia in Brier sia in LogLoss.")
+                        _both_show208 = ["Statistica", "Competizione", "Stagione", "Soglia Over", "N", "Delta Brier", "Delta LogLoss"]
+                        str_lit.dataframe(_both_bad208[_both_show208].sort_values(["Statistica", "Competizione", "Stagione", "Soglia Over"]).round(5), use_container_width=True, hide_index=True)
+                    else:
+                        str_lit.success("Nessuna soglia risulta peggiore della baseline contemporaneamente su Brier e LogLoss.")
+                    if not _one_bad208.empty:
+                        with str_lit.expander("Mostra risultati misti: una metrica peggiora e l'altra migliora", expanded=False):
+                            _one_show208 = ["Statistica", "Competizione", "Stagione", "Soglia Over", "N", "Delta Brier", "Esito Brier", "Delta LogLoss", "Esito LogLoss"]
+                            str_lit.dataframe(_one_bad208[_one_show208].sort_values(["Statistica", "Competizione", "Stagione", "Soglia Over"]).round(5), use_container_width=True, hide_index=True)
+
+                    # Quadro per statistica e competizione, aggregando le stagioni senza
+                    # nascondere il dettaglio stagionale già mostrato sopra.
+                    _summary_comp208 = _g207.groupby(["Statistica", "Competizione"], dropna=False).agg(
+                        **{"Gruppi stagione": ("Stagione", "nunique"),
+                           "Soglie valutate": ("Soglia Over", "count"),
+                           "Soglie peggiori Brier": ("Esito Brier", lambda x: int((x != "PASS").sum())),
+                           "Soglie peggiori LogLoss": ("Esito LogLoss", lambda x: int((x != "PASS").sum())),
+                           "Soglie peggiori entrambe": ("Esito entrambe", lambda x: int((x != "PASS").sum())),
+                           "N minimo": ("N", "min"),
+                           "Delta Brier medio": ("Delta Brier", "mean"),
+                           "Delta LogLoss medio": ("Delta LogLoss", "mean")}
+                    ).reset_index()
+                    _summary_comp208["Esito competizione"] = np.where(
+                        (_summary_comp208["Soglie peggiori entrambe"] == 0) & (_summary_comp208["N minimo"] >= 30),
+                        "PASS — nessuna criticità doppia", "ATTENZIONE — verificare dettaglio")
+                    str_lit.markdown("#### V20.8 — Riepilogo per statistica e competizione (stagioni aggregate)")
+                    str_lit.dataframe(_summary_comp208.round(5), use_container_width=True, hide_index=True)
+                    str_lit.download_button("⬇️ Scarica V20.8 criticità doppie CSV", data=_both_bad208.to_csv(index=False).encode("utf-8-sig"), file_name="V20_8_criticita_doppie.csv", mime="text/csv")
+                    str_lit.download_button("⬇️ Scarica V20.8 riepilogo competizioni CSV", data=_summary_comp208.to_csv(index=False).encode("utf-8-sig"), file_name="V20_8_riepilogo_statistica_competizione.csv", mime="text/csv")
+
                     str_lit.markdown("#### Dettaglio per singola soglia e gruppo")
                     _show207 = ["Statistica", "Competizione", "Stagione", "Soglia Over", "N", "Delta Brier", "Esito Brier", "Delta LogLoss", "Esito LogLoss", "Affidabilita campione"]
                     str_lit.dataframe(_g207[_show207].round(5), use_container_width=True, hide_index=True)
