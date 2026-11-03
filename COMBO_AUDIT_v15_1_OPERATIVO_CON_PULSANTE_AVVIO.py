@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Audit V21.2",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Audit V21.3",
     layout="wide",
     page_icon="⚽",
 )
@@ -1011,6 +1011,147 @@ def crea_diagnostica_calibrazione_v210(df_det):
     df_bins_source=crea_tabella_fasce(["Mercato", "Fonte quote"])
     df_bins_comp_source=crea_tabella_fasce(["Mercato", "Fonte quote", "Competizione"])
     return df_checks, df_comp, df_bins_source, df_bins_comp_source
+
+
+def crea_diagnostica_v213(df_audit):
+    """V21.3: confronto imparziale del modello con baseline bookmaker de-vig.
+
+    Valuta TUTTI gli esiti per ogni partita con quote complete, non soltanto
+    la selezione con EV massimo e positivo. Le probabilita' bookmaker sono
+    ricavate dalle quote reali e normalizzate per rimuovere il margine.
+    Solo Audit: nessuna probabilita' viene modificata o riutilizzata operativamente.
+    """
+    if df_audit is None or df_audit.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    d = df_audit.copy()
+    for c in ["P(1) %", "P(X) %", "P(2) %", "P(Over 2.5) %", "P(Under 2.5) %"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce") / 100.0
+    odds_cfg = {
+        "1X2": {
+            "Avg": (["Quota Avg_1", "Quota Avg_X", "Quota Avg_2"], ["1", "X", "2"], ["P(1) %", "P(X) %", "P(2) %"]),
+            "B365": (["Quota B365_1", "Quota B365_X", "Quota B365_2"], ["1", "X", "2"], ["P(1) %", "P(X) %", "P(2) %"]),
+        },
+        "Over/Under 2.5 gol": {
+            "Avg": (["Quota Avg_Over25", "Quota Avg_Under25"], ["Over 2.5", "Under 2.5"], ["P(Over 2.5) %", "P(Under 2.5) %"]),
+            "B365": (["Quota B365_Over25", "Quota B365_Under25"], ["Over 2.5", "Under 2.5"], ["P(Over 2.5) %", "P(Under 2.5) %"]),
+        },
+    }
+    rows=[]
+    bin_rows=[]
+    for market, books in odds_cfg.items():
+        for book, (odd_cols, labels, prob_cols) in books.items():
+            if not all(c in d.columns for c in odd_cols + prob_cols):
+                continue
+            odds_df=d[odd_cols].apply(pd.to_numeric, errors="coerce")
+            probs_df=d[prob_cols].apply(pd.to_numeric, errors="coerce")
+            valid=(odds_df.notna().all(axis=1) & (odds_df > 1).all(axis=1)
+                   & probs_df.notna().all(axis=1) & (probs_df >= 0).all(axis=1)
+                   & (probs_df.sum(axis=1) > 0.999) & (probs_df.sum(axis=1) < 1.001))
+            for idx in d.index[valid]:
+                row=d.loc[idx]
+                odds=odds_df.loc[idx].to_numpy(dtype=float)
+                model=probs_df.loc[idx].to_numpy(dtype=float)
+                inv=1.0/odds
+                book_probs=inv/inv.sum()
+                if market == "1X2":
+                    actual=str(row.get("Esito reale", ""))
+                else:
+                    gh=pd.to_numeric(pd.Series([row.get("Gol casa reali")]), errors="coerce").iloc[0]
+                    ga=pd.to_numeric(pd.Series([row.get("Gol trasferta reali")]), errors="coerce").iloc[0]
+                    if pd.isna(gh) or pd.isna(ga):
+                        continue
+                    actual="Over 2.5" if float(gh)+float(ga)>2.5 else "Under 2.5"
+                if actual not in labels:
+                    continue
+                y=np.array([1.0 if actual==lab else 0.0 for lab in labels])
+                brier_model=float(np.sum((model-y)**2))
+                brier_book=float(np.sum((book_probs-y)**2))
+                ll_model=float(-np.log(np.clip(model[labels.index(actual)],1e-12,1.0)))
+                ll_book=float(-np.log(np.clip(book_probs[labels.index(actual)],1e-12,1.0)))
+                evs=model*odds-1.0
+                best=int(np.argmax(evs))
+                for lab, pp in zip(labels, model):
+                    band=pd.cut(pd.Series([100*float(pp)]), bins=[0,10,20,30,40,50,60,70,80,90,100.000001], right=False, include_lowest=True).iloc[0]
+                    if pd.notna(band):
+                        bin_rows.append({"Mercato":market,"Fonte quote":book,"Competizione":row.get("Competizione"),"Esito":lab,"Fascia probabilita (%)":str(band),"Probabilita modello (%)":100*float(pp),"Esito (0/1)":int(actual==lab)})
+                rows.append({
+                    "Data":row.get("Data"), "Competizione":row.get("Competizione"),
+                    "Casa":row.get("Casa"), "Trasferta":row.get("Trasferta"),
+                    "Mercato":market, "Fonte quote":book, "Esito reale":actual,
+                    "Brier modello":brier_model, "Brier bookmaker de-vig":brier_book,
+                    "Delta Brier modello - bookmaker":brier_model-brier_book,
+                    "LogLoss modello":ll_model, "LogLoss bookmaker de-vig":ll_book,
+                    "Delta LogLoss modello - bookmaker":ll_model-ll_book,
+                    "Selezione EV massimo":labels[best],
+                    "Probabilita selezione modello (%)":100*float(model[best]),
+                    "Probabilita bookmaker de-vig selezione (%)":100*float(book_probs[best]),
+                    "Quota selezione":float(odds[best]), "EV selezione (%)":100*float(evs[best]),
+                    "EV selezione ricalcolato (%)":100*(float(model[best])*float(odds[best])-1.0),
+                    "Selezione vincente":int(labels[best]==actual),
+                    "Selezione EV positivo":int(evs[best]>0),
+                    "Somma probabilita modello (%)":100*float(model.sum()),
+                    "Somma probabilita bookmaker de-vig (%)":100*float(book_probs.sum()),
+                })
+    detail=pd.DataFrame(rows)
+    if detail.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    summary=[]
+    for keys,g in detail.groupby(["Mercato","Fonte quote"], dropna=False):
+        summary.append({"Mercato":keys[0],"Fonte quote":keys[1],"Partite comuni":len(g),
+            "Brier modello medio":g["Brier modello"].mean(),"Brier bookmaker de-vig medio":g["Brier bookmaker de-vig"].mean(),
+            "Delta Brier modello - bookmaker":g["Delta Brier modello - bookmaker"].mean(),
+            "LogLoss modello medio":g["LogLoss modello"].mean(),"LogLoss bookmaker de-vig medio":g["LogLoss bookmaker de-vig"].mean(),
+            "Delta LogLoss modello - bookmaker":g["Delta LogLoss modello - bookmaker"].mean(),
+            "EV massimo positivo (%)":100*g["Selezione EV positivo"].mean(),
+            "Numero selezioni EV positive":int(g["Selezione EV positivo"].sum())})
+    for keys,g in detail.groupby(["Mercato","Fonte quote","Competizione"], dropna=False):
+        summary.append({"Mercato":keys[0],"Fonte quote":keys[1],"Competizione":keys[2],"Partite comuni":len(g),
+            "Brier modello medio":g["Brier modello"].mean(),"Brier bookmaker de-vig medio":g["Brier bookmaker de-vig"].mean(),
+            "Delta Brier modello - bookmaker":g["Delta Brier modello - bookmaker"].mean(),
+            "LogLoss modello medio":g["LogLoss modello"].mean(),"LogLoss bookmaker de-vig medio":g["LogLoss bookmaker de-vig"].mean(),
+            "Delta LogLoss modello - bookmaker":g["Delta LogLoss modello - bookmaker"].mean(),
+            "EV massimo positivo (%)":100*g["Selezione EV positivo"].mean(),
+            "Numero selezioni EV positive":int(g["Selezione EV positivo"].sum())})
+    df_summary=pd.DataFrame(summary)
+
+    selected=detail[detail["Selezione EV positivo"]==1]
+    sel_rows=[]
+    for keys,g in selected.groupby(["Mercato","Fonte quote","Competizione","Selezione EV massimo"],dropna=False):
+        sel_rows.append({"Mercato":keys[0],"Fonte quote":keys[1],"Competizione":keys[2],"Selezione":keys[3],
+            "Partite selezionate":len(g),"Win rate (%)":100*g["Selezione vincente"].mean(),
+            "Probabilita modello media (%)":g["Probabilita selezione modello (%)"].mean(),
+            "Probabilita bookmaker de-vig media (%)":g["Probabilita bookmaker de-vig selezione (%)"].mean(),
+            "EV medio (%)":g["EV selezione (%)"].mean(),
+            "Affidabilita campione":"Adeguato (N≥30)" if len(g)>=30 else "Limitato (N<30)"})
+    df_selection=pd.DataFrame(sel_rows)
+
+    # Calibrazione su tutti gli esiti (non condizionata a EV positivo).
+    bins=pd.DataFrame(bin_rows)
+    if not bins.empty:
+        df_bins=(bins.groupby(["Mercato","Fonte quote","Competizione","Esito","Fascia probabilita (%)"],observed=True)
+            .agg({"Esito (0/1)":"size", "Probabilita modello (%)":"mean"})
+            .rename(columns={"Esito (0/1)":"Osservazioni", "Probabilita modello (%)":"Probabilita media prevista (%)"})
+            .reset_index())
+        freq=(bins.groupby(["Mercato","Fonte quote","Competizione","Esito","Fascia probabilita (%)"],observed=True)["Esito (0/1)"].mean().mul(100).rename("Frequenza reale (%)").reset_index())
+        df_bins=df_bins.merge(freq,on=["Mercato","Fonte quote","Competizione","Esito","Fascia probabilita (%)"],how="left")
+        df_bins["Scarto previsto-reale (pp)"]=df_bins["Probabilita media prevista (%)"]-df_bins["Frequenza reale (%)"]
+        df_bins["Affidabilita campione"]=np.where(df_bins["Osservazioni"]>=30,"Adeguato (N≥30)","Limitato (N<30)")
+    else:
+        df_bins=pd.DataFrame()
+
+    checks=[]
+    checks.append({"Controllo":"Probabilita modello valide e somma 100%","Esito":"PASS" if np.allclose(detail["Somma probabilita modello (%)"],100.0,atol=0.01) else "ATTENZIONE","Valore":float((detail["Somma probabilita modello (%)"]-100.0).abs().max()),"Unita":"massimo scarto (pp)","Righe":len(detail)})
+    checks.append({"Controllo":"Probabilita bookmaker de-vig sommano 100%","Esito":"PASS" if np.allclose(detail["Somma probabilita bookmaker de-vig (%)"],100.0,atol=0.01) else "ATTENZIONE","Valore":float((detail["Somma probabilita bookmaker de-vig (%)"]-100.0).abs().max()),"Unita":"massimo scarto (pp)","Righe":len(detail)})
+    match_keys=["Data","Competizione","Casa","Trasferta","Mercato","Fonte quote"]
+    dup=int(detail.duplicated(match_keys).sum())
+    checks.append({"Controllo":"Una riga per partita/mercato/fonte nel confronto completo","Esito":"PASS" if dup==0 else "ATTENZIONE","Valore":dup,"Unita":"duplicati","Righe":len(detail)})
+    ev_error=float((detail["EV selezione (%)"]-detail["EV selezione ricalcolato (%)"]).abs().max())
+    checks.append({"Controllo":"EV selezione = probabilita modello × quota − 1","Esito":"PASS" if ev_error<1e-8 else "ATTENZIONE","Valore":ev_error,"Unita":"massimo errore (pp)","Righe":len(detail)})
+    return df_summary, df_selection, df_bins, pd.DataFrame(checks)
+
 
 def _prob_clip(p):
     return float(np.clip(float(p), 1e-6, 1.0 - 1e-6))
@@ -2040,6 +2181,30 @@ with tab_audit:
             str_lit.dataframe(df212_bins_comp_source.round(4), use_container_width=True, hide_index=True)
             str_lit.download_button("⬇️ Scarica fasce per competizione e fonte V21.2 CSV", df212_bins_comp_source.to_csv(index=False).encode("utf-8-sig"), "V21_2_calibrazione_fasce_competizione_fonte.csv", "text/csv")
         str_lit.warning("Le soglie EV 0%, 2% e 5% sono campioni annidati: una stessa partita puo' comparire in piu' soglie, ma non piu' di una volta nella stessa combinazione partita/mercato/fonte/soglia. Non sommare le righe tra soglie.")
+
+        # V21.3 — diagnosi non condizionata e confronto con baseline bookmaker.
+        str_lit.markdown("### 🔬 V21.3 — Diagnosi della sovrastima e confronto con baseline bookmaker")
+        str_lit.caption("V21.2 osservava soltanto la selezione con EV massimo e positivo: è quindi un campione condizionato dalla regola di selezione. V21.3 valuta tutti gli esiti su tutte le partite con quote complete, confrontando Poisson WF con probabilità bookmaker normalizzate (de-vig), sulle stesse partite. Solo Audit: nessuna correzione operativa.")
+        with str_lit.spinner("Confronto Poisson WF e baseline bookmaker su tutti gli esiti..."):
+            df213_summary, df213_selection, df213_bins, df213_checks = crea_diagnostica_v213(df_audit)
+        if not df213_checks.empty:
+            str_lit.markdown("#### Controlli di coerenza V21.3")
+            str_lit.dataframe(df213_checks, use_container_width=True, hide_index=True)
+        if not df213_summary.empty:
+            str_lit.markdown("#### Modello Poisson WF contro bookmaker de-vig — tutte le partite con quote complete")
+            str_lit.caption("Delta negativo favorisce il modello; delta positivo favorisce il bookmaker. Brier e LogLoss sono calcolati sull'intero vettore degli esiti, non soltanto sulla selezione EV+. Il de-vig normalizza le probabilità implicite delle quote rimuovendo proporzionalmente l'overround.")
+            str_lit.dataframe(df213_summary.round(5), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica confronto V21.3 modello vs bookmaker CSV", df213_summary.to_csv(index=False).encode("utf-8-sig"), "V21_3_confronto_modello_bookmaker.csv", "text/csv")
+        if not df213_selection.empty:
+            str_lit.markdown("#### Distribuzione delle selezioni EV positive per esito")
+            str_lit.caption("Questa tabella descrive le selezioni generate dalla regola EV massimo > 0. È una diagnostica condizionata, distinta dal confronto completo precedente.")
+            str_lit.dataframe(df213_selection.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica distribuzione selezioni V21.3 CSV", df213_selection.to_csv(index=False).encode("utf-8-sig"), "V21_3_distribuzione_selezioni.csv", "text/csv")
+        if not df213_bins.empty:
+            str_lit.markdown("#### Calibrazione per fascia su tutti gli esiti")
+            str_lit.dataframe(df213_bins.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica calibrazione completa V21.3 CSV", df213_bins.to_csv(index=False).encode("utf-8-sig"), "V21_3_calibrazione_tutti_esiti.csv", "text/csv")
+        str_lit.info("Nota metodologica: il confronto bookmaker usa probabilità implicite normalizzate sulle quote Avg/B365 realmente disponibili. Non equivale a una baseline storica indipendente; è un confronto con il mercato. Le partite senza quote complete sono escluse da entrambi i lati del confronto.")
 
         # V15: pacchetto diagnostico aggiuntivo; nessuna modifica alle previsioni operative.
         str_lit.markdown("#### 🧪 V18 — Riconciliazione conteggi e stabilità temporale (solo diagnostica)")
