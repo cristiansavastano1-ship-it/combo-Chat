@@ -1681,6 +1681,78 @@ with tab_audit:
                         "PASS — nessuna criticità doppia", "ATTENZIONE — verificare dettaglio")
                     str_lit.markdown("#### V20.8 — Riepilogo per statistica e competizione (stagioni aggregate)")
                     str_lit.dataframe(_summary_comp208.round(5), use_container_width=True, hide_index=True)
+
+                    # V20.9 — persistenza delle criticità tra stagioni. Solo Audit:
+                    # aggrega gli esiti già calcolati; non modifica probabilità o modello operativo.
+                    str_lit.markdown("### 🧭 V20.9 — Persistenza delle criticità tra stagioni")
+                    _persist_src209 = _g207.copy()
+                    _persist_src209["_stagione_num209"] = pd.to_numeric(
+                        _persist_src209["Stagione"].astype(str).str.extract(r"(\d+)", expand=False), errors="coerce"
+                    )
+                    _last_season209 = _persist_src209["_stagione_num209"].max()
+                    _persist_src209["_bad_brier209"] = _persist_src209["Delta Brier"] > 0
+                    _persist_src209["_bad_ll209"] = _persist_src209["Delta LogLoss"] > 0
+                    _persist_src209["_bad_both209"] = _persist_src209["_bad_brier209"] & _persist_src209["_bad_ll209"]
+                    _persist_src209["_bad_any209"] = _persist_src209["_bad_brier209"] | _persist_src209["_bad_ll209"]
+                    _persist_src209["_ultima_stagione209"] = _persist_src209["_stagione_num209"] == _last_season209
+                    _persist_rows209 = []
+                    _keys209 = ["Statistica", "Competizione", "Soglia Over"]
+                    for _key209, _grp209 in _persist_src209.groupby(_keys209, dropna=False):
+                        _latest209 = _grp209[_grp209["_ultima_stagione209"]]
+                        _both_n209 = int(_grp209["_bad_both209"].sum())
+                        _any_n209 = int(_grp209["_bad_any209"].sum())
+                        _persist_rows209.append({
+                            "Statistica": _key209[0], "Competizione": _key209[1], "Soglia Over": _key209[2],
+                            "Stagioni valutate": int(_grp209["Stagione"].nunique()),
+                            "Stagioni peggiori Brier": int(_grp209["_bad_brier209"].sum()),
+                            "Stagioni peggiori LogLoss": int(_grp209["_bad_ll209"].sum()),
+                            "Stagioni peggiori entrambe": _both_n209,
+                            "Stagioni peggiori almeno una": _any_n209,
+                            "Ultima stagione": str(_latest209["Stagione"].iloc[0]) if not _latest209.empty else "-",
+                            "Ultima stagione Brier peggiore": bool(_latest209["_bad_brier209"].any()),
+                            "Ultima stagione LogLoss peggiore": bool(_latest209["_bad_ll209"].any()),
+                            "Ultima stagione entrambe peggiori": bool(_latest209["_bad_both209"].any()),
+                            "Delta Brier medio": float(_grp209["Delta Brier"].mean()),
+                            "Delta LogLoss medio": float(_grp209["Delta LogLoss"].mean()),
+                            "Esito persistenza": ("CRITICITÀ RICORRENTE" if _both_n209 >= 2 else
+                                                  "CRITICITÀ ISOLATA" if _both_n209 == 1 else
+                                                  "NESSUNA CRITICITÀ DOPPIA")
+                        })
+                    _persist209 = pd.DataFrame(_persist_rows209)
+                    _persist209["Fascia persistenza"] = np.select(
+                        [_persist209["Stagioni peggiori entrambe"] >= 3,
+                         _persist209["Stagioni peggiori entrambe"] == 2,
+                         _persist209["Stagioni peggiori entrambe"] == 1],
+                        ["3 stagioni", "2 stagioni", "1 stagione"], default="0 stagioni"
+                    )
+                    _persist209 = _persist209.sort_values(
+                        ["Stagioni peggiori entrambe", "Ultima stagione entrambe peggiori", "Statistica", "Competizione"],
+                        ascending=[False, False, True, True]
+                    )
+                    str_lit.caption("Una stagione è considerata critica su entrambe le metriche solo se Delta Brier e Delta LogLoss sono entrambi > 0. Delta negativi favoriscono il modello. La persistenza è descrittiva: con tre stagioni non dimostra da sola un difetto strutturale.")
+                    str_lit.markdown("#### Persistenza per singola soglia attraverso le stagioni")
+                    str_lit.dataframe(_persist209.round(5), use_container_width=True, hide_index=True)
+
+                    _persist_comp209 = _persist209.groupby(["Statistica", "Competizione"], dropna=False).agg(
+                        **{"Soglie valutate": ("Soglia Over", "count"),
+                           "Soglie critiche in 1 stagione": ("Stagioni peggiori entrambe", lambda x: int((x == 1).sum())),
+                           "Soglie critiche in 2 stagioni": ("Stagioni peggiori entrambe", lambda x: int((x == 2).sum())),
+                           "Soglie critiche in 3 stagioni": ("Stagioni peggiori entrambe", lambda x: int((x >= 3).sum())),
+                           "Critiche anche ultima stagione": ("Ultima stagione entrambe peggiori", "sum"),
+                           "Delta Brier medio": ("Delta Brier medio", "mean"),
+                           "Delta LogLoss medio": ("Delta LogLoss medio", "mean")}
+                    ).reset_index()
+                    str_lit.markdown("#### V20.9 — Riepilogo persistenza per statistica e campionato")
+                    str_lit.dataframe(_persist_comp209.round(5), use_container_width=True, hide_index=True)
+                    _latest_flags209 = _persist209[_persist209["Ultima stagione Brier peggiore"] | _persist209["Ultima stagione LogLoss peggiore"]]
+                    if not _latest_flags209.empty:
+                        str_lit.warning(f"Ultima stagione: {len(_latest_flags209)} combinazioni statistica/campionato/soglia hanno almeno una metrica peggiore della baseline. Le criticità doppie persistenti sono evidenziate separatamente nella tabella.")
+                        str_lit.dataframe(_latest_flags209[["Statistica", "Competizione", "Soglia Over", "Stagioni peggiori entrambe", "Ultima stagione", "Ultima stagione Brier peggiore", "Ultima stagione LogLoss peggiore", "Esito persistenza"]].round(5), use_container_width=True, hide_index=True)
+                    else:
+                        str_lit.success("Nessuna soglia peggiora la baseline nell'ultima stagione disponibile.")
+                    str_lit.download_button("⬇️ Scarica V20.9 persistenza per soglia CSV", data=_persist209.to_csv(index=False).encode("utf-8-sig"), file_name="V20_9_persistenza_soglie_stagioni.csv", mime="text/csv")
+                    str_lit.download_button("⬇️ Scarica V20.9 riepilogo campionati CSV", data=_persist_comp209.to_csv(index=False).encode("utf-8-sig"), file_name="V20_9_riepilogo_persistenza_campionati.csv", mime="text/csv")
+
                     str_lit.download_button("⬇️ Scarica V20.8 criticità doppie CSV", data=_both_bad208.to_csv(index=False).encode("utf-8-sig"), file_name="V20_8_criticita_doppie.csv", mime="text/csv")
                     str_lit.download_button("⬇️ Scarica V20.8 riepilogo competizioni CSV", data=_summary_comp208.to_csv(index=False).encode("utf-8-sig"), file_name="V20_8_riepilogo_statistica_competizione.csv", mime="text/csv")
 
