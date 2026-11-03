@@ -163,6 +163,14 @@ def carica_storico_audit_gratuito():
         "Ammonizioni casa": "HY", "Ammonizioni trasferta": "AY",
         "Espulsioni casa": "HR", "Espulsioni trasferta": "AR",
     }
+    # Quote storiche effettivamente presenti nei CSV gratuiti.
+    # Non vengono create quote sintetiche né sostituite celle mancanti.
+    colonne_quote = {
+        "Avg_1": "AVGH", "Avg_X": "AVGD", "Avg_2": "AVGA",
+        "B365_1": "B365H", "B365_X": "B365D", "B365_2": "B365A",
+        "Avg_Over25": "AVG>2.5", "Avg_Under25": "AVG<2.5",
+        "B365_Over25": "B365>2.5", "B365_Under25": "B365<2.5",
+    }
     anno_corrente = datetime.now().year
     anno_inizio = anno_corrente if datetime.now().month >= 8 else anno_corrente - 1
     stagioni = [f"{str(y)[-2:]}{str(y + 1)[-2:]}" for y in range(anno_inizio, anno_inizio - 3, -1)]
@@ -209,8 +217,21 @@ def carica_storico_audit_gratuito():
                                     pass
                             stats[nome_stat] = valore
 
+                        quote = {}
+                        for nome_quota, colonna_quota in colonne_quote.items():
+                            valore_quota = None
+                            if colonna_quota in colonne and pd.notna(r[colonne[colonna_quota]]):
+                                try:
+                                    q = float(r[colonne[colonna_quota]])
+                                    if np.isfinite(q) and q > 1.0:
+                                        valore_quota = q
+                                except (TypeError, ValueError, OverflowError):
+                                    pass
+                            quote[nome_quota] = valore_quota
+
                         record = {
                             "status": "FINISHED",
+                            "quoteStoriche": quote,
                             "utcDate": data.strftime("%Y-%m-%dT12:00:00Z"),
                             "Competizione": nome_lega,
                             "homeTeam": {"name": casa},
@@ -701,6 +722,7 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
                 "casa": m.get("homeTeam", {}).get("name", "Casa"),
                 "trasferta": m.get("awayTeam", {}).get("name", "Trasferta"),
                 "gol_casa": int(gc), "gol_trasferta": int(gt),
+                "quote": m.get("quoteStoriche", {}) or {},
             })
         except (TypeError, ValueError):
             continue
@@ -748,6 +770,8 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
             p2 = float(np.triu(matrice, 1).sum())
             p_goal = float(matrice[1:, 1:].sum())
             p_nogoal = 1.0 - p_goal
+            p_over25 = float(sum(matrice[i, j] for i in range(max_gol + 1) for j in range(max_gol + 1) if i + j >= 3))
+            p_under25 = 1.0 - p_over25
             # Controllo indipendente: con Poisson indipendenti, P(No Goal) =
             # 1 - P(casa segna almeno un gol) * P(trasferta segna almeno un gol).
             p_nogoal_formula = 1.0 - (1.0 - math.exp(-lam_c)) * (1.0 - math.exp(-lam_t))
@@ -791,6 +815,8 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
                 "Competizione": partita["competizione"],
                 "Casa": casa, "Trasferta": trasf,
                 "P(1) %": 100*p1, "P(X) %": 100*px, "P(2) %": 100*p2,
+                "P(Over 2.5) %": 100*p_over25, "P(Under 2.5) %": 100*p_under25,
+                **{f"Quota {k}": v for k, v in (partita.get("quote", {}) or {}).items()},
                 "Segno previsto": previsto, "Esito reale": esito,
                 "X prevista come segno": int(previsto == "X"),
                 "Posizione X": posizione_x,
@@ -831,6 +857,83 @@ def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
 
     return pd.DataFrame(righe)
 
+
+
+
+def crea_audit_economico_v210(df_audit, soglie_edge=(0.00, 0.02, 0.05)):
+    """Audit economico walk-forward su quote storiche reali. Stake fisso 1 unita.
+
+    Le probabilita' sono quelle walk-forward gia' calcolate prima della partita.
+    Per ogni match/mercato/bookmaker seleziona al massimo un esito: il maggiore EV.
+    Le quote mancanti restano escluse. Nessun mercato statistico viene simulato.
+    """
+    if df_audit is None or df_audit.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    mercati = {
+        "1X2": {
+            "outcomes": [("1", "P(1) %", "Esito reale"), ("X", "P(X) %", "Esito reale"), ("2", "P(2) %", "Esito reale")],
+            "odds": {"Avg": ["Quota Avg_1", "Quota Avg_X", "Quota Avg_2"],
+                     "B365": ["Quota B365_1", "Quota B365_X", "Quota B365_2"]},
+        },
+        "Over/Under 2.5 gol": {
+            "outcomes": [("Over 2.5", "P(Over 2.5) %", "Gol casa reali"), ("Under 2.5", "P(Under 2.5) %", "Gol casa reali")],
+            "odds": {"Avg": ["Quota Avg_Over25", "Quota Avg_Under25"],
+                     "B365": ["Quota B365_Over25", "Quota B365_Under25"]},
+        },
+    }
+    d = df_audit.copy()
+    # Compatibilita' robusta con timestamp e valori numerici.
+    for c in ["P(1) %", "P(X) %", "P(2) %", "P(Over 2.5) %", "P(Under 2.5) %"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce") / 100.0
+    for c in ["Gol casa reali", "Gol trasferta reali"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    riepiloghi, dettagli, copertura = [], [], []
+
+    for mercato, cfg in mercati.items():
+        for book, odds_cols in cfg["odds"].items():
+            disponibili = all(c in d.columns for c in odds_cols)
+            if not disponibili:
+                copertura.append({"Mercato": mercato, "Fonte quote": book, "Partite Audit": len(d), "Partite con quote complete": 0, "Copertura quote (%)": 0.0})
+                continue
+            odds_matrix = d[odds_cols].apply(pd.to_numeric, errors="coerce")
+            valid_quotes = odds_matrix.notna().all(axis=1) & (odds_matrix > 1.0).all(axis=1)
+            copertura.append({"Mercato": mercato, "Fonte quote": book, "Partite Audit": len(d), "Partite con quote complete": int(valid_quotes.sum()), "Copertura quote (%)": round(100*float(valid_quotes.mean()), 2) if len(d) else 0.0})
+            for idx, row in d.loc[valid_quotes].iterrows():
+                odds = [float(row[c]) for c in odds_cols]
+                if mercato == "1X2":
+                    probs = [row.get("P(1) %"), row.get("P(X) %"), row.get("P(2) %")]
+                    labels = ["1", "X", "2"]
+                    actual = str(row.get("Esito reale", ""))
+                    margin = sum(1.0/o for o in odds) - 1.0
+                    candidates = [(float(p)*o-1.0, labels[j], o, float(p), int(actual == labels[j])) for j,(p,o) in enumerate(zip(probs,odds)) if pd.notna(p)]
+                else:
+                    probs = [row.get("P(Over 2.5) %"), row.get("P(Under 2.5) %")]
+                    labels = ["Over 2.5", "Under 2.5"]
+                    gh, ga = row.get("Gol casa reali"), row.get("Gol trasferta reali")
+                    if pd.isna(gh) or pd.isna(ga):
+                        continue
+                    actual = "Over 2.5" if float(gh)+float(ga) > 2.5 else "Under 2.5"
+                    margin = sum(1.0/o for o in odds) - 1.0
+                    candidates = [(float(p)*o-1.0, labels[j], o, float(p), int(actual == labels[j])) for j,(p,o) in enumerate(zip(probs,odds)) if pd.notna(p)]
+                if not candidates:
+                    continue
+                ev, pick, odd, prob, won = max(candidates, key=lambda x:x[0])
+                base = {"Data": row.get("Data"), "Competizione": row.get("Competizione"), "Casa": row.get("Casa"), "Trasferta": row.get("Trasferta"), "Mercato": mercato, "Fonte quote": book, "Selezione": pick, "Probabilita WF (%)": 100*prob, "Quota": odd, "EV atteso (%)": 100*ev, "Margine bookmaker (%)": 100*margin, "Esito reale": actual, "Vincente": won, "Profitto stake 1": odd-1.0 if won else -1.0}
+                for edge in soglie_edge:
+                    if ev > edge:
+                        dettagli.append({**base, "Soglia EV (%)": 100*edge})
+
+    df_det = pd.DataFrame(dettagli)
+    df_cov = pd.DataFrame(copertura)
+    if not df_det.empty:
+        for keys, g in df_det.groupby(["Mercato", "Fonte quote", "Soglia EV (%)"], dropna=False):
+            stake = float(len(g))
+            profit = float(g["Profitto stake 1"].sum())
+            riepiloghi.append({"Mercato": keys[0], "Fonte quote": keys[1], "Soglia EV (%)": keys[2], "Scommesse": len(g), "Vinte": int(g["Vincente"].sum()), "Win rate (%)": 100*float(g["Vincente"].mean()), "Quota media": float(g["Quota"].mean()), "EV medio previsto (%)": float(g["EV atteso (%)"].mean()), "Margine bookmaker medio (%)": float(g["Margine bookmaker (%)"].mean()), "Profitto netto (stake 1)": profit, "Stake totale": stake, "ROI realizzato (%)": 100*profit/stake, "Affidabilita campione": "Adeguato (N≥30)" if len(g)>=30 else "Limitato (N<30)"})
+    return pd.DataFrame(riepiloghi), df_det, df_cov
 
 
 
@@ -1451,7 +1554,7 @@ with tab_monte_carlo:
 # --- TAB 8: AUDIT ---
 with tab_audit:
     str_lit.subheader("🛡️ Audit statistico: Pareggio X e Goal / No Goal")
-    str_lit.info("Versione diagnostica V20.6: audit storico e test statistici completi; calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
+    str_lit.info("Versione diagnostica V21.0: audit storico, robustezza e verifica economica walk-forward; calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
     str_lit.caption(
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
@@ -1822,6 +1925,24 @@ with tab_audit:
             "Servono almeno 30 risultati precedenti nella competizione prima di valutare una partita."
         )
     else:
+        # V21.0 — verifica economica separata: solo Audit, nessuna modifica al modello operativo.
+        str_lit.markdown("## 💶 V21.0 — Verifica economica walk-forward su quote storiche reali")
+        str_lit.caption("Le probabilità provengono dall'audit walk-forward, calcolato usando soltanto partite precedenti. Stake fisso: 1 unità per selezione. Le quote mancanti non vengono ricostruite.")
+        with str_lit.spinner("Calcolo margine bookmaker, valore atteso e ROI storico..."):
+            df210_roi, df210_picks, df210_cov = crea_audit_economico_v210(df_audit)
+        if not df210_cov.empty:
+            str_lit.markdown("### Copertura delle quote storiche realmente disponibili")
+            str_lit.dataframe(df210_cov, use_container_width=True, hide_index=True)
+        if not df210_roi.empty:
+            str_lit.markdown("### Risultati economici per mercato, fonte quote e soglia EV")
+            str_lit.dataframe(df210_roi.round(4), use_container_width=True, hide_index=True)
+            str_lit.caption("EV = probabilità walk-forward × quota − 1. ROI = profitto netto / stake totale. Le soglie EV 0%, 2% e 5% sono filtri diagnostici, non raccomandazioni di puntata. I risultati sono storici e non garantiscono rendimenti futuri.")
+            str_lit.download_button("⬇️ Scarica riepilogo ROI V21.0 CSV", df210_roi.to_csv(index=False).encode("utf-8-sig"), "V21_0_riepilogo_ROI_walk_forward.csv", "text/csv")
+            str_lit.download_button("⬇️ Scarica dettaglio selezioni V21.0 CSV", df210_picks.to_csv(index=False).encode("utf-8-sig"), "V21_0_dettaglio_scommesse_walk_forward.csv", "text/csv")
+        else:
+            str_lit.warning("Non ci sono ancora selezioni con EV positivo alle soglie testate. Controlla la copertura quote e il campione disponibile.")
+        str_lit.info("Limite della fonte gratuita: football-data.co.uk offre quote storiche per 1X2 e Over/Under gol in alcune colonne/bookmaker. Non fornisce qui quote storiche affidabili per angoli, tiri o tiri in porta: per questi mercati il ROI non viene calcolato. Nessuna quota sintetica viene utilizzata.")
+
         # V15: pacchetto diagnostico aggiuntivo; nessuna modifica alle previsioni operative.
         str_lit.markdown("#### 🧪 V18 — Riconciliazione conteggi e stabilità temporale (solo diagnostica)")
         str_lit.caption(
