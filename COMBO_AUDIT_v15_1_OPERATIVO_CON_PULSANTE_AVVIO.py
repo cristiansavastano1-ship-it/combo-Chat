@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V20.6",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Audit V21.1",
     layout="wide",
     page_icon="⚽",
 )
@@ -936,6 +936,69 @@ def crea_audit_economico_v210(df_audit, soglie_edge=(0.00, 0.02, 0.05)):
     return pd.DataFrame(riepiloghi), df_det, df_cov
 
 
+
+
+def crea_diagnostica_calibrazione_v210(df_det):
+    """Controlli di integrita' e calibrazione delle selezioni economiche V21.0.
+
+    Usa le selezioni gia' generate dall'audit; non modifica probabilita' o modello.
+    Le righe per soglia sono valutazioni separate e non vanno sommate tra soglie.
+    """
+    if df_det is None or df_det.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    d = df_det.copy()
+    p = pd.to_numeric(d.get("Probabilita WF (%)"), errors="coerce") / 100.0
+    q = pd.to_numeric(d.get("Quota"), errors="coerce")
+    ev = pd.to_numeric(d.get("EV atteso (%)"), errors="coerce")
+    won = pd.to_numeric(d.get("Vincente"), errors="coerce")
+    profit = pd.to_numeric(d.get("Profitto stake 1"), errors="coerce")
+    expected_ev = (p * q - 1.0) * 100.0
+    expected_profit = np.where(won == 1, q - 1.0, -1.0)
+    selection_matches = (d["Selezione"].astype(str) == d["Esito reale"].astype(str)).astype(int)
+    keys = ["Data", "Competizione", "Casa", "Trasferta", "Mercato", "Fonte quote", "Soglia EV (%)"]
+
+    checks = [
+        {"Controllo": "EV = probabilità selezionata × quota − 1", "Esito": "PASS" if float((expected_ev-ev).abs().max()) < 1e-8 else "ATTENZIONE", "Valore": float((expected_ev-ev).abs().max()), "Unita": "massimo errore (pp)"},
+        {"Controllo": "Profitto coerente con quota e vincita", "Esito": "PASS" if float((expected_profit-profit).abs().max()) < 1e-8 else "ATTENZIONE", "Valore": float((expected_profit-profit).abs().max()), "Unita": "massimo errore (unita')"},
+        {"Controllo": "Vincente coerente con selezione ed esito reale", "Esito": "PASS" if int((won != selection_matches).sum()) == 0 else "ATTENZIONE", "Valore": int((won != selection_matches).sum()), "Unita": "righe discordanti"},
+        {"Controllo": "Probabilita' nel range 0–100%", "Esito": "PASS" if bool(pd.to_numeric(d["Probabilita WF (%)"], errors="coerce").between(0,100).all()) else "ATTENZIONE", "Valore": int((~pd.to_numeric(d["Probabilita WF (%)"], errors="coerce").between(0,100)).sum()), "Unita": "righe fuori range"},
+        {"Controllo": "Quote decimali maggiori di 1", "Esito": "PASS" if bool((q > 1).all()) else "ATTENZIONE", "Valore": int((q <= 1).sum()), "Unita": "quote non valide"},
+        {"Controllo": "Una selezione per partita/mercato/fonte/soglia", "Esito": "PASS" if int(d.duplicated(keys).sum()) == 0 else "ATTENZIONE", "Valore": int(d.duplicated(keys).sum()), "Unita": "duplicati"},
+    ]
+    df_checks = pd.DataFrame(checks)
+
+    def metriche(g):
+        pp = pd.to_numeric(g["Probabilita WF (%)"], errors="coerce").to_numpy(dtype=float) / 100.0
+        yy = pd.to_numeric(g["Vincente"], errors="coerce").to_numpy(dtype=float)
+        pp = np.clip(pp, 1e-12, 1-1e-12)
+        return {
+            "Scommesse": len(g),
+            "Probabilita media prevista (%)": 100*float(np.mean(pp)),
+            "Win rate reale (%)": 100*float(np.mean(yy)),
+            "Scarto previsto-reale (pp)": 100*float(np.mean(pp)-np.mean(yy)),
+            "Brier selezione": float(np.mean((pp-yy)**2)),
+            "LogLoss selezione": float(np.mean(-(yy*np.log(pp)+(1-yy)*np.log(1-pp)))),
+            "ROI realizzato (%)": 100*float(pd.to_numeric(g["Profitto stake 1"], errors="coerce").mean()),
+        }
+
+    base = d[pd.to_numeric(d["Soglia EV (%)"], errors="coerce") == 0.0].copy()
+    comp_rows=[]
+    for keys_group, g in base.groupby(["Mercato", "Fonte quote", "Competizione"], dropna=False):
+        comp_rows.append({"Mercato":keys_group[0], "Fonte quote":keys_group[1], "Competizione":keys_group[2], **metriche(g)})
+    df_comp = pd.DataFrame(comp_rows)
+
+    bin_edges=[0,10,20,30,40,50,60,70,80,90,100.000001]
+    bin_rows=[]
+    for market, gm in base.groupby("Mercato", dropna=False):
+        prob=pd.to_numeric(gm["Probabilita WF (%)"], errors="coerce")
+        gm=gm.copy(); gm["Fascia probabilita' (%)"]=pd.cut(prob, bins=bin_edges, right=False, include_lowest=True)
+        for band, g in gm.groupby("Fascia probabilita' (%)", observed=True, dropna=False):
+            if len(g)==0: continue
+            m=metriche(g)
+            bin_rows.append({"Mercato":market, "Fascia probabilita' (%)":str(band), **m})
+    df_bins=pd.DataFrame(bin_rows)
+    return df_checks, df_comp, df_bins
 
 def _prob_clip(p):
     return float(np.clip(float(p), 1e-6, 1.0 - 1e-6))
@@ -1942,6 +2005,24 @@ with tab_audit:
         else:
             str_lit.warning("Non ci sono ancora selezioni con EV positivo alle soglie testate. Controlla la copertura quote e il campione disponibile.")
         str_lit.info("Limite della fonte gratuita: football-data.co.uk offre quote storiche per 1X2 e Over/Under gol in alcune colonne/bookmaker. Non fornisce qui quote storiche affidabili per angoli, tiri o tiri in porta: per questi mercati il ROI non viene calcolato. Nessuna quota sintetica viene utilizzata.")
+
+        # V21.1 — verifica della calibrazione delle probabilita' usate nell'EV; solo Audit.
+        str_lit.markdown("### 🧪 V21.1 — Controllo probabilita' selezionata ed EV (solo diagnostica)")
+        str_lit.caption("Le probabilita' V21.0 sono Poisson RAW in walk-forward: 'WF' indica la sequenza temporale, NON una calibrazione Platt. Qui confrontiamo probabilita' della selezione e frequenza di vittoria reale; nessun valore viene corretto o usato nel modello operativo.")
+        with str_lit.spinner("Verifica coerenza EV, vincite e calibrazione delle selezioni..."):
+            df211_check, df211_comp, df211_bins = crea_diagnostica_calibrazione_v210(df210_picks)
+        if not df211_check.empty:
+            str_lit.markdown("#### Integrita' dei calcoli economici")
+            str_lit.dataframe(df211_check, use_container_width=True, hide_index=True)
+        if not df211_comp.empty:
+            str_lit.markdown("#### Probabilita' prevista contro vittorie reali — soglia EV 0%, per competizione")
+            str_lit.dataframe(df211_comp.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica calibrazione per competizione V21.1 CSV", df211_comp.to_csv(index=False).encode("utf-8-sig"), "V21_1_calibrazione_per_competizione.csv", "text/csv")
+        if not df211_bins.empty:
+            str_lit.markdown("#### Calibrazione per fasce di probabilita' — soglia EV 0%")
+            str_lit.dataframe(df211_bins.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica calibrazione per fasce V21.1 CSV", df211_bins.to_csv(index=False).encode("utf-8-sig"), "V21_1_calibrazione_per_fasce.csv", "text/csv")
+        str_lit.warning("Le soglie EV 0%, 2% e 5% sono campioni annidati: una stessa partita puo' comparire in piu' soglie, ma non piu' di una volta nella stessa combinazione partita/mercato/fonte/soglia. Non sommare le righe tra soglie.")
 
         # V15: pacchetto diagnostico aggiuntivo; nessuna modifica alle previsioni operative.
         str_lit.markdown("#### 🧪 V18 — Riconciliazione conteggi e stabilità temporale (solo diagnostica)")
