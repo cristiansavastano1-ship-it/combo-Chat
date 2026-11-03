@@ -1611,6 +1611,44 @@ with tab_audit:
                 str_lit.markdown("### Metriche probabilistiche per campionato e stagione")
                 str_lit.dataframe(df205_group.round(5), use_container_width=True, hide_index=True)
                 str_lit.download_button("⬇️ Scarica V20.5 metriche campionato/stagione CSV",data=df205_group.to_csv(index=False).encode("utf-8-sig"),file_name="V20_5_metriche_campionato_stagione.csv",mime="text/csv")
+                # V20.7 — robustezza disaggregata per competizione/stagione.
+                # Deriva esclusivamente dalle metriche Audit già calcolate; nessuna modifica
+                # a previsioni operative, probabilità, ranking o schedine.
+                str_lit.markdown("### 🔎 V20.7 — Robustezza per campionato e stagione")
+                _g207 = df205_group.copy()
+                _need207 = ["Statistica", "Soglia Over", "Competizione", "Stagione", "N",
+                            "Delta Brier", "Delta LogLoss"]
+                if all(c in _g207.columns for c in _need207):
+                    for _c207 in ["N", "Delta Brier", "Delta LogLoss", "Soglia Over"]:
+                        _g207[_c207] = pd.to_numeric(_g207[_c207], errors="coerce")
+                    _g207 = _g207.dropna(subset=["N", "Delta Brier", "Delta LogLoss"])
+                    _g207["Esito Brier"] = np.where(_g207["Delta Brier"] < 0, "PASS", "ATTENZIONE")
+                    _g207["Esito LogLoss"] = np.where(_g207["Delta LogLoss"] < 0, "PASS", "ATTENZIONE")
+                    _g207["Esito entrambe"] = np.where((_g207["Esito Brier"] == "PASS") & (_g207["Esito LogLoss"] == "PASS"), "PASS", "ATTENZIONE")
+                    _g207["Affidabilita campione"] = np.where(_g207["N"] >= 30, "Adeguato (N≥30)", "Limitato (N<30)")
+                    _summary207 = _g207.groupby(["Statistica", "Competizione", "Stagione"], dropna=False).agg(
+                        **{"Soglie valutate": ("Soglia Over", "count"),
+                           "Soglie PASS Brier": ("Esito Brier", lambda x: int((x == "PASS").sum())),
+                           "Soglie PASS LogLoss": ("Esito LogLoss", lambda x: int((x == "PASS").sum())),
+                           "Soglie PASS entrambe": ("Esito entrambe", lambda x: int((x == "PASS").sum())),
+                           "Partite (N)": ("N", "max"),
+                           "Delta Brier medio": ("Delta Brier", "mean"),
+                           "Delta LogLoss medio": ("Delta LogLoss", "mean")}
+                    ).reset_index()
+                    _summary207["Esito gruppo"] = np.where(
+                        (_summary207["Partite (N)"] >= 30) &
+                        (_summary207["Soglie PASS entrambe"] == _summary207["Soglie valutate"]),
+                        "PASS — tutte le soglie", "ATTENZIONE — verificare dettaglio")
+                    _summary207["Affidabilita campione"] = np.where(_summary207["Partite (N)"] >= 30, "Adeguato (N≥30)", "Limitato (N<30)")
+                    str_lit.caption("Per ogni statistica, competizione e stagione: delta negativi favoriscono il modello. PASS di gruppo richiede N≥30 e tutte le soglie disponibili migliori della baseline sia in Brier sia in LogLoss. I gruppi piccoli restano indicativi.")
+                    str_lit.dataframe(_summary207.round(5), use_container_width=True, hide_index=True)
+                    str_lit.markdown("#### Dettaglio per singola soglia e gruppo")
+                    _show207 = ["Statistica", "Competizione", "Stagione", "Soglia Over", "N", "Delta Brier", "Esito Brier", "Delta LogLoss", "Esito LogLoss", "Affidabilita campione"]
+                    str_lit.dataframe(_g207[_show207].round(5), use_container_width=True, hide_index=True)
+                    str_lit.download_button("⬇️ Scarica V20.7 robustezza per campionato/stagione CSV", data=_summary207.to_csv(index=False).encode("utf-8-sig"), file_name="V20_7_robustezza_campionato_stagione.csv", mime="text/csv")
+                    str_lit.download_button("⬇️ Scarica V20.7 dettaglio per soglia CSV", data=_g207.to_csv(index=False).encode("utf-8-sig"), file_name="V20_7_dettaglio_soglie_campionato_stagione.csv", mime="text/csv")
+                else:
+                    str_lit.warning("V20.7 non disponibile: mancano colonne nelle metriche per campionato/stagione.")
             if not df205_block.empty:
                 str_lit.markdown("### Bootstrap temporale a blocchi di 7 date")
                 str_lit.dataframe(df205_block.round(5), use_container_width=True, hide_index=True)
