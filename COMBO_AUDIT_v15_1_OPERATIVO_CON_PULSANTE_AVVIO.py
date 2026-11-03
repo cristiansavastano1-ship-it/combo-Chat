@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Audit V21.1",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Audit V21.2",
     layout="wide",
     page_icon="⚽",
 )
@@ -945,7 +945,7 @@ def crea_diagnostica_calibrazione_v210(df_det):
     Le righe per soglia sono valutazioni separate e non vanno sommate tra soglie.
     """
     if df_det is None or df_det.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     d = df_det.copy()
     p = pd.to_numeric(d.get("Probabilita WF (%)"), errors="coerce") / 100.0
@@ -988,17 +988,29 @@ def crea_diagnostica_calibrazione_v210(df_det):
         comp_rows.append({"Mercato":keys_group[0], "Fonte quote":keys_group[1], "Competizione":keys_group[2], **metriche(g)})
     df_comp = pd.DataFrame(comp_rows)
 
+    # V21.2: fasce separate per fonte e competizione. Nessuna ricalibrazione.
     bin_edges=[0,10,20,30,40,50,60,70,80,90,100.000001]
-    bin_rows=[]
-    for market, gm in base.groupby("Mercato", dropna=False):
-        prob=pd.to_numeric(gm["Probabilita WF (%)"], errors="coerce")
-        gm=gm.copy(); gm["Fascia probabilita' (%)"]=pd.cut(prob, bins=bin_edges, right=False, include_lowest=True)
-        for band, g in gm.groupby("Fascia probabilita' (%)", observed=True, dropna=False):
-            if len(g)==0: continue
-            m=metriche(g)
-            bin_rows.append({"Mercato":market, "Fascia probabilita' (%)":str(band), **m})
-    df_bins=pd.DataFrame(bin_rows)
-    return df_checks, df_comp, df_bins
+    def crea_tabella_fasce(group_cols):
+        rows=[]
+        for group_values, gm in base.groupby(group_cols, dropna=False, sort=True):
+            if not isinstance(group_values, tuple):
+                group_values=(group_values,)
+            work=gm.copy()
+            prob=pd.to_numeric(work["Probabilita WF (%)"], errors="coerce")
+            work["Fascia probabilita' (%)"]=pd.cut(prob, bins=bin_edges, right=False, include_lowest=True)
+            for band, g in work.groupby("Fascia probabilita' (%)", observed=True, dropna=False):
+                if len(g)==0:
+                    continue
+                row={col:value for col,value in zip(group_cols, group_values)}
+                row["Fascia probabilita' (%)"]=str(band)
+                row.update(metriche(g))
+                row["Affidabilita' campione"]="Adeguato (N≥30)" if len(g)>=30 else "Limitato (N<30)"
+                rows.append(row)
+        return pd.DataFrame(rows)
+
+    df_bins_source=crea_tabella_fasce(["Mercato", "Fonte quote"])
+    df_bins_comp_source=crea_tabella_fasce(["Mercato", "Fonte quote", "Competizione"])
+    return df_checks, df_comp, df_bins_source, df_bins_comp_source
 
 def _prob_clip(p):
     return float(np.clip(float(p), 1e-6, 1.0 - 1e-6))
@@ -2007,10 +2019,10 @@ with tab_audit:
         str_lit.info("Limite della fonte gratuita: football-data.co.uk offre quote storiche per 1X2 e Over/Under gol in alcune colonne/bookmaker. Non fornisce qui quote storiche affidabili per angoli, tiri o tiri in porta: per questi mercati il ROI non viene calcolato. Nessuna quota sintetica viene utilizzata.")
 
         # V21.1 — verifica della calibrazione delle probabilita' usate nell'EV; solo Audit.
-        str_lit.markdown("### 🧪 V21.1 — Controllo probabilita' selezionata ed EV (solo diagnostica)")
+        str_lit.markdown("### 🧪 V21.2 — Calibrazione per fascia, fonte e competizione (solo diagnostica)")
         str_lit.caption("Le probabilita' V21.0 sono Poisson RAW in walk-forward: 'WF' indica la sequenza temporale, NON una calibrazione Platt. Qui confrontiamo probabilita' della selezione e frequenza di vittoria reale; nessun valore viene corretto o usato nel modello operativo.")
         with str_lit.spinner("Verifica coerenza EV, vincite e calibrazione delle selezioni..."):
-            df211_check, df211_comp, df211_bins = crea_diagnostica_calibrazione_v210(df210_picks)
+            df211_check, df211_comp, df212_bins_source, df212_bins_comp_source = crea_diagnostica_calibrazione_v210(df210_picks)
         if not df211_check.empty:
             str_lit.markdown("#### Integrita' dei calcoli economici")
             str_lit.dataframe(df211_check, use_container_width=True, hide_index=True)
@@ -2018,10 +2030,15 @@ with tab_audit:
             str_lit.markdown("#### Probabilita' prevista contro vittorie reali — soglia EV 0%, per competizione")
             str_lit.dataframe(df211_comp.round(4), use_container_width=True, hide_index=True)
             str_lit.download_button("⬇️ Scarica calibrazione per competizione V21.1 CSV", df211_comp.to_csv(index=False).encode("utf-8-sig"), "V21_1_calibrazione_per_competizione.csv", "text/csv")
-        if not df211_bins.empty:
-            str_lit.markdown("#### Calibrazione per fasce di probabilita' — soglia EV 0%")
-            str_lit.dataframe(df211_bins.round(4), use_container_width=True, hide_index=True)
-            str_lit.download_button("⬇️ Scarica calibrazione per fasce V21.1 CSV", df211_bins.to_csv(index=False).encode("utf-8-sig"), "V21_1_calibrazione_per_fasce.csv", "text/csv")
+        if not df212_bins_source.empty:
+            str_lit.markdown("#### Calibrazione per fasce — separata per fonte quote (EV 0%)")
+            str_lit.caption("Avg e B365 sono calcolate separatamente. Brier, LogLoss e ROI si riferiscono alle sole selezioni del gruppo; N<30 e' indicato come campione limitato.")
+            str_lit.dataframe(df212_bins_source.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica fasce per fonte V21.2 CSV", df212_bins_source.to_csv(index=False).encode("utf-8-sig"), "V21_2_calibrazione_fasce_per_fonte.csv", "text/csv")
+        if not df212_bins_comp_source.empty:
+            str_lit.markdown("#### Calibrazione per fasce — competizione e fonte quote (EV 0%)")
+            str_lit.dataframe(df212_bins_comp_source.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica fasce per competizione e fonte V21.2 CSV", df212_bins_comp_source.to_csv(index=False).encode("utf-8-sig"), "V21_2_calibrazione_fasce_competizione_fonte.csv", "text/csv")
         str_lit.warning("Le soglie EV 0%, 2% e 5% sono campioni annidati: una stessa partita puo' comparire in piu' soglie, ma non piu' di una volta nella stessa combinazione partita/mercato/fonte/soglia. Non sommare le righe tra soglie.")
 
         # V15: pacchetto diagnostico aggiuntivo; nessuna modifica alle previsioni operative.
