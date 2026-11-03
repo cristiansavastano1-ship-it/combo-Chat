@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V20.5.1",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Diagnostica V20.6",
     layout="wide",
     page_icon="⚽",
 )
@@ -1451,7 +1451,7 @@ with tab_monte_carlo:
 # --- TAB 8: AUDIT ---
 with tab_audit:
     str_lit.subheader("🛡️ Audit statistico: Pareggio X e Goal / No Goal")
-    str_lit.info("Versione diagnostica V20.5: audit storico e test statistici completi; calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
+    str_lit.info("Versione diagnostica V20.6: audit storico e test statistici completi; calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
     str_lit.caption(
         "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
         "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
@@ -1616,6 +1616,40 @@ with tab_audit:
                 str_lit.dataframe(df205_block.round(5), use_container_width=True, hide_index=True)
                 str_lit.caption("Delta negativi favoriscono il modello. I blocchi contengono tutte le partite delle date selezionate; IC che attraversa zero indicano evidenza non conclusiva. Il bootstrap a blocchi riduce, ma non elimina, il rischio di dipendenze temporali.")
                 str_lit.download_button("⬇️ Scarica V20.5 bootstrap temporale CSV",data=df205_block.to_csv(index=False).encode("utf-8-sig"),file_name="V20_5_bootstrap_blocchi_date.csv",mime="text/csv")
+                # V20.6: sintesi leggibile dei risultati bootstrap. Solo Audit: nessun dato
+                # o calcolo operativo viene modificato; la sintesi usa esclusivamente df205_block.
+                str_lit.markdown("### 🧭 V20.6 — Sintesi complessiva della robustezza temporale")
+                _b = df205_block.copy()
+                _required_b = ["Statistica", "Soglia Over", "N partite", "N blocchi date",
+                               "IC95 Delta Brier sup", "IC95 Delta LogLoss sup",
+                               "Bootstrap Brier modello migliore (%)", "Bootstrap LogLoss modello migliore (%)"]
+                if all(c in _b.columns for c in _required_b):
+                    _b["Esito Brier"] = np.where(pd.to_numeric(_b["IC95 Delta Brier sup"], errors="coerce") < 0, "PASS", "ATTENZIONE")
+                    _b["Esito LogLoss"] = np.where(pd.to_numeric(_b["IC95 Delta LogLoss sup"], errors="coerce") < 0, "PASS", "ATTENZIONE")
+                    _b["Esito complessivo"] = np.where((_b["Esito Brier"] == "PASS") & (_b["Esito LogLoss"] == "PASS"), "PASS — entrambe le metriche", "ATTENZIONE — evidenza non conclusiva")
+                    _b["Soglia Over"] = pd.to_numeric(_b["Soglia Over"], errors="coerce")
+                    _summary = _b.groupby("Statistica", dropna=False).agg(
+                        **{"Soglie valutate": ("Soglia Over", "count"),
+                           "Soglie PASS Brier": ("Esito Brier", lambda x: int((x == "PASS").sum())),
+                           "Soglie PASS LogLoss": ("Esito LogLoss", lambda x: int((x == "PASS").sum())),
+                           "Partite (N)": ("N partite", "min"),
+                           "Blocchi date": ("N blocchi date", "min"),
+                           "Bootstrap Brier favorevole medio (%)": ("Bootstrap Brier modello migliore (%)", "mean"),
+                           "Bootstrap LogLoss favorevole medio (%)": ("Bootstrap LogLoss modello migliore (%)", "mean")}
+                    ).reset_index()
+                    _n_pass = int(((_b["Esito Brier"] == "PASS") & (_b["Esito LogLoss"] == "PASS")).sum())
+                    _c1, _c2, _c3 = str_lit.columns(3)
+                    _c1.metric("Soglie con entrambe le metriche PASS", f"{_n_pass}/{len(_b)}")
+                    _c2.metric("Soglie testate", f"{len(_b)}")
+                    _c3.metric("Blocchi temporali per soglia", str(int(pd.to_numeric(_b["N blocchi date"], errors="coerce").min())) if not _b.empty else "—")
+                    str_lit.dataframe(_summary.round(2), use_container_width=True, hide_index=True)
+                    str_lit.markdown("#### Esito per singola soglia")
+                    _cols_show = ["Statistica", "Soglia Over", "N partite", "N blocchi date", "IC95 Delta Brier sup", "Esito Brier", "IC95 Delta LogLoss sup", "Esito LogLoss", "Bootstrap Brier modello migliore (%)", "Bootstrap LogLoss modello migliore (%)", "Esito complessivo"]
+                    str_lit.dataframe(_b[_cols_show].round(4), use_container_width=True, hide_index=True)
+                    str_lit.caption("PASS significa che il limite superiore dell'IC95% del delta modello−baseline è inferiore a zero: evidenza bootstrap a favore del modello per quella metrica. ATTENZIONE significa che il risultato non supera questo criterio. È una sintesi diagnostica, non una garanzia di rendimento né un'autorizzazione all'uso nelle schedine.")
+                    str_lit.download_button("⬇️ Scarica sintesi V20.6 bootstrap CSV", data=_b.to_csv(index=False).encode("utf-8-sig"), file_name="V20_6_sintesi_robustezza_temporale.csv", mime="text/csv")
+                else:
+                    str_lit.warning("Sintesi V20.6 non disponibile: mancano alcune colonne del bootstrap temporale.")
         else:
             str_lit.warning(
                 "Non ci sono ancora abbastanza osservazioni precedenti per valutare le statistiche. "
