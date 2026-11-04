@@ -9,7 +9,7 @@ import streamlit as str_lit
 
 # --- CONFIGURAZIONE PAGINA ---
 str_lit.set_page_config(
-    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Audit V21.5",
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — Audit V21.6",
     layout="wide",
     page_icon="⚽",
 )
@@ -1013,7 +1013,7 @@ def crea_diagnostica_calibrazione_v210(df_det):
     return df_checks, df_comp, df_bins_source, df_bins_comp_source
 
 
-def crea_diagnostica_v213(df_audit, includi_dettaglio=False):
+def crea_diagnostica_v213(df_audit):
     """V21.3: confronto imparziale del modello con baseline bookmaker de-vig.
 
     Valuta TUTTI gli esiti per ogni partita con quote complete, non soltanto
@@ -1022,8 +1022,7 @@ def crea_diagnostica_v213(df_audit, includi_dettaglio=False):
     Solo Audit: nessuna probabilita' viene modificata o riutilizzata operativamente.
     """
     if df_audit is None or df_audit.empty:
-        risultato = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
-        return risultato + (pd.DataFrame(),) if includi_dettaglio else risultato
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     d = df_audit.copy()
     for c in ["P(1) %", "P(X) %", "P(2) %", "P(Over 2.5) %", "P(Under 2.5) %"]:
@@ -1097,8 +1096,7 @@ def crea_diagnostica_v213(df_audit, includi_dettaglio=False):
                 })
     detail=pd.DataFrame(rows)
     if detail.empty:
-        risultato = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
-        return risultato + (detail,) if includi_dettaglio else risultato
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     summary=[]
     for keys,g in detail.groupby(["Mercato","Fonte quote"], dropna=False):
@@ -1152,107 +1150,213 @@ def crea_diagnostica_v213(df_audit, includi_dettaglio=False):
     checks.append({"Controllo":"Una riga per partita/mercato/fonte nel confronto completo","Esito":"PASS" if dup==0 else "ATTENZIONE","Valore":dup,"Unita":"duplicati","Righe":len(detail)})
     ev_error=float((detail["EV selezione (%)"]-detail["EV selezione ricalcolato (%)"]).abs().max())
     checks.append({"Controllo":"EV selezione = probabilita modello × quota − 1","Esito":"PASS" if ev_error<1e-8 else "ATTENZIONE","Valore":ev_error,"Unita":"massimo errore (pp)","Righe":len(detail)})
-    risultato = (df_summary, df_selection, df_bins, pd.DataFrame(checks))
-    return risultato + (detail,) if includi_dettaglio else risultato
+    return df_summary, df_selection, df_bins, pd.DataFrame(checks)
 
 
 
-def crea_audit_v215_stabilita_temporale(df_audit, bootstrap_reps=500, blocco_giorni=7, seed=215):
-    """V21.5: stabilita' temporale del confronto Poisson WF vs bookmaker.
+def crea_audit_stabilita_v215(df_audit, n_boot=500, giorni_blocco=7, seed=20261104):
+    """V21.5: stabilita' temporale della calibrazione, solo Audit.
 
-    Il dettaglio viene ricostruito dalla stessa funzione V21.3. Avg e B365
-    restano analizzate separatamente: non vengono mai sommate come se fossero
-    partite indipendenti. Il bootstrap ricampiona blocchi calendario contigui.
-    Nessuna probabilita' operativa viene modificata.
+    Usa una sola riga per partita (nessun raddoppio Avg/B365), raggruppa per
+    competizione e stagione calcistica e calcola intervalli bootstrap a blocchi
+    temporali sulla differenza media p-y. Non modifica probabilita' operative.
     """
-    vuoto = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+    vuoto = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
     if df_audit is None or df_audit.empty:
         return vuoto
-    _, _, _, checks213, detail = crea_diagnostica_v213(df_audit, includi_dettaglio=True)
-    if detail is None or detail.empty:
-        return vuoto
+    d = df_audit.copy()
+    required = ["Data", "Competizione", "P(1) %", "P(X) %", "P(2) %",
+                "P(Over 2.5) %", "Esito reale", "Gol casa reali", "Gol trasferta reali"]
+    missing = [c for c in required if c not in d.columns]
+    if missing:
+        checks = pd.DataFrame([{"Controllo": "Colonne necessarie V21.5", "Esito": "ATTENZIONE",
+                                "Dettaglio": ", ".join(missing)}])
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), checks
 
-    d = detail.copy()
-    d["_data"] = pd.to_datetime(d["Data"], errors="coerce")
-    d = d.dropna(subset=["_data", "Competizione", "Mercato", "Fonte quote"]).copy()
+    d["Data_dt"] = pd.to_datetime(d["Data"], errors="coerce", utc=True).dt.tz_convert(None)
+    for c in ["P(1) %", "P(X) %", "P(2) %", "P(Over 2.5) %"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce") / 100.0
+    d["Gol casa reali"] = pd.to_numeric(d["Gol casa reali"], errors="coerce")
+    d["Gol trasferta reali"] = pd.to_numeric(d["Gol trasferta reali"], errors="coerce")
+    d = d.dropna(subset=["Data_dt", "Competizione", "Esito reale", "Gol casa reali",
+                         "Gol trasferta reali", "P(1) %", "P(X) %", "P(2) %", "P(Over 2.5) %"]).copy()
+    d = d[d["Esito reale"].isin(["1", "X", "2"])].copy()
     if d.empty:
-        return vuoto
-    d["Stagione"] = np.where(d["_data"].dt.month >= 8,
-        d["_data"].dt.year.astype(str) + "/" + (d["_data"].dt.year + 1).astype(str),
-        (d["_data"].dt.year - 1).astype(str) + "/" + d["_data"].dt.year.astype(str))
-    # Blocchi calendario: tutte le partite della stessa settimana restano insieme.
-    blocco_giorni = max(1, int(blocco_giorni))
-    giorni_da_epoch = (d["_data"].dt.normalize() - pd.Timestamp("1970-01-01")).dt.days
-    d["_blocco"] = (giorni_da_epoch // blocco_giorni).astype(int)
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame([
+            {"Controllo": "Righe valide V21.5", "Esito": "ATTENZIONE", "Dettaglio": "Nessuna riga valida"}])
 
+    # Stagione calcistica: luglio-giugno; ogni partita compare una sola volta.
+    start_year = d["Data_dt"].dt.year - (d["Data_dt"].dt.month < 7).astype(int)
+    d["Stagione"] = start_year.astype(str) + "/" + (start_year + 1).astype(str)
+    d["y_over"] = ((d["Gol casa reali"] + d["Gol trasferta reali"]) >= 3).astype(int)
     rng = np.random.default_rng(seed)
-    rows = []
-    group_cols = ["Mercato", "Fonte quote", "Competizione", "Stagione"]
-    for keys, g in d.groupby(group_cols, dropna=False, sort=True):
-        n = len(g)
-        blocks = [x.index.to_numpy() for _, x in g.groupby("_blocco", sort=True)]
-        n_blocks = len(blocks)
-        row = {"Mercato":keys[0], "Fonte quote":keys[1], "Competizione":keys[2], "Stagione":keys[3],
-               "Partite":n, "Settimane/blocchi":n_blocks,
-               "Delta Brier medio modello-bookmaker":float(g["Delta Brier modello - bookmaker"].mean()),
-               "Delta LogLoss medio modello-bookmaker":float(g["Delta LogLoss modello - bookmaker"].mean())}
-        if n_blocks >= 4 and n >= 30 and bootstrap_reps > 0:
-            brier_delta = np.empty(bootstrap_reps, dtype=float)
-            ll_delta = np.empty(bootstrap_reps, dtype=float)
-            for b in range(bootstrap_reps):
-                chosen = rng.integers(0, n_blocks, size=n_blocks)
-                sampled_idx = np.concatenate([blocks[j] for j in chosen])
-                sample = d.loc[sampled_idx]
-                brier_delta[b] = sample["Delta Brier modello - bookmaker"].mean()
-                ll_delta[b] = sample["Delta LogLoss modello - bookmaker"].mean()
-            row.update({
-                "IC95 Brier low":float(np.quantile(brier_delta,0.025)),
-                "IC95 Brier high":float(np.quantile(brier_delta,0.975)),
-                "P bootstrap Brier < 0 (%)":100.0*float(np.mean(brier_delta<0)),
-                "IC95 LogLoss low":float(np.quantile(ll_delta,0.025)),
-                "IC95 LogLoss high":float(np.quantile(ll_delta,0.975)),
-                "P bootstrap LogLoss < 0 (%)":100.0*float(np.mean(ll_delta<0)),
-                "Esito bootstrap":"Calcolato"
-            })
-        else:
-            row.update({"IC95 Brier low":np.nan,"IC95 Brier high":np.nan,
-                "P bootstrap Brier < 0 (%)":np.nan,"IC95 LogLoss low":np.nan,
-                "IC95 LogLoss high":np.nan,"P bootstrap LogLoss < 0 (%)":np.nan,
-                "Esito bootstrap":"Campione/blocchi insufficienti"})
-        # Interpretazione: delta > 0 significa che il bookmaker ha score più basso.
-        row["Modello peggiore del bookmaker"] = int(row["Delta Brier medio modello-bookmaker"] > 0 and row["Delta LogLoss medio modello-bookmaker"] > 0)
-        rows.append(row)
-    per_stagione = pd.DataFrame(rows)
+    metric_rows, cal_rows = [], []
+    specs = {
+        "1X2": (["1", "X", "2"], ["P(1) %", "P(X) %", "P(2) %"],
+                lambda g: g["Esito reale"].astype(str).to_numpy()),
+        "Over/Under 2.5 gol": (["Over 2.5", "Under 2.5"], ["P(Over 2.5) %", None],
+                lambda g: g["y_over"].to_numpy()),
+    }
+    for (comp, season), g0 in d.groupby(["Competizione", "Stagione"], dropna=False):
+        g0 = g0.sort_values("Data_dt").copy()
+        if len(g0) < 30:
+            continue
+        # Blocchi consecutivi di 7 giorni ancorati all'inizio del gruppo.
+        g0["_block"] = ((g0["Data_dt"] - g0["Data_dt"].min()).dt.days // max(1, int(giorni_blocco))).astype(int)
+        for market, (labels, prob_cols, actual_fn) in specs.items():
+            if market == "1X2":
+                probs = g0[prob_cols].to_numpy(dtype=float)
+                actual = actual_fn(g0)
+                ymat = np.column_stack([(actual == lab).astype(float) for lab in labels])
+                valid = np.isfinite(probs).all(axis=1) & np.isclose(probs.sum(axis=1), 1.0, atol=0.01)
+            else:
+                po = g0["P(Over 2.5) %"].to_numpy(dtype=float)
+                probs = np.column_stack([po, 1.0-po])
+                yo = actual_fn(g0).astype(float)
+                ymat = np.column_stack([yo, 1.0-yo])
+                valid = np.isfinite(probs).all(axis=1) & (po >= 0) & (po <= 1)
+            if valid.sum() < 30:
+                continue
+            gg = g0.loc[valid].copy().reset_index(drop=True)
+            probs, ymat = probs[valid], ymat[valid]
+            actual_labels = labels
+            # Brier/LogLoss vettoriali per stagione.
+            brier = float(np.mean(np.sum((probs-ymat)**2, axis=1)))
+            chosen = np.argmax(ymat, axis=1)
+            ll = float(np.mean(-np.log(np.clip(probs[np.arange(len(probs)), chosen], 1e-12, 1.0))))
+            metric_rows.append({"Mercato": market, "Competizione": comp, "Stagione": season,
+                                "Partite": int(len(gg)), "Brier medio": brier, "LogLoss medio": ll,
+                                "Blocchi temporali": int(gg["_block"].nunique())})
+            block_ids = gg["_block"].unique()
+            block_indices = [np.flatnonzero(gg["_block"].to_numpy() == b) for b in block_ids]
+            for j, label in enumerate(actual_labels):
+                delta = probs[:, j] - ymat[:, j]
+                boots = []
+                if len(block_indices) >= 3:
+                    for _ in range(int(n_boot)):
+                        chosen_blocks = rng.integers(0, len(block_indices), size=len(block_indices))
+                        ix = np.concatenate([block_indices[k] for k in chosen_blocks])
+                        if len(ix):
+                            boots.append(float(np.mean(delta[ix])))
+                if boots:
+                    lo, hi = np.quantile(boots, [0.025, 0.975])
+                else:
+                    lo, hi = np.nan, np.nan
+                mean_p, observed = float(probs[:, j].mean()), float(ymat[:, j].mean())
+                gap = mean_p-observed
+                cal_rows.append({"Mercato": market, "Competizione": comp, "Stagione": season,
+                    "Esito": label, "N": int(len(gg)), "Probabilita media prevista (%)": 100*mean_p,
+                    "Frequenza reale (%)": 100*observed, "Scarto previsto-reale (pp)": 100*gap,
+                    "IC95% bootstrap blocchi low (pp)": 100*lo if np.isfinite(lo) else np.nan,
+                    "IC95% bootstrap blocchi high (pp)": 100*hi if np.isfinite(hi) else np.nan,
+                    "Blocchi temporali": int(len(block_indices)),
+                    "Esito intervallo": ("Sovrastima persistente nel gruppo" if lo > 0 else
+                                         "Sottostima persistente nel gruppo" if hi < 0 else
+                                         "Intervallo include zero" if np.isfinite(lo) else "Non stimabile (<3 blocchi)"),
+                    "Affidabilita campione": "Adeguato (N≥30)" if len(gg)>=30 else "Limitato (N<30)"})
 
-    trend_rows=[]
-    if not per_stagione.empty:
-        for keys,g in per_stagione.groupby(["Mercato","Fonte quote"], dropna=False, sort=True):
-            valid=g[g["Esito bootstrap"]=="Calcolato"]
-            trend_rows.append({
-                "Mercato":keys[0],"Fonte quote":keys[1],
-                "Stagioni analizzate":int(g["Stagione"].nunique()),
-                "Competizioni-stagione":len(g),
-                "Confronti con Brier e LogLoss entrambi peggiori":int(g["Modello peggiore del bookmaker"].sum()),
-                "Quota confronti con modello peggiore (%)":100.0*float(g["Modello peggiore del bookmaker"].mean()),
-                "Confronti con IC95 Brier interamente > 0":int((valid["IC95 Brier low"]>0).sum()),
-                "Confronti con IC95 LogLoss interamente > 0":int((valid["IC95 LogLoss low"]>0).sum()),
-                "Confronti con P bootstrap Brier < 0 ≥ 95%":int((valid["P bootstrap Brier < 0 (%)"]>=95).sum()),
-                "Confronti con P bootstrap LogLoss < 0 ≥ 95%":int((valid["P bootstrap LogLoss < 0 (%)"]>=95).sum()),
-                "Nota":"Avg e B365 restano separate; non sommare le rispettive righe."
-            })
-    trend=pd.DataFrame(trend_rows)
+    df_metrics = pd.DataFrame(metric_rows)
+    df_cal = pd.DataFrame(cal_rows)
+    if not df_cal.empty:
+        persist = []
+        for keys, g in df_cal.groupby(["Mercato", "Competizione", "Esito"], dropna=False):
+            eligible = g[g["Esito intervallo"] != "Non stimabile (<3 blocchi)"]
+            persist.append({"Mercato": keys[0], "Competizione": keys[1], "Esito": keys[2],
+                "Stagioni valutate": int(len(g)),
+                "Stagioni con IC95% sopra zero": int((eligible["IC95% bootstrap blocchi low (pp)"] > 0).sum()),
+                "Stagioni con IC95% sotto zero": int((eligible["IC95% bootstrap blocchi high (pp)"] < 0).sum()),
+                "Stagioni con IC95% che include zero": int((eligible["Esito intervallo"] == "Intervallo include zero").sum()),
+                "Scarto medio tra stagioni (pp)": float(g["Scarto previsto-reale (pp)"].mean()),
+                "N complessivo": int(g["N"].sum())})
+        df_persist = pd.DataFrame(persist)
+    else:
+        df_persist = pd.DataFrame()
+    checks = pd.DataFrame([
+        {"Controllo": "Partite uniche (nessun doppio Avg/B365)", "Esito": "PASS" if not d.duplicated(["Data_dt", "Competizione", "Casa", "Trasferta"]).any() else "ATTENZIONE",
+         "Dettaglio": f"{len(d)} righe; una riga per partita nel df_audit"},
+        {"Controllo": "Bootstrap a blocchi temporali", "Esito": "PASS" if not df_cal.empty and (df_cal["Blocchi temporali"] >= 3).any() else "ATTENZIONE",
+         "Dettaglio": f"Blocchi da {giorni_blocco} giorni; {n_boot} repliche richieste"},
+        {"Controllo": "Modello operativo invariato", "Esito": "PASS", "Dettaglio": "V21.5 legge df_audit e non riscrive probabilita' o ranking"},
+    ])
+    return df_metrics, df_cal, df_persist, checks
 
-    # Controlli di copertura e duplicazione. Chiave include la fonte, poiché i confronti
-    # Avg e B365 sono distinti; il trend non tratta le due fonti come campioni indipendenti.
-    key_cols=["Data","Competizione","Casa","Trasferta","Mercato","Fonte quote"]
-    dup=int(d.duplicated(key_cols).sum())
-    checks=[
-        {"Controllo":"Date valide per analisi temporale","Esito":"PASS" if d["_data"].notna().all() else "ATTENZIONE","Valore":int(d["_data"].notna().sum()),"Righe":len(d)},
-        {"Controllo":"Duplicati partita/mercato/fonte","Esito":"PASS" if dup==0 else "ATTENZIONE","Valore":dup,"Righe":len(d)},
-        {"Controllo":"Bootstrap a blocchi temporali","Esito":"PASS" if not per_stagione.empty and (per_stagione["Esito bootstrap"]=="Calcolato").any() else "ATTENZIONE","Valore":int((per_stagione["Esito bootstrap"]=="Calcolato").sum()) if not per_stagione.empty else 0,"Righe":len(per_stagione)},
-        {"Controllo":"Nessuna fusione Avg/B365","Esito":"PASS" if set(d["Fonte quote"].dropna().unique()).issubset({"Avg","B365"}) else "ATTENZIONE","Valore":int(d["Fonte quote"].nunique()),"Righe":len(d)},
-    ]
-    return per_stagione, trend, pd.DataFrame(checks)
+
+
+def crea_diagnostica_v216(df_audit, n_boot=500, giorni_blocco=7, seed=20261106):
+    """V21.6: contributo dei singoli esiti al divario modello-bookmaker. Solo Audit."""
+    empty=(pd.DataFrame(),pd.DataFrame())
+    if df_audit is None or df_audit.empty:
+        return empty
+    d=df_audit.copy()
+    for c in ["P(1) %","P(X) %","P(2) %","P(Over 2.5) %","P(Under 2.5) %"]:
+        if c in d.columns:
+            d[c]=pd.to_numeric(d[c],errors="coerce")/100.0
+    cfg={
+      "1X2":{"Avg":(["Quota Avg_1","Quota Avg_X","Quota Avg_2"],["1","X","2"],["P(1) %","P(X) %","P(2) %"]),
+            "B365":(["Quota B365_1","Quota B365_X","Quota B365_2"],["1","X","2"],["P(1) %","P(X) %","P(2) %"])},
+      "Over/Under 2.5 gol":{"Avg":(["Quota Avg_Over25","Quota Avg_Under25"],["Over 2.5","Under 2.5"],["P(Over 2.5) %","P(Under 2.5) %"]),
+            "B365":(["Quota B365_Over25","Quota B365_Under25"],["Over 2.5","Under 2.5"],["P(Over 2.5) %","P(Under 2.5) %"])}}
+    rows=[]
+    for market,books in cfg.items():
+      for source,(odd_cols,labels,pcols) in books.items():
+        if not all(c in d.columns for c in odd_cols+pcols+["Data","Competizione","Esito reale","Gol casa reali","Gol trasferta reali"]):
+          continue
+        odds=d[odd_cols].apply(pd.to_numeric,errors="coerce")
+        probs=d[pcols].apply(pd.to_numeric,errors="coerce")
+        valid=odds.notna().all(axis=1)&(odds>1).all(axis=1)&probs.notna().all(axis=1)&(probs>=0).all(axis=1)&np.isclose(probs.sum(axis=1),1.0,atol=0.001)
+        for idx in d.index[valid]:
+          r=d.loc[idx]
+          if market=="1X2": actual=str(r["Esito reale"])
+          else:
+            gh=pd.to_numeric(pd.Series([r["Gol casa reali"]]),errors="coerce").iloc[0]
+            ga=pd.to_numeric(pd.Series([r["Gol trasferta reali"]]),errors="coerce").iloc[0]
+            if pd.isna(gh) or pd.isna(ga): continue
+            actual="Over 2.5" if gh+ga>=3 else "Under 2.5"
+          if actual not in labels: continue
+          op=odds.loc[idx].to_numpy(float); mp=probs.loc[idx].to_numpy(float)
+          inv=1.0/op; bp=inv/inv.sum(); y=np.array([float(actual==lab) for lab in labels])
+          try: dt=pd.to_datetime(r["Data"],errors="coerce",utc=True,dayfirst=True).tz_convert(None)
+          except Exception: dt=pd.NaT
+          if pd.isna(dt): continue
+          sy=dt.year-(dt.month<7); season=f"{sy}/{sy+1}"
+          for j,lab in enumerate(labels):
+            rows.append({"Data_dt":dt,"Competizione":r["Competizione"],"Stagione":season,"Mercato":market,"Fonte quote":source,"Esito":lab,
+              "Brier componente modello":(mp[j]-y[j])**2,"Brier componente bookmaker":(bp[j]-y[j])**2,
+              "Delta Brier componente":(mp[j]-y[j])**2-(bp[j]-y[j])**2,
+              "LogLoss componente modello":-y[j]*np.log(np.clip(mp[j],1e-12,1.0)),
+              "LogLoss componente bookmaker":-y[j]*np.log(np.clip(bp[j],1e-12,1.0)),
+              "Delta LogLoss componente":-y[j]*np.log(np.clip(mp[j],1e-12,1.0))+y[j]*np.log(np.clip(bp[j],1e-12,1.0))})
+    x=pd.DataFrame(rows)
+    if x.empty: return empty
+    rng=np.random.default_rng(seed); out=[]
+    keys=["Mercato","Fonte quote","Competizione","Stagione","Esito"]
+    for k,g in x.groupby(keys,dropna=False):
+      g=g.sort_values("Data_dt").copy(); g["_blocco"]=(g["Data_dt"]-g["Data_dt"].min()).dt.days//max(1,int(giorni_blocco))
+      blocks=g["_blocco"].unique(); ix=[np.flatnonzero(g["_blocco"].to_numpy()==b) for b in blocks]
+      boots_b=[]; boots_l=[]
+      if len(ix)>=3:
+        for _ in range(int(n_boot)):
+          take=rng.integers(0,len(ix),size=len(ix)); sample=np.concatenate([ix[z] for z in take])
+          boots_b.append(float(g["Delta Brier componente"].to_numpy()[sample].mean()))
+          boots_l.append(float(g["Delta LogLoss componente"].to_numpy()[sample].mean()))
+      blo,bhi=np.quantile(boots_b,[.025,.975]) if boots_b else (np.nan,np.nan)
+      llo,lhi=np.quantile(boots_l,[.025,.975]) if boots_l else (np.nan,np.nan)
+      out.append({"Mercato":k[0],"Fonte quote":k[1],"Competizione":k[2],"Stagione":k[3],"Esito":k[4],"N":len(g),"Blocchi 7g":len(ix),
+        "Delta Brier componente medio":g["Delta Brier componente"].mean(),"IC95 Brier low":blo,"IC95 Brier high":bhi,
+        "Delta LogLoss componente medio":g["Delta LogLoss componente"].mean(),"IC95 LogLoss low":llo,"IC95 LogLoss high":lhi,
+        "Diagnosi Brier":("Modello peggiore" if blo>0 else "Modello migliore" if bhi<0 else "IC include zero" if np.isfinite(blo) else "Non stimabile"),
+        "Diagnosi LogLoss":("Modello peggiore" if llo>0 else "Modello migliore" if lhi<0 else "IC include zero" if np.isfinite(llo) else "Non stimabile")})
+    detail=pd.DataFrame(out)
+    summary=(detail.groupby(["Mercato","Fonte quote","Esito"],dropna=False).agg(
+      **{"Confronti comp-stagione":("N","size"),"Partite":("N","sum")},
+      Delta_Brier_medio=("Delta Brier componente medio","mean"),Delta_LogLoss_medio=("Delta LogLoss componente medio","mean"),
+      Gruppi_IC_Brier_positivi=("Diagnosi Brier",lambda z:(z=="Modello peggiore").sum()),
+      Gruppi_IC_LogLoss_positivi=("Diagnosi LogLoss",lambda z:(z=="Modello peggiore").sum())).reset_index())
+    checks=pd.DataFrame([
+      {"Controllo":"Fonti bookmaker separate","Esito":"PASS" if set(x["Fonte quote"].dropna().unique()).issubset({"Avg","B365"}) else "ATTENZIONE","Dettaglio":"Avg e B365 restano gruppi distinti"},
+      {"Controllo":"Decomposizione per esito","Esito":"PASS" if not detail.empty else "ATTENZIONE","Dettaglio":f"{len(x)} contributi per esito; nessuna probabilita' operativa modificata"},
+      {"Controllo":"Bootstrap temporale","Esito":"PASS" if (detail["Blocchi 7g"]>=3).any() else "ATTENZIONE","Dettaglio":f"Blocchi da {giorni_blocco} giorni; {n_boot} repliche"}])
+    return detail,summary,checks
 
 def _prob_clip(p):
     return float(np.clip(float(p), 1e-6, 1.0 - 1e-6))
@@ -2307,23 +2411,51 @@ with tab_audit:
             str_lit.download_button("⬇️ Scarica calibrazione completa V21.3 CSV", df213_bins.to_csv(index=False).encode("utf-8-sig"), "V21_3_calibrazione_tutti_esiti.csv", "text/csv")
         str_lit.info("Nota metodologica: il confronto bookmaker usa probabilità implicite normalizzate sulle quote Avg/B365 realmente disponibili. Non equivale a una baseline storica indipendente; è un confronto con il mercato. Le partite senza quote complete sono escluse da entrambi i lati del confronto.")
 
-        # V21.5 — stabilita' temporale del confronto: solo Audit.
-        str_lit.markdown("### 🧭 V21.5 — Stabilità temporale del confronto modello/bookmaker")
-        str_lit.caption("Verifica se il divario V21.3 si ripete nelle stagioni e nelle competizioni. Bootstrap a blocchi settimanali per rispettare la dipendenza temporale. Avg e B365 sono mantenute separate: non vengono sommate come partite indipendenti. Nessuna modifica al modello operativo.")
-        with str_lit.spinner("Analisi V21.5: stagioni e bootstrap temporale a blocchi..."):
-            df215_season, df215_trend, df215_checks = crea_audit_v215_stabilita_temporale(df_audit, bootstrap_reps=500, blocco_giorni=7, seed=215)
+
+        # V21.5 — stabilita' temporale della calibrazione; solo Audit.
+        str_lit.markdown("### 🧭 V21.5 — Stabilità temporale della calibrazione (solo Audit)")
+        str_lit.caption("Valuta una sola volta ogni partita, senza duplicarla per Avg/B365. Raggruppa per competizione e stagione calcistica (luglio-giugno) e usa bootstrap a blocchi di 7 giorni per gli intervalli di confidenza dello scarto previsto-reale. Nessuna correzione operativa.")
+        with str_lit.spinner("Verifica stabilità temporale per stagione e competizione..."):
+            df215_metriche, df215_cal, df215_persist, df215_checks = crea_audit_stabilita_v215(df_audit)
         if not df215_checks.empty:
             str_lit.markdown("#### Controlli V21.5")
             str_lit.dataframe(df215_checks, use_container_width=True, hide_index=True)
-        if not df215_season.empty:
-            str_lit.markdown("#### Risultati per competizione e stagione")
-            str_lit.caption("Delta = modello − bookmaker: positivo significa score peggiore per il modello. Gli intervalli sono bootstrap al 95% su blocchi settimanali. I gruppi con pochi blocchi non ricevono un intervallo.")
-            str_lit.dataframe(df215_season.round(5), use_container_width=True, hide_index=True)
-            str_lit.download_button("⬇️ Scarica stabilità temporale V21.5 CSV", df215_season.to_csv(index=False).encode("utf-8-sig"), "V21_5_stabilita_per_competizione_stagione.csv", "text/csv")
-        if not df215_trend.empty:
-            str_lit.markdown("#### Persistenza complessiva per mercato e fonte")
-            str_lit.dataframe(df215_trend.round(4), use_container_width=True, hide_index=True)
-            str_lit.download_button("⬇️ Scarica riepilogo persistenza V21.5 CSV", df215_trend.to_csv(index=False).encode("utf-8-sig"), "V21_5_riepilogo_persistenza.csv", "text/csv")
+        if not df215_metriche.empty:
+            str_lit.markdown("#### Qualità probabilistica per competizione e stagione")
+            str_lit.caption("Brier e LogLoss sono calcolati sul vettore completo degli esiti; valori più bassi sono migliori. Le righe non sono selezioni EV.")
+            str_lit.dataframe(df215_metriche.round(5), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica metriche V21.5 per stagione CSV", df215_metriche.to_csv(index=False).encode("utf-8-sig"), "V21_5_metriche_stagione.csv", "text/csv")
+        if not df215_cal.empty:
+            str_lit.markdown("#### Calibrazione per esito e stagione con IC95% bootstrap temporale")
+            str_lit.caption("Scarto positivo = sovrastima; negativo = sottostima. Se l'intervallo IC95% include zero, lo scarto non è distinguibile da zero al livello indicativo del 5%. Il bootstrap ricampiona blocchi di 7 giorni, non singole partite.")
+            str_lit.dataframe(df215_cal.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica calibrazione e IC95% V21.5 CSV", df215_cal.to_csv(index=False).encode("utf-8-sig"), "V21_5_calibrazione_ic95_blocchi.csv", "text/csv")
+        if not df215_persist.empty:
+            str_lit.markdown("#### Persistenza degli scarti tra stagioni")
+            str_lit.caption("Conta in quante stagioni lo scarto mantiene un intervallo interamente sopra o sotto zero. È una sintesi descrittiva, non una regola di correzione.")
+            str_lit.dataframe(df215_persist.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica persistenza V21.5 CSV", df215_persist.to_csv(index=False).encode("utf-8-sig"), "V21_5_persistenza_stagioni.csv", "text/csv")
+        else:
+            str_lit.warning("V21.5 non ha prodotto gruppi sufficienti: verificare date, colonne e numerosità per stagione.")
+
+
+        # V21.6 — scomposizione per singolo esito del divario rispetto al bookmaker.
+        str_lit.markdown("### 🔬 V21.6 — Quali esiti generano il divario? (solo Audit)")
+        str_lit.caption("Scompone Brier e LogLoss nei contributi dei singoli esiti (1/X/2 e Over/Under), confrontando Poisson con bookmaker de-vig sulle stesse partite. Bootstrap a blocchi di 7 giorni per competizione e stagione. Avg e B365 restano separate.")
+        with str_lit.spinner("Scomposizione del divario per esito e bootstrap temporale..."):
+            df216_dettaglio, df216_sintesi, df216_checks = crea_diagnostica_v216(df_audit)
+        if not df216_checks.empty:
+            str_lit.markdown("#### Controlli V21.6")
+            str_lit.dataframe(df216_checks, use_container_width=True, hide_index=True)
+        if not df216_sintesi.empty:
+            str_lit.markdown("#### Sintesi: esiti che pesano maggiormente sul divario")
+            str_lit.caption("Delta positivo = contributo d'errore maggiore per il modello; negativo = contributo minore. Gli IC sono calcolati separatamente per competizione e stagione.")
+            str_lit.dataframe(df216_sintesi.round(5), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica sintesi V21.6 CSV", df216_sintesi.to_csv(index=False).encode("utf-8-sig"), "V21_6_sintesi_esiti.csv", "text/csv")
+        if not df216_dettaglio.empty:
+            with str_lit.expander("Dettaglio V21.6 per competizione e stagione", expanded=False):
+                str_lit.dataframe(df216_dettaglio.round(5), use_container_width=True, hide_index=True)
+                str_lit.download_button("⬇️ Scarica dettaglio V21.6 CSV", df216_dettaglio.to_csv(index=False).encode("utf-8-sig"), "V21_6_dettaglio_esiti_blocchi.csv", "text/csv")
 
         # V15: pacchetto diagnostico aggiuntivo; nessuna modifica alle previsioni operative.
         str_lit.markdown("#### 🧪 V18 — Riconciliazione conteggi e stabilità temporale (solo diagnostica)")
