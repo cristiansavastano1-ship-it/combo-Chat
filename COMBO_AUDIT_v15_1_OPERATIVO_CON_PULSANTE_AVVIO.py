@@ -115,8 +115,7 @@ tab_calendario, tab_classifica, tab_value, tab_grafici, tab_ai_schedine, tab_val
     "🤖 Schedine AI",
     "⚡ Value Finder",
     "🎲 Monte Carlo",
-    "🛡️ Audit",
-    "📈 Validazione prospettica"
+    "🛡️ Audit"
 ])
 
 # --- FUNZIONI DI SUPPORTO & MODELLAZIONE ---
@@ -671,120 +670,6 @@ def crea_audit_v205_calibrazione(df_pred, bootstrap_reps=1000, seed=205, blocco_
 
 def poisson_prob(lmbda, k):
     return (math.exp(-lmbda) * (lmbda**k)) / math.factorial(k)
-
-def _probabilita_snapshot_v216(match, stats_dict):
-    """Replica le lambda e le probabilità mostrate nella scheda match V21.6.
-    Non modifica né sostituisce il motore operativo: crea solo uno snapshot Audit.
-    """
-    casa = (match.get("homeTeam") or {}).get("name")
-    trasferta = (match.get("awayTeam") or {}).get("name")
-    if not casa or not trasferta:
-        return None
-    dati_c = stats_dict.get(casa, {})
-    dati_t = stats_dict.get(trasferta, {})
-    try:
-        lambda_c = float(dati_c.get("media_gf", 1.4))
-        lambda_t = float(dati_t.get("media_gf", 1.1))
-    except (TypeError, ValueError):
-        return None
-    if not (np.isfinite(lambda_c) and np.isfinite(lambda_t) and lambda_c >= 0 and lambda_t >= 0):
-        return None
-
-    matrice = np.zeros((11, 11), dtype=float)
-    for gc in range(11):
-        for gt in range(11):
-            matrice[gc, gt] = poisson_prob(lambda_c, gc) * poisson_prob(lambda_t, gt)
-    massa = float(matrice.sum())
-    if not np.isfinite(massa) or massa <= 0:
-        return None
-    matrice /= massa
-    p1 = float(np.tril(matrice, k=-1).sum())  # righe casa > colonne trasferta
-    px = float(np.trace(matrice))
-    p2 = float(np.triu(matrice, k=1).sum())
-    p_goal = float(matrice[1:, 1:].sum())
-    p_no_goal = 1.0 - p_goal
-    p_under25 = float(sum(matrice[gc, gt] for gc in range(11) for gt in range(11) if gc + gt <= 2))
-    p_over25 = 1.0 - p_under25
-    return {
-        "Lambda casa snapshot": lambda_c,
-        "Lambda trasferta snapshot": lambda_t,
-        "P1 %": p1 * 100,
-        "PX %": px * 100,
-        "P2 %": p2 * 100,
-        "Goal %": p_goal * 100,
-        "No Goal %": p_no_goal * 100,
-        "Over 2.5 %": p_over25 * 100,
-        "Under 2.5 %": p_under25 * 100,
-    }
-
-
-def crea_righe_snapshot_prospettico(matches_list, stats_dict):
-    """Registra solo fixture non iniziate, con ID stabile e probabilità V21.6."""
-    righe = []
-    stati_ammessi = {"TIMED", "SCHEDULED"}
-    for m in matches_list:
-        if str(m.get("status", "")).upper() not in stati_ammessi:
-            continue
-        utc_date = m.get("utcDate")
-        if not utc_date:
-            continue
-        prob = _probabilita_snapshot_v216(m, stats_dict)
-        if prob is None:
-            continue
-        home = (m.get("homeTeam") or {}).get("name", "")
-        away = (m.get("awayTeam") or {}).get("name", "")
-        competition = m.get("Competizione", "Torneo")
-        match_id = m.get("id")
-        if match_id is None:
-            match_id = f"{competition}|{utc_date}|{home}|{away}"
-        r = {
-            "Match_ID": str(match_id),
-            "Data_UTC": str(utc_date),
-            "Competizione": competition,
-            "Giornata": m.get("matchday"),
-            "Casa": home,
-            "Trasferta": away,
-            "Stato_snapshot": str(m.get("status")),
-            "Versione_modello": "V21.6-operativo-snapshot",
-            "Timestamp_snapshot_UTC": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-            **prob,
-            "Gol_casa_reali": np.nan,
-            "Gol_trasferta_reali": np.nan,
-            "Esito_1X2_reale": "",
-            "No_Goal_reale": np.nan,
-            "Over_2_5_reale": np.nan,
-            "Stato_risultato": "IN_ATTESA",
-        }
-        righe.append(r)
-    return pd.DataFrame(righe)
-
-
-def aggiorna_risultati_snapshot(df_archivio, matches_list):
-    """Aggiorna soltanto gli esiti finali; le probabilità snapshot restano immutate."""
-    if df_archivio is None or df_archivio.empty:
-        return df_archivio
-    out = df_archivio.copy()
-    indice = {str(m.get("id")): m for m in matches_list if m.get("id") is not None}
-    for i, row in out.iterrows():
-        m = indice.get(str(row.get("Match_ID", "")))
-        if not m or str(m.get("status", "")).upper() != "FINISHED":
-            continue
-        score = (m.get("score") or {}).get("fullTime") or {}
-        gc, gt = score.get("home"), score.get("away")
-        if gc is None or gt is None:
-            continue
-        try:
-            gc, gt = int(gc), int(gt)
-        except (TypeError, ValueError):
-            continue
-        out.at[i, "Gol_casa_reali"] = gc
-        out.at[i, "Gol_trasferta_reali"] = gt
-        out.at[i, "Esito_1X2_reale"] = "1" if gc > gt else ("X" if gc == gt else "2")
-        out.at[i, "No_Goal_reale"] = int(gc == 0 or gt == 0)
-        out.at[i, "Over_2_5_reale"] = int(gc + gt >= 3)
-        out.at[i, "Stato_risultato"] = "FINISHED"
-    return out
-
 
 def calcola_statistiche_avanzate_match(sq_casa, sq_trasf, statistiche_squadre):
     dati_c = statistiche_squadre.get(sq_casa, {"media_gf": 1.4, "media_gs": 1.1})
@@ -1746,88 +1631,6 @@ for c_nome, (codice_lega, tipo_fonte) in selezionati_dict.items():
                         "forma": "N/D",
                         "Competizione": c_nome
                     }
-
-# --- VALIDAZIONE PROSPETTICA: archivio CSV esterno e portabile ---
-with tab_validazione:
-    str_lit.subheader("📈 Validazione prospettica — registro pre-partita")
-    str_lit.info(
-        "Questa sezione registra uno snapshot delle probabilità V21.6 per le partite "
-        "ancora non iniziate. Non cambia lambda, Poisson, quote, ranking o previsioni operative. "
-        "Su Streamlit Cloud il filesystem locale può essere temporaneo: scarica il CSV e "
-        "ricaricalo nelle sessioni successive per conservarne lo storico."
-    )
-    str_lit.caption(
-        "Le probabilità registrate replicano la scheda partita V21.6: lambda ricavate dalle "
-        "medie GF correnti in classifica, fallback 1.4 casa e 1.1 trasferta, matrice Poisson 0–10 "
-        "normalizzata. Non sono una ricostruzione storica delle classifiche pre-partita."
-    )
-    file_archivio = str_lit.file_uploader(
-        "Carica il CSV dell'archivio prospettico precedente (se esiste)",
-        type=["csv"], key="upload_archivio_prospettico_v217"
-    )
-    df_archivio_prospettico = pd.DataFrame()
-    if file_archivio is not None:
-        try:
-            df_archivio_prospettico = pd.read_csv(file_archivio)
-            if "Match_ID" not in df_archivio_prospettico.columns:
-                str_lit.error("CSV non riconosciuto: manca la colonna Match_ID. L'archivio non è stato modificato.")
-                df_archivio_prospettico = pd.DataFrame()
-        except Exception as exc:
-            str_lit.error(f"Impossibile leggere il CSV: {exc}")
-            df_archivio_prospettico = pd.DataFrame()
-
-    if not matches_raw:
-        str_lit.warning("Nessuna partita API caricata. Inserisci una API key football-data.org e seleziona il campionato.")
-    else:
-        n_programmate = sum(str(m.get("status", "")).upper() in {"TIMED", "SCHEDULED"} for m in matches_raw)
-        str_lit.metric("Partite non iniziate disponibili nel campionato selezionato", n_programmate)
-
-    if str_lit.button("📸 Crea / aggiorna snapshot pre-partita", key="btn_snapshot_v217"):
-        nuovo = crea_righe_snapshot_prospettico(matches_raw, statistiche_squadre)
-        if df_archivio_prospettico.empty:
-            base = nuovo.copy()
-        else:
-            base = df_archivio_prospettico.copy()
-            # Colonne nuove introdotte in eventuali versioni successive.
-            for col in nuovo.columns:
-                if col not in base.columns:
-                    base[col] = np.nan
-            if not nuovo.empty:
-                esistenti = set(base["Match_ID"].astype(str))
-                aggiunte = nuovo[~nuovo["Match_ID"].astype(str).isin(esistenti)]
-                base = pd.concat([base, aggiunte], ignore_index=True)
-        base = aggiorna_risultati_snapshot(base, matches_raw)
-        base = base.drop_duplicates(subset=["Match_ID"], keep="first")
-        str_lit.session_state["archivio_prospettico_v217"] = base
-        str_lit.success(
-            f"Archivio aggiornato: {len(nuovo)} fixture candidate; "
-            f"{len(base)} partite totali, {int(base.get('Stato_risultato', pd.Series(dtype=str)).eq('FINISHED').sum())} con risultato finale. "
-            "Le probabilità già registrate non vengono sovrascritte."
-        )
-
-    df_vis = str_lit.session_state.get("archivio_prospettico_v217")
-    if df_vis is None:
-        df_vis = aggiorna_risultati_snapshot(df_archivio_prospettico, matches_raw) if not df_archivio_prospettico.empty else pd.DataFrame()
-    if not df_vis.empty:
-        n_finite = int(df_vis.get("Stato_risultato", pd.Series(dtype=str)).eq("FINISHED").sum())
-        n_attesa = int(df_vis.get("Stato_risultato", pd.Series(dtype=str)).eq("IN_ATTESA").sum())
-        c_a, c_b, c_c = str_lit.columns(3)
-        c_a.metric("Previsioni archiviate", len(df_vis))
-        c_b.metric("Risultati acquisiti", n_finite)
-        c_c.metric("Ancora in attesa", n_attesa)
-        str_lit.dataframe(df_vis, use_container_width=True, hide_index=True)
-        str_lit.download_button(
-            "⬇️ Scarica archivio CSV aggiornato",
-            data=df_vis.to_csv(index=False).encode("utf-8-sig"),
-            file_name="COMBO_validazione_prospettica_V217.csv",
-            mime="text/csv",
-            key="download_archivio_prospettico_v217"
-        )
-        if n_finite >= 30:
-            str_lit.caption("Quando saranno disponibili almeno 30 risultati, verranno mostrati controlli preliminari; la valutazione conclusiva resta prevista su un campione molto più ampio (obiettivo iniziale: 500 partite).")
-    else:
-        str_lit.warning("Nessun archivio ancora disponibile. Carica il CSV precedente oppure crea il primo snapshot quando sono presenti partite future.")
-
 
 # --- TAB 1: CALENDARIO & STUDIO ---
 with tab_calendario:
