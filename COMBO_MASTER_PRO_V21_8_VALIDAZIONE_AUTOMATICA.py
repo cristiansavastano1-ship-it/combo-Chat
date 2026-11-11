@@ -11,7 +11,63 @@ from scipy.stats import poisson
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 
-st.set_page_config(page_title="COMBO — V21.8 Validazione prospettica", page_icon="⚽", layout="centered")
+st.set_page_config(
+    page_title="COMBO MASTER PRO AI — V21.8",
+    page_icon="⚽",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# =====================================================================
+# 🎨 INTERFACCIA VISIVA — TEMA APPROVATO COMBO MASTER PRO
+# Solo presentazione: non modifica calcoli, dati o probabilità.
+# =====================================================================
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+    #MainMenu, footer, header { visibility: hidden; }
+    .stApp { background: #0b0f19; color: #f3f4f6; }
+    .block-container { max-width: 1450px; padding-top: 1.5rem; padding-bottom: 3rem; }
+    [data-testid="stSidebar"] { background: #111827; border-right: 1px solid #1f2937; }
+    [data-testid="stMetric"] {
+        background: rgba(17, 24, 39, .88);
+        border: 1px solid #263449; padding: 14px; border-radius: 14px;
+        box-shadow: 0 6px 18px rgba(0,0,0,.18);
+    }
+    [data-testid="stMetricValue"] { color: #38bdf8 !important; font-weight: 700 !important; }
+    .stButton > button {
+        border: 1px solid #2563eb; border-radius: 10px; font-weight: 650;
+        background: linear-gradient(135deg, #2563eb, #1d4ed8); color: white;
+    }
+    .stButton > button:hover { border-color: #60a5fa; color: white; }
+    div[data-baseweb="select"] > div { background-color: #111827; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div style="
+        background: linear-gradient(135deg, #1e1b4b 0%, #0f172a 100%);
+        padding: 25px 28px; border-radius: 20px; border: 1px solid #312e81;
+        text-align: center; margin-bottom: 18px;
+        box-shadow: 0 18px 30px -12px rgba(0,0,0,.45);">
+        <h1 style="color:#f8fafc; font-weight:800; font-size:2rem;
+                   margin:0; letter-spacing:-.5px;">
+            ⚽ COMBO MASTER PRO AI
+        </h1>
+        <p style="color:#94a3b8; font-size:.98rem; margin:8px 0 0 0;">
+            Suite predittiva avanzata con Poisson, Monte Carlo e Value Analytics
+            · Validazione prospettica V21.8
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # =====================================================================
 # 🔎 AUDIT VERSION v5 — derivata dall'app originale, ma separata.
@@ -1618,7 +1674,7 @@ def _tabella_calibrazione_metriche(met):
 # =====================================================================
 # 🖥️ INTERFACCIA
 # =====================================================================
-st.title("🧪 COMBO — Audit Model V13.6 Operativa")
+st.markdown("## 🧠 Motore operativo COMBO · Analisi e validazione")
 
 
 # =====================================================================
