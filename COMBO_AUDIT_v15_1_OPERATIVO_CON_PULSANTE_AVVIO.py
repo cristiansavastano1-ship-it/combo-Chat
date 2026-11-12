@@ -1,6391 +1,4154 @@
-import streamlit as st
+import math
+from datetime import datetime
 import pandas as pd
 import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
 import requests
-import io
-import time
-import os
-import pickle
-from datetime import datetime, date
-from scipy.stats import poisson
-from sklearn.isotonic import IsotonicRegression
-from sklearn.linear_model import LogisticRegression
-
-st.set_page_config(page_title="COMBO — V13.6 Operativa", page_icon="⚽", layout="centered")
-
-# =====================================================================
-# 🔎 AUDIT VERSION v5 — derivata dall'app originale, ma separata.
-# NON usare questa versione per sostituire l'app originale: serve solo a
-# misurare il modello in modo più rigoroso prima di decidere modifiche.
-# Principi dell'audit:
-#   1) nessuna calibrazione post-hoc globale nel backtest OOS;
-#   2) griglia risultati più ampia (0..12);
-#   3) Brier score + log loss oltre alla semplice accuratezza;
-#   4) curve di calibrazione per fasce di probabilità;
-#   5) confronto esplicito modello/mercato, senza dichiarare vincitori.
-# =====================================================================
-AUDIT_SCORE_MAX = 12
-EPS_PROB = 1e-9
-V4_MAX_BUCKETS = 8
-
-CAMPIONATI_DOMESTICI = {
-    "Italia - Serie A": {"id_fd": "I1"},
-    "Inghilterra - Premier League": {"id_fd": "E0"},
-    "Spagna - La Liga": {"id_fd": "SP1"},
-    "Germania - Bundesliga": {"id_fd": "D1"},
-    "Francia - Ligue 1": {"id_fd": "F1"},
-}
-
-CAMPIONATI_COPPE = {
-    "🌍 UEFA Champions League": {"code": "CL", "gratis_confermato": True},
-    "🌍 UEFA Europa League": {"code": "EL", "gratis_confermato": False},
-    "🌍 UEFA Conference League": {"code": "UECL", "gratis_confermato": False},
-}
-
-HEADERS_BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
-
-K_SHRINKAGE = 10  # stesso principio già validato nell'App Risultati Fissi
-
-
-# =====================================================================
-# 🔧 FIX #4 — MATCHING SQUADRE "MORBIDO"
-# Prima: confronto testuale esatto. Con le coppe europee (nomi da
-# football-data.org, es. "Manchester United FC") contro i nomi domestici
-# (es. "Man United") il match esatto falliva spesso in silenzio, facendo
-# scattare il generatore di dati finti (ora rimosso, vedi FIX #1).
-# =====================================================================
-def normalizza_nome_squadra(nome):
-    nome = str(nome)
-    for suffisso in [" FC", " CF", " AFC", " AC", " SC", " CFC"]:
-        nome = nome.replace(suffisso, "")
-    return nome.strip().lower()
-
-
-def nomi_corrispondono(a, b):
-    na, nb = normalizza_nome_squadra(a), normalizza_nome_squadra(b)
-    return na == nb or na in nb or nb in na
-
-
-def codici_stagione(oggi=None):
-    oggi = oggi or date.today()
-    anno_inizio_corrente = oggi.year if oggi.month >= 7 else oggi.year - 1
-    anno_inizio_precedente = anno_inizio_corrente - 1
-    fmt = lambda a: f"{a % 100:02d}{(a + 1) % 100:02d}"
-    return fmt(anno_inizio_corrente), fmt(anno_inizio_precedente)
-
-
-def tau_dixon_coles(gc, gt, lc, lt, rho):
-    if gc == 0 and gt == 0: return 1 - (lc * lt * rho)
-    elif gc == 0 and gt == 1: return 1 + (lc * rho)
-    elif gc == 1 and gt == 0: return 1 + (lt * rho)
-    elif gc == 1 and gt == 1: return 1 - rho
-    return 1.0
-
-
-def media_ewma(serie, span):
-    serie = serie.dropna()
-    if len(serie) == 0: return None
-    return serie.ewm(span=span, min_periods=1).mean().iloc[-1]
-
-
-def media_pesata_decadimento(df, colonna, data_riferimento, emivita):
-    if colonna not in df.columns: return None
-    sub = df[[colonna, 'Date_parsed']].dropna()
-    if len(sub) == 0: return None
-    giorni = (data_riferimento - sub['Date_parsed']).dt.days.clip(lower=0)
-    pesi = 0.5 ** (giorni / emivita)
-    tot = pesi.sum()
-    return sub[colonna].mean() if tot <= 0 else (sub[colonna] * pesi).sum() / tot
-
-
-# =====================================================================
-# 🔧 Download robusto: header da browser + retry + fallback www/no-www
-# (stessa correzione già validata nell'App Risultati Fissi, dopo il
-# disservizio di football-data.co.uk causato dal blocco geografico su
-# "www" per il traffico non-UK)
-# =====================================================================
-def scarica_csv_robusto(url, tentativi=3, attesa_secondi=2):
-    """FIX #11 — BOM (Byte Order Mark): fixtures.csv inizia con un carattere
-    invisibile Unicode che, se non gestito, si attacca al nome della prima
-    colonna ("Div" diventa "\\ufeffDiv"), facendo fallire in silenzio ogni
-    controllo tipo "if 'Div' in colonne" — nessuna fixture futura veniva mai
-    trovata, su nessun campionato, per questo motivo esatto. 'utf-8-sig' lo
-    rimuove in fase di decodifica; non fa danno se il file non ha il BOM."""
-    varianti_url = [url]
-    if "://www." in url:
-        varianti_url.append(url.replace("://www.", "://"))
-    elif "://" in url:
-        varianti_url.append(url.replace("://", "://www."))
-
-    ultimo_errore = None
-    for tentativo in range(tentativi):
-        for url_prova in varianti_url:
-            try:
-                resp = requests.get(url_prova, headers=HEADERS_BROWSER, timeout=15)
-                resp.raise_for_status()
-                testo = resp.content.decode('utf-8-sig', errors='replace')
-                df = pd.read_csv(io.StringIO(testo))
-                df.columns = [str(c).replace('\ufeff', '').strip() for c in df.columns]  # rete di sicurezza extra
-                return df, None
-            except Exception as e:
-                ultimo_errore = str(e)
-        if tentativo < tentativi - 1:
-            time.sleep(attesa_secondi)
-    return None, ultimo_errore
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def carica_dati_campionato(id_fd):
-    """FIX B — aggiunto il tag 'Stagione' (precedente/corrente), necessario
-    per poter validare il value bet SOLO sui risultati reali più recenti,
-    non su quelli già usati per calibrare le medie di lega."""
-    codice_corrente, codice_precedente = codici_stagione()
-    frames = []
-    for codice, label in [(codice_precedente, 'precedente'), (codice_corrente, 'corrente')]:
-        url = f"https://football-data.co.uk/mmz4281/{codice}/{id_fd}.csv"
-        df, _ = scarica_csv_robusto(url)
-        if df is not None:
-            df.columns = df.columns.str.strip()
-            df['Stagione'] = label
-            frames.append(df)
-    if frames:
-        dati = pd.concat(frames, ignore_index=True, sort=False)
-        dati['Date_parsed'] = pd.to_datetime(dati['Date'], errors='coerce', dayfirst=True)
-        return dati.dropna(subset=['Date_parsed']).sort_values('Date_parsed').reset_index(drop=True)
-    return None
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def carica_tutti_i_campionati():
-    tutti_dati = []
-    for c_info in CAMPIONATI_DOMESTICI.values():
-        df = carica_dati_campionato(c_info["id_fd"])
-        if df is not None:
-            tutti_dati.append(df)
-    if tutti_dati:
-        return pd.concat(tutti_dati, ignore_index=True, sort=False)
-    return pd.DataFrame()
-
-
-def estrai_partite_squadra_intelligente(squadra, df_coppa, df_globale):
-    """Matching morbido (FIX #4): prima prova nel dataset della competizione
-    stessa, poi nel dataset globale domestico come fallback."""
-    if df_coppa is not None and not df_coppa.empty:
-        maschera = df_coppa['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra)) | \
-                   df_coppa['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra))
-        f_coppa = df_coppa[maschera]
-        if len(f_coppa) > 0:
-            return f_coppa
-
-    if df_globale is not None and not df_globale.empty:
-        maschera = df_globale['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra)) | \
-                   df_globale['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra))
-        f_glob = df_globale[maschera]
-        if len(f_glob) > 0:
-            return f_glob
-
-    return pd.DataFrame()
-
-
-# =====================================================================
-# 🔧 FIX CRITICO #12 — ATTRIBUZIONE CORRETTA DI GOL/TIRI/CORNER
-# BUG PRECEDENTE: le partite di una squadra venivano raccolte sia in casa
-# sia in trasferta, ma poi il codice leggeva sempre la colonna "di casa"
-# (FTHG) come "gol fatti". Per le partite giocate in TRASFERTA, FTHG sono
-# i gol dell'AVVERSARIO — quindi circa metà dei dati di attacco erano in
-# realtà dati di difesa e viceversa. Effetto: una squadra che segna 3 e
-# subisce 0 risultava 1.5/1.5, cioè perfettamente nella media — il modello
-# perdeva quasi del tutto la capacità di distinguere squadre forti e deboli,
-# e finiva sotto la semplice baseline "vince sempre la squadra di casa".
-# Qui i valori vengono attribuiti guardando, partita per partita, se la
-# squadra giocava in casa o fuori.
-# =====================================================================
-def serie_squadra(df, squadra, tipo):
-    """tipo: 'gol_fatti', 'gol_subiti', 'tiri_fatti', 'corner_fatti'.
-    Ritorna una Series con i valori attribuiti correttamente alla squadra,
-    indipendentemente dal fatto che giocasse in casa o in trasferta."""
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-
-    colonne_casa = {'gol_fatti': 'FTHG', 'gol_subiti': 'FTAG', 'tiri_fatti': 'HST', 'corner_fatti': 'HC'}
-    colonne_trasf = {'gol_fatti': 'FTAG', 'gol_subiti': 'FTHG', 'tiri_fatti': 'AST', 'corner_fatti': 'AC'}
-    col_c, col_t = colonne_casa[tipo], colonne_trasf[tipo]
-
-    if col_c not in df.columns or col_t not in df.columns:
-        return pd.Series(dtype=float)
-
-    gioca_in_casa = df['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra))
-    valori = df[col_c].where(gioca_in_casa, df[col_t])
-    return valori.dropna()
-
-
-def estrai_scontri_diretti(squadra_casa, squadra_trasferta, df_coppa, df_globale):
-    frames_tot = []
-    if df_coppa is not None and not df_coppa.empty:
-        frames_tot.append(df_coppa)
-    if df_globale is not None and not df_globale.empty:
-        frames_tot.append(df_globale)
-    if not frames_tot:
-        return pd.DataFrame()
-
-    df_uni = pd.concat(frames_tot, ignore_index=True, sort=False)
-    if 'FTHG' not in df_uni.columns or 'FTAG' not in df_uni.columns:
-        return pd.DataFrame()
-
-    maschera_diretto = df_uni['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra_casa)) & \
-                        df_uni['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra_trasferta))
-    maschera_inverso = df_uni['HomeTeam'].apply(lambda x: nomi_corrispondono(x, squadra_trasferta)) & \
-                        df_uni['AwayTeam'].apply(lambda x: nomi_corrispondono(x, squadra_casa))
-
-    h2h = df_uni[(df_uni['FTHG'].notna()) & (df_uni['FTAG'].notna()) & (maschera_diretto | maschera_inverso)].copy()
-
-    if 'Date_parsed' in h2h.columns:
-        h2h = h2h.sort_values('Date_parsed', ascending=False)
-    return h2h.head(5)
-
-
-# =====================================================================
-# 🔧 FIX #1 — VIA IL GENERATORE DI DATI FINTI, DENTRO VERO SHRINKAGE
-# Prima: se una squadra non aveva partite trovate, il codice INVENTAVA un
-# profilo attacco/difesa calcolato dalla somma dei codici ASCII del nome
-# squadra — un numero pseudo-casuale spacciato per statistica.
-# Ora: quando i dati specifici sono pochi o assenti, la stima converge
-# gradualmente verso la media di lega (shrinkage, stesso principio già
-# validato nell'App Risultati Fissi) invece di inventare un profilo finto.
-# Il chiamante riceve n_casa/n_trasf per mostrare un avviso onesto quando
-# il campione specifico è scarso.
-# =====================================================================
-def calcola_modello_completo(giocate_coppa, squadra_casa, squadra_trasferta, rho, ewma_span,
-                              emivita, df_globale, data_riferimento=None):
-    giocate_validi = giocate_coppa.dropna(subset=['FTHG', 'FTAG']) if giocate_coppa is not None else pd.DataFrame()
-    if data_riferimento is None:
-        data_riferimento = giocate_validi['Date_parsed'].max() if not giocate_validi.empty else pd.Timestamp(date.today())
-
-    # Baseline di lega/competizione. Se il campione della competizione è
-    # troppo piccolo (tipico per le coppe a inizio stagione), lo arricchiamo
-    # con il dataset domestico globale per una stima più stabile.
-    base_per_media = giocate_validi
-    if len(giocate_validi) < 20 and df_globale is not None and not df_globale.empty:
-        base_per_media = pd.concat([giocate_validi, df_globale.dropna(subset=['FTHG', 'FTAG'])], ignore_index=True, sort=False)
-
-    m_gol_casa = media_pesata_decadimento(base_per_media, 'FTHG', data_riferimento, emivita) or 1.65
-    m_gol_trasf = media_pesata_decadimento(base_per_media, 'FTAG', data_riferimento, emivita) or 1.25
-    m_tiri_casa_lega = media_pesata_decadimento(base_per_media, 'HST', data_riferimento, emivita) or 4.8
-    m_tiri_trasf_lega = media_pesata_decadimento(base_per_media, 'AST', data_riferimento, emivita) or 4.1
-    m_corner_casa_lega = media_pesata_decadimento(base_per_media, 'HC', data_riferimento, emivita) or 5.4
-    m_corner_trasf_lega = media_pesata_decadimento(base_per_media, 'AC', data_riferimento, emivita) or 4.6
-
-    forma_casa = estrai_partite_squadra_intelligente(squadra_casa, giocate_coppa, df_globale)
-    forma_trasf = estrai_partite_squadra_intelligente(squadra_trasferta, giocate_coppa, df_globale)
-    n_casa, n_trasf = len(forma_casa), len(forma_trasf)
-
-    # FIX CRITICO #12 — i valori vengono attribuiti alla squadra giusta
-    # guardando, partita per partita, se giocava in casa o in trasferta.
-    gf_casa_rec = media_ewma(serie_squadra(forma_casa, squadra_casa, 'gol_fatti'), ewma_span) if n_casa else None
-    gs_casa_rec = media_ewma(serie_squadra(forma_casa, squadra_casa, 'gol_subiti'), ewma_span) if n_casa else None
-    gf_trasf_rec = media_ewma(serie_squadra(forma_trasf, squadra_trasferta, 'gol_fatti'), ewma_span) if n_trasf else None
-    gs_trasf_rec = media_ewma(serie_squadra(forma_trasf, squadra_trasferta, 'gol_subiti'), ewma_span) if n_trasf else None
-
-    tiri_casa = media_ewma(serie_squadra(forma_casa, squadra_casa, 'tiri_fatti'), ewma_span) if n_casa else None
-    corner_casa = media_ewma(serie_squadra(forma_casa, squadra_casa, 'corner_fatti'), ewma_span) if n_casa else None
-    tiri_trasf = media_ewma(serie_squadra(forma_trasf, squadra_trasferta, 'tiri_fatti'), ewma_span) if n_trasf else None
-    corner_trasf = media_ewma(serie_squadra(forma_trasf, squadra_trasferta, 'corner_fatti'), ewma_span) if n_trasf else None
-
-    # Shrinkage: peso -> 0 quando n_casa/n_trasf sono pochi o zero, quindi la
-    # stima converge verso il rapporto neutro 1.0 (= "come la media") invece
-    # di un profilo inventato. Peso -> 1 quando il campione è ampio, quindi ci
-    # si fida del dato specifico della squadra.
-    peso_casa = n_casa / (n_casa + K_SHRINKAGE)
-    peso_trasf = n_trasf / (n_trasf + K_SHRINKAGE)
-
-    # FIX CRITICO #13 — riferimento corretto per i rapporti attacco/difesa.
-    # I dati di una squadra mescolano partite in casa e in trasferta, quindi
-    # vanno confrontati con la media di lega COMPLESSIVA (casa+trasferta), non
-    # con quella specifica di casa o di trasferta. Prima si confrontava il dato
-    # misto della squadra di casa con la media "solo casa" (più alta) e quello
-    # della squadra ospite con la media "solo trasferta" (più bassa): risultato,
-    # le squadre di casa risultavano sistematicamente sottovalutate e le ospiti
-    # sopravvalutate — per questo il modello prevedeva più vittorie in trasferta
-    # che in casa, il contrario di come funziona davvero il calcio.
-    # Il vantaggio del fattore campo resta comunque applicato, più sotto, dal
-    # fatto che lambda_casa usa m_gol_casa e lambda_trasferta usa m_gol_trasf.
-    m_gol_complessiva = (m_gol_casa + m_gol_trasf) / 2.0
-
-    rapp_attacco_casa = (gf_casa_rec / max(0.1, m_gol_complessiva)) if gf_casa_rec is not None else 1.0
-    rapp_difesa_casa = (gs_casa_rec / max(0.1, m_gol_complessiva)) if gs_casa_rec is not None else 1.0
-    rapp_attacco_trasf = (gf_trasf_rec / max(0.1, m_gol_complessiva)) if gf_trasf_rec is not None else 1.0
-    rapp_difesa_trasf = (gs_trasf_rec / max(0.1, m_gol_complessiva)) if gs_trasf_rec is not None else 1.0
-
-    attacco_casa = peso_casa * rapp_attacco_casa + (1 - peso_casa) * 1.0
-    difesa_casa = peso_casa * rapp_difesa_casa + (1 - peso_casa) * 1.0
-    attacco_trasf = peso_trasf * rapp_attacco_trasf + (1 - peso_trasf) * 1.0
-    difesa_trasf = peso_trasf * rapp_difesa_trasf + (1 - peso_trasf) * 1.0
-
-    # Stessa logica del FIX #13 anche per tiri e angoli: i dati della squadra
-    # sono misti casa+trasferta, quindi il riferimento verso cui convergono
-    # (shrinkage) dev'essere la media complessiva, non quella specifica.
-    m_tiri_complessiva = (m_tiri_casa_lega + m_tiri_trasf_lega) / 2.0
-    m_corner_complessiva = (m_corner_casa_lega + m_corner_trasf_lega) / 2.0
-
-    tiri_casa_finale = peso_casa * tiri_casa + (1 - peso_casa) * m_tiri_complessiva if tiri_casa is not None else m_tiri_casa_lega
-    corner_casa_finale = peso_casa * corner_casa + (1 - peso_casa) * m_corner_complessiva if corner_casa is not None else m_corner_casa_lega
-    tiri_trasf_finale = peso_trasf * tiri_trasf + (1 - peso_trasf) * m_tiri_complessiva if tiri_trasf is not None else m_tiri_trasf_lega
-    corner_trasf_finale = peso_trasf * corner_trasf + (1 - peso_trasf) * m_corner_complessiva if corner_trasf is not None else m_corner_trasf_lega
-
-    lam_c = max(0.2, attacco_casa * difesa_trasf * m_gol_casa)
-    lam_t = max(0.2, attacco_trasf * difesa_casa * m_gol_trasf)
-
-    prob_1, prob_x, prob_2 = 0.0, 0.0, 0.0
-    prob_goal, prob_nogoal = 0.0, 0.0
-    limiti_under = [1.5, 2.5, 3.5]
-    prob_under = {l: 0.0 for l in limiti_under}
-    multigol_casa = {"0-1": 0.0, "0-2": 0.0, "1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
-    multigol_trasf = {"0-1": 0.0, "0-2": 0.0, "1-2": 0.0, "1-3": 0.0, "2-3": 0.0, "2-4": 0.0}
-    combo_stats = {"1 + Goal": 0.0, "1 + Over 2.5": 0.0, "X + Under 2.5": 0.0, "2 + Goal": 0.0}
-    griglia_risultati = []  # FIX #5 — griglia completa per il motore combo libero
-
-    tot_p = 0.0
-    for gc in range(AUDIT_SCORE_MAX + 1):
-        for gt in range(AUDIT_SCORE_MAX + 1):
-            p = poisson.pmf(gc, lam_c) * poisson.pmf(gt, lam_t) * tau_dixon_coles(gc, gt, lam_c, lam_t, rho) * 100
-            tot_p += p
-            segno = 'X' if gc == gt else ('1' if gc > gt else '2')
-            griglia_risultati.append({"gc": gc, "gt": gt, "p": p, "segno": segno})
-
-            if segno == '1': prob_1 += p
-            elif segno == 'X': prob_x += p
-            else: prob_2 += p
-
-            if gc > 0 and gt > 0: prob_goal += p
-            else: prob_nogoal += p
-
-            for l in limiti_under:
-                if gc + gt < l: prob_under[l] += p
-
-            for mg_key, (mi_c, ma_c) in [("0-1", (0,1)), ("0-2", (0,2)), ("1-2", (1,2)), ("1-3", (1,3)), ("2-3", (2,3)), ("2-4", (2,4))]:
-                if mi_c <= gc <= ma_c: multigol_casa[mg_key] += p
-                if mi_c <= gt <= ma_c: multigol_trasf[mg_key] += p
-
-            if segno == '1' and gc > 0 and gt > 0: combo_stats["1 + Goal"] += p
-            if segno == '1' and (gc + gt) > 2.5: combo_stats["1 + Over 2.5"] += p
-            if segno == 'X' and (gc + gt) < 2.5: combo_stats["X + Under 2.5"] += p
-            if segno == '2' and gc > 0 and gt > 0: combo_stats["2 + Goal"] += p
-
-    if tot_p > 0:
-        f = 100.0 / tot_p
-        prob_1, prob_x, prob_2 = prob_1*f, prob_x*f, prob_2*f
-        prob_goal, prob_nogoal = prob_goal*f, prob_nogoal*f
-        prob_under = {l: v*f for l, v in prob_under.items()}
-        multigol_casa = {k: v*f for k, v in multigol_casa.items()}
-        multigol_trasf = {k: v*f for k, v in multigol_trasf.items()}
-        combo_stats = {k: v*f for k, v in combo_stats.items()}
-        for r in griglia_risultati:
-            r["p"] *= f
-
-    return {
-        "prob_1": prob_1, "prob_X": prob_x, "prob_2": prob_2,
-        "prob_goal": prob_goal, "prob_nogoal": prob_nogoal,
-        "prob_under": prob_under, "multigol_casa": multigol_casa, "multigol_trasf": multigol_trasf,
-        "combo": combo_stats, "griglia": griglia_risultati,
-        # Parametri esposti per i mercati aggiuntivi; il motore Poisson V15 resta invariato.
-        "lambda_casa": float(lam_c), "lambda_trasferta": float(lam_t),
-        "angoli_stimati": f"{corner_casa_finale + corner_trasf_finale:.1f}",
-        "tiri_stimati": f"{tiri_casa_finale + tiri_trasf_finale:.1f}",
-        "n_casa": n_casa, "n_trasf": n_trasf,
-    }
-
-
-# =====================================================================
-# 🔧 FIX #5 — MOTORE COMBO LIBERO
-# Calcola la probabilità congiunta di qualunque combinazione di segno +
-# soglia gol (Over/Under) + Gol/No Gol, leggendo direttamente dalla griglia
-# di risultati già calcolata — corretto per costruzione (somma le celle
-# della griglia Poisson che soddisfano TUTTE le condizioni insieme, non
-# moltiplica probabilità come se fossero eventi indipendenti, cosa che
-# gol/segno NON sono).
-# =====================================================================
-def calcola_combo_libera(griglia, segno=None, soglia_gol=None, tipo_soglia=None, gol_nogol=None):
-    tot = 0.0
-    for r in griglia:
-        gc, gt, p = r["gc"], r["gt"], r["p"]
-        ok = True
-        if segno and r["segno"] != segno:
-            ok = False
-        if ok and soglia_gol is not None and tipo_soglia:
-            tot_g = gc + gt
-            if tipo_soglia == "Over" and not (tot_g > soglia_gol): ok = False
-            if tipo_soglia == "Under" and not (tot_g < soglia_gol): ok = False
-        if ok and gol_nogol:
-            entrambe_segnano = gc > 0 and gt > 0
-            if gol_nogol == "Goal" and not entrambe_segnano: ok = False
-            if gol_nogol == "NoGoal" and entrambe_segnano: ok = False
-        if ok:
-            tot += p
-    return tot
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def carica_fixture_future(id_fd):
-    df, _ = scarica_csv_robusto("https://football-data.co.uk/fixtures.csv")
-    if df is not None:
-        fx = df.copy()
-        fx.columns = fx.columns.str.strip()
-        if 'Div' in fx.columns:
-            fx = fx[fx['Div'] == id_fd].copy()
-            fx['Date_parsed'] = pd.to_datetime(fx['Date'], errors='coerce', dayfirst=True)
-            oggi = pd.Timestamp(date.today())
-            return fx[fx['Date_parsed'] >= oggi].sort_values('Date_parsed').reset_index(drop=True)
-    return pd.DataFrame()
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def carica_dati_api_europee(codice_competizione, api_key):
-    headers = {"X-Auth-Token": api_key}
-    url_matches = f"https://api.football-data.org/v4/competitions/{codice_competizione}/matches"
-    try:
-        resp = requests.get(url_matches, headers=headers, timeout=15)
-        if resp.status_code == 403:
-            return "ERRORE_403"
-        resp.raise_for_status()
-        data = resp.json()
-        matches = data.get("matches", [])
-        rows = []
-        for m in matches:
-            status = m['status']
-            fthg, ftag = None, None
-            if status == 'FINISHED':
-                fthg = m['score']['fullTime']['home']
-                ftag = m['score']['fullTime']['away']
-            rows.append({
-                'Date': m['utcDate'][:10], 'HomeTeam': m['homeTeam']['name'], 'AwayTeam': m['awayTeam']['name'],
-                'FTHG': fthg, 'FTAG': ftag, 'Status': status,
-            })
-        df = pd.DataFrame(rows)
-        df['Date_parsed'] = pd.to_datetime(df['Date'], errors='coerce')
-        return df.sort_values('Date_parsed').reset_index(drop=True)
-    except Exception as e:
-        return str(e)
-
-
-# =====================================================================
-# 🔧 FIX #3 — VALUE BET CORRETTO (overround + media multi-bookmaker)
-# Prima: EV = probabilità_modello × quota_grezza di UN SOLO bookmaker
-# (Bet365), senza depurare la quota dal margine del bookmaker — lo stesso
-# bug dell'overround già corretto nell'App Risultati Fissi. Ora: media di
-# tutti i bookmaker disponibili nel file, quota "equa" depurata dal margine.
-# =====================================================================
-def classifica_colonne_quote(colonne):
-    apertura_h = [c for c in colonne if c.endswith('H') and not c.endswith('CH') and c not in ['FTHG', 'HTHG', 'PTHG']]
-    apertura_d = [c for c in colonne if c.endswith('D') and not c.endswith('CD') and c not in ['FTHG', 'FTAG', 'HTHG', 'HTAG']]
-    apertura_a = [c for c in colonne if c.endswith('A') and not c.endswith('CA') and c not in ['FTAG', 'HTAG', 'PTAG']]
-    return apertura_h, apertura_d, apertura_a
-
-
-def quote_mercato_normalizzate(riga, colonne_h, colonne_d, colonne_a):
-    vh = [riga[c] for c in colonne_h if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
-    vd = [riga[c] for c in colonne_d if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
-    va = [riga[c] for c in colonne_a if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
-    if not (vh and vd and va): return None
-    qh, qd, qa = sum(vh)/len(vh), sum(vd)/len(vd), sum(va)/len(va)
-    pih, pid, pia = 1/qh, 1/qd, 1/qa
-    over = pih + pid + pia
-    return {"q_casa_equa": over/pih, "q_x_equa": over/pid, "q_trasf_equa": over/pia,
-            "overround": over, "n_bookmakers": len(vh)}
-
-
-# =====================================================================
-# 🔧 PUNTO C — STIMA APPROSSIMATA DELLA QUOTA COMBO
-# Nessun bookmaker pubblica una quota per combo libere tipo "1 + Over 2.5 +
-# Goal" nei file gratuiti — solo per i mercati singoli (1X2, Over/Under
-# 2.5). Qui stimiamo una quota "come se" i mercati fossero indipendenti
-# (moltiplicando le quote eque dei singoli mercati disponibili) — è
-# un'APPROSSIMAZIONE, non un dato di mercato reale: segno e gol totali
-# nella stessa partita sono in una certa misura correlati, quindi il numero
-# vero si discosterà da questo. Il componente Gol/No Gol non ha una quota
-# disponibile nel file, quindi non entra nella stima — etichettato chiaramente.
-# =====================================================================
-def classifica_colonne_over_under(colonne, soglia="2.5"):
-    over_cols = [c for c in colonne if c.endswith(f'>{soglia}')]
-    under_cols = [c for c in colonne if c.endswith(f'<{soglia}')]
-    return over_cols, under_cols
-
-
-def quote_over_under_normalizzate(riga, colonne_over, colonne_under):
-    v_over = [riga[c] for c in colonne_over if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
-    v_under = [riga[c] for c in colonne_under if pd.notna(riga.get(c)) and isinstance(riga.get(c), (int, float))]
-    if not (v_over and v_under): return None
-    q_over, q_under = sum(v_over)/len(v_over), sum(v_under)/len(v_under)
-    pi_over, pi_under = 1/q_over, 1/q_under
-    overround = pi_over + pi_under
-    return {"q_over_equa": overround/pi_over, "q_under_equa": overround/pi_under, "n_bookmakers": len(v_over)}
-
-
-def stima_quota_combo_approssimata(segno, soglia_gol, tipo_soglia, quote_1x2, quote_ou_25):
-    """Ritorna (quota_stimata_o_None, lista_componenti_non_prezzate)."""
-    fattori = []
-    non_prezzate = []
-    if segno:
-        if quote_1x2:
-            mappa = {"1": quote_1x2["q_casa_equa"], "X": quote_1x2["q_x_equa"], "2": quote_1x2["q_trasf_equa"]}
-            fattori.append(mappa[segno])
-        else:
-            non_prezzate.append(f"segno {segno}")
-    if soglia_gol is not None and tipo_soglia:
-        if soglia_gol == 2.5 and quote_ou_25:
-            fattori.append(quote_ou_25["q_over_equa"] if tipo_soglia == "Over" else quote_ou_25["q_under_equa"])
-        else:
-            non_prezzate.append(f"{tipo_soglia} {soglia_gol}")
-    quota = None
-    if fattori:
-        quota = 1.0
-        for f in fattori:
-            quota *= f
-    return quota, non_prezzate
-
-
-# =====================================================================
-# 🔧 BACKTEST SENZA FILTRO — accuratezza pura del modello
-# Diverso dal value bet (che filtra per EV/soglia): qui valutiamo semplicemente
-# "quante volte la previsione principale del modello (il segno più probabile)
-# ha indovinato il risultato vero?", su TUTTE le partite disponibili, senza
-# nessun filtro — la metrica più diretta e senza sorprese sulla bontà di base
-# del modello, utile per mandarmi i numeri e controllarli insieme.
-# =====================================================================
-def esegui_backtest_senza_filtro(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd=None,
-                                  usa_calibrazione=False, richiedi_accordo_mercato=False):
-    """richiedi_accordo_mercato (IDEA #1): valuta la previsione principale SOLO
-    sulle partite dove il modello è d'accordo col favorito del mercato (stesso
-    segno con la quota più bassa) — un filtro di fiducia, non una correzione
-    della stima come il blending già scartato. Riduce il campione ma, se
-    l'idea è valida, dovrebbe alzare l'accuratezza sul sottoinsieme rimasto."""
-    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
-    ha_stagione = 'Stagione' in tutte.columns
-
-    if usa_oos and ha_stagione:
-        indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
-    else:
-        indici = list(range(15, len(tutte)))
-
-    if not indici:
-        return None
-
-    calib_info = carica_calibratore(id_fd, "1x2") if (usa_calibrazione and id_fd) else None
-    calibratore = calib_info["calibratore"] if calib_info else None
-    colonne_h, colonne_d, colonne_a = classifica_colonne_quote(tutte.columns)
-
-    n_partite, n_corrette = 0, 0
-    n_scartate_disaccordo, n_scartate_no_quote = 0, 0
-    per_segno = {"1": {"previste": 0, "corrette": 0}, "X": {"previste": 0, "corrette": 0}, "2": {"previste": 0, "corrette": 0}}
-
-    for i in indici:
-        partita = tutte.iloc[i]
-        prec = tutte.iloc[:i]
-        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
-                                      emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
-        if m is None: continue
-        if calibratore is not None:
-            m = applica_calibrazione_1x2(m, calibratore)
-
-        probabilita = {"1": m['prob_1'], "X": m['prob_X'], "2": m['prob_2']}
-        previsione_principale = max(probabilita, key=probabilita.get)
-
-        if richiedi_accordo_mercato:
-            quote = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a)
-            if quote is None:
-                n_scartate_no_quote += 1
-                continue
-            quote_per_segno = {"1": quote["q_casa_equa"], "X": quote["q_x_equa"], "2": quote["q_trasf_equa"]}
-            favorito_mercato = min(quote_per_segno, key=quote_per_segno.get)  # quota più bassa = favorito
-            if previsione_principale != favorito_mercato:
-                n_scartate_disaccordo += 1
-                continue
-
-        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
-        n_partite += 1
-        per_segno[previsione_principale]["previste"] += 1
-        if previsione_principale == esito:
-            n_corrette += 1
-            per_segno[previsione_principale]["corrette"] += 1
-
-    return {"n_partite": n_partite, "n_corrette": n_corrette, "per_segno": per_segno,
-            "n_scartate_disaccordo": n_scartate_disaccordo, "n_scartate_no_quote": n_scartate_no_quote}
-
-
-# =====================================================================
-# 🔧 PUNTO B — CALIBRAZIONE POST-HOC (1X2 + le 12 combo automatiche)
-# Stessa tecnica isotonic regression già validata nell'App Risultati Fissi.
-# Un correttore per 1X2 (corregge "Esito Finale" e il Value Bet), più uno
-# separato per ciascuna delle 12 combinazioni automatiche (segno × Gol/No
-# Gol × Over/Under 2.5) — la verità per allenarle è già nei risultati reali
-# che scarichiamo (nessuna fonte dati nuova serve). Le combo libere con
-# soglie diverse da 2.5 restano SENZA calibrazione: te lo segnaliamo,
-# non lo nascondiamo.
-# =====================================================================
-LE_12_COMBO = [(s, g, t) for s in ["1", "X", "2"] for g in ["Goal", "NoGoal"] for t in ["Over", "Under"]]
-
-
-
-# =====================================================================
-# V13 — PLATT SOLO O/U 2.5
-# Walk-forward: il fit usa esclusivamente partite precedenti alla partita
-# da analizzare. Non modifica 1X2, Goal/No Goal, Multigol o la griglia.
-# =====================================================================
-@st.cache_data(show_spinner=False, ttl=3600)
-def _v13_training_ou_platt(dati, rho, ewma_span, emivita, data_riferimento, n_train=100):
-    """Costruisce il training O/U 2.5 senza look-ahead."""
-    if dati is None or len(dati) == 0 or 'FTHG' not in dati.columns or 'FTAG' not in dati.columns:
-        return pd.DataFrame()
-    df = dati.copy()
-    if 'Date_parsed' not in df.columns:
-        return pd.DataFrame()
-    df = df[df['FTHG'].notna() & df['FTAG'].notna() & df['Date_parsed'].notna()].copy()
-    if data_riferimento is not None and pd.notna(data_riferimento):
-        df = df[df['Date_parsed'] < data_riferimento].copy()
-    df = df.sort_values('Date_parsed').tail(max(int(n_train) + 40, int(n_train))).copy()
-    rows = []
-    for _, r in df.iterrows():
-        d = r['Date_parsed']
-        prior = df[df['Date_parsed'] < d].copy()
-        if len(prior) < 20:
-            continue
-        try:
-            m = calcola_modello_completo(
-                prior,
-                r['HomeTeam'], r['AwayTeam'],
-                rho, ewma_span, emivita, pd.DataFrame(),
-                data_riferimento=d
-            )
-            if not m or 'prob_under' not in m or 2.5 not in m['prob_under']:
-                continue
-            p_over = 1.0 - float(m['prob_under'][2.5]) / 100.0
-            y_over = int(float(r['FTHG']) + float(r['FTAG']) > 2.5)
-            if np.isfinite(p_over):
-                rows.append({'p_raw': float(np.clip(p_over, 0.001, 0.999)), 'y_over': y_over, 'Date': d})
-        except Exception:
-            continue
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values('Date').tail(int(n_train)).reset_index(drop=True)
-
-
-def _v13_logit(p):
-    """Logit numerically stable per una probabilita 0..1."""
-    p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
-    return float(np.log(p / (1.0 - p)))
-
-
-def _v13_fit_platt_ou(df_train):
-    """Fit Platt standard e restituisce (modello, pendenza, motivo).
-
-    La calibrazione viene applicata solo quando la pendenza e' positiva:
-    una calibrazione valida deve preservare l'ordinamento delle probabilita'.
-    """
-    if df_train is None or len(df_train) < 50:
-        return None, np.nan, "campione insufficiente"
-    y = df_train['y_over'].astype(int).to_numpy()
-    if len(np.unique(y)) < 2:
-        return None, np.nan, "un solo esito presente nel training"
-    p = df_train['p_raw'].astype(float).to_numpy()
-    x = np.array([_v13_logit(v) for v in p], dtype=float).reshape(-1, 1)
-    model = LogisticRegression(solver='lbfgs', C=1e6, max_iter=1000)
-    model.fit(x, y)
-    coef = float(model.coef_[0, 0])
-    if not np.isfinite(coef) or coef <= 0.0:
-        return None, coef, "fit non monotono: pendenza non positiva"
-    return model, coef, "applicabile"
-
-
-def _v13_predict_platt_ou(p_raw_over, calibratore):
-    if calibratore is None:
-        return float(np.clip(p_raw_over, 0.001, 0.999))
-    x = [[_v13_logit(p_raw_over)]]
-    return float(np.clip(calibratore.predict_proba(x)[0, 1], 0.001, 0.999))
-
-
-def _v13_apply_platt_ou(modello, calibratore):
-    """Applica Platt esclusivamente alla probabilita O/U 2.5 del match."""
-    if modello is None or calibratore is None:
-        return modello
-    p_raw_over = 1.0 - float(modello['prob_under'][2.5]) / 100.0
-    p_platt_over = _v13_predict_platt_ou(p_raw_over, calibratore)
-    modello['prob_under'][2.5] = (1.0 - p_platt_over) * 100.0
-    return modello
-
-def _path_calibratore(id_fd, chiave="1x2"):
-    return f"calibratore_combo_{chiave}_{id_fd}.pkl"
-
-
-def _salva_calibratore(id_fd, chiave, calibratore, n_oss):
-    try:
-        with open(_path_calibratore(id_fd, chiave), "wb") as f:
-            pickle.dump({"calibratore": calibratore, "n_osservazioni": n_oss,
-                         "timestamp": datetime.now().isoformat(timespec="minutes")}, f)
-    except Exception:
-        pass
-
-
-def carica_calibratore(id_fd, chiave="1x2"):
-    path = _path_calibratore(id_fd, chiave)
-    if os.path.exists(path):
-        try:
-            with open(path, "rb") as f:
-                return pickle.load(f)
-        except Exception:
-            return None
-    return None
-
-
-def _allena_isotonic(osservazioni):
-    if len(osservazioni) < 100:
-        return None
-    x = np.array([p for p, _ in osservazioni])
-    y = np.array([1.0 if av else 0.0 for _, av in osservazioni])
-    calibratore = IsotonicRegression(out_of_bounds='clip', y_min=0.001, y_max=0.999)
-    calibratore.fit(x, y)
-    return calibratore
-
-
-def applica_calibrazione_1x2(modello, calibratore):
-    if calibratore is None or modello is None:
-        return modello
-    p1 = float(calibratore.predict([modello['prob_1']/100])[0])
-    px = float(calibratore.predict([modello['prob_X']/100])[0])
-    p2 = float(calibratore.predict([modello['prob_2']/100])[0])
-    tot = p1 + px + p2
-    if tot <= 0:
-        return modello
-    m = dict(modello)
-    m['prob_1'], m['prob_X'], m['prob_2'] = p1/tot*100, px/tot*100, p2/tot*100
-    return m
-
-
-def allena_tutte_le_calibrazioni(dati_completi, rho, ewma_span, emivita, id_fd):
-    """Un'unica passata sui dati storici: per ogni partita calcola il modello
-    UNA volta, poi costruisce le osservazioni (predetto, avverato) per 1X2 e
-    per tutte e 12 le combo insieme — efficiente, una sola passata."""
-    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
-    oss_1x2 = []
-    oss_combo = {c: [] for c in LE_12_COMBO}
-
-    for i in range(15, len(tutte)):
-        partita = tutte.iloc[i]
-        prec = tutte.iloc[:i]
-        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
-                                      emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
-        if m is None: continue
-
-        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
-        oss_1x2.append((m['prob_1']/100, esito == '1'))
-        oss_1x2.append((m['prob_X']/100, esito == 'X'))
-        oss_1x2.append((m['prob_2']/100, esito == '2'))
-
-        tot_gol_reale = partita['FTHG'] + partita['FTAG']
-        entrambe_reale = partita['FTHG'] > 0 and partita['FTAG'] > 0
-        for (segno_c, gg_c, tipo_c) in LE_12_COMBO:
-            prob_c = calcola_combo_libera(m['griglia'], segno=segno_c, soglia_gol=2.5, tipo_soglia=tipo_c, gol_nogol=gg_c)
-            avverato_c = (segno_c == esito) and \
-                         ((gg_c == "Goal") == entrambe_reale) and \
-                         ((tipo_c == "Over") == (tot_gol_reale > 2.5))
-            oss_combo[(segno_c, gg_c, tipo_c)].append((prob_c/100, avverato_c))
-
-    risultati = {"1x2": {"n": len(oss_1x2), "ok": False}}
-    cal_1x2 = _allena_isotonic(oss_1x2)
-    if cal_1x2:
-        _salva_calibratore(id_fd, "1x2", cal_1x2, len(oss_1x2))
-        risultati["1x2"]["ok"] = True
-
-    for chiave_c, oss_c in oss_combo.items():
-        nome_chiave = f"{chiave_c[0]}_{chiave_c[1]}_{chiave_c[2]}"
-        cal_c = _allena_isotonic(oss_c)
-        risultati[nome_chiave] = {"n": len(oss_c), "ok": cal_c is not None}
-        if cal_c:
-            _salva_calibratore(id_fd, nome_chiave, cal_c, len(oss_c))
-
-    return risultati
-
-
-# =====================================================================
-# 🔧 BACKTEST COMBO — stessa logica del backtest 1X2 senza filtro, applicata
-# alla combo automatica più probabile di ogni partita (tra le 12 possibili).
-# Usa la calibrazione per-combo se disponibile e attiva, e la stessa verità
-# (risultato reale) già usata per allenarle — nessuna fonte dati nuova.
-# =====================================================================
-def esegui_backtest_combo(dati_completi, rho, ewma_span, emivita, usa_oos, id_fd=None,
-                           usa_calibrazione=False, richiedi_accordo_mercato=False, richiedi_accordo_ou=False):
-    """richiedi_accordo_mercato: valuta solo le combo il cui SEGNO è d'accordo
-    col favorito del mercato (idea #1, già validata su 1X2: +5/+10 punti).
-    richiedi_accordo_ou (idea #1b, DA VERIFICARE): in aggiunta, richiede che
-    anche la componente OVER/UNDER sia d'accordo con la quota di mercato
-    Over/Under 2.5 — copre una seconda delle tre dimensioni di una combo
-    (il filtro sul solo segno ne copre una su tre, la terza — Gol/No Gol —
-    resta comunque non filtrabile: non esiste una quota di mercato gratuita
-    per quel mercato nei file che usiamo)."""
-    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
-    ha_stagione = 'Stagione' in tutte.columns
-
-    if usa_oos and ha_stagione:
-        indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
-    else:
-        indici = list(range(15, len(tutte)))
-
-    if not indici:
-        return None
-
-    colonne_h, colonne_d, colonne_a = classifica_colonne_quote(tutte.columns)
-    colonne_over, colonne_under = classifica_colonne_over_under(tutte.columns, "2.5")
-    n_partite, n_corrette = 0, 0
-    n_scartate_disaccordo, n_scartate_disaccordo_ou, n_scartate_no_quote = 0, 0, 0
-    per_combo = {f"{s}_{g}_{t}": {"previste": 0, "corrette": 0} for (s, g, t) in LE_12_COMBO}
-
-    for i in indici:
-        partita = tutte.iloc[i]
-        prec = tutte.iloc[:i]
-        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
-                                      emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
-        if m is None: continue
-
-        probabilita_combo = {}
-        for (s, g, t) in LE_12_COMBO:
-            nome_chiave = f"{s}_{g}_{t}"
-            prob_grezza = calcola_combo_libera(m['griglia'], segno=s, soglia_gol=2.5, tipo_soglia=t, gol_nogol=g)
-            prob_finale = prob_grezza
-            if usa_calibrazione and id_fd:
-                calib_c = carica_calibratore(id_fd, nome_chiave)
-                if calib_c:
-                    prob_finale = float(calib_c["calibratore"].predict([prob_grezza/100])[0]) * 100
-            probabilita_combo[nome_chiave] = prob_finale
-
-        combo_prevista = max(probabilita_combo, key=probabilita_combo.get)
-        s_p, g_p, t_p = combo_prevista.split("_")
-
-        if richiedi_accordo_mercato or richiedi_accordo_ou:
-            quote = quote_mercato_normalizzate(partita, colonne_h, colonne_d, colonne_a)
-            if quote is None:
-                n_scartate_no_quote += 1
-                continue
-
-        if richiedi_accordo_mercato:
-            quote_per_segno = {"1": quote["q_casa_equa"], "X": quote["q_x_equa"], "2": quote["q_trasf_equa"]}
-            favorito_mercato = min(quote_per_segno, key=quote_per_segno.get)
-            if s_p != favorito_mercato:
-                n_scartate_disaccordo += 1
-                continue
-
-        if richiedi_accordo_ou:
-            quote_ou = quote_over_under_normalizzate(partita, colonne_over, colonne_under)
-            if quote_ou is None:
-                n_scartate_no_quote += 1
-                continue
-            favorito_ou_mercato = "Over" if quote_ou["q_over_equa"] < quote_ou["q_under_equa"] else "Under"
-            if t_p != favorito_ou_mercato:
-                n_scartate_disaccordo_ou += 1
-                continue
-
-        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
-        tot_gol_reale = partita['FTHG'] + partita['FTAG']
-        entrambe_reale = partita['FTHG'] > 0 and partita['FTAG'] > 0
-        avverata = (s_p == esito) and ((g_p == "Goal") == entrambe_reale) and ((t_p == "Over") == (tot_gol_reale > 2.5))
-
-        n_partite += 1
-        per_combo[combo_prevista]["previste"] += 1
-        if avverata:
-            n_corrette += 1
-            per_combo[combo_prevista]["corrette"] += 1
-
-    return {"n_partite": n_partite, "n_corrette": n_corrette, "per_combo": per_combo,
-            "n_scartate_disaccordo": n_scartate_disaccordo, "n_scartate_disaccordo_ou": n_scartate_disaccordo_ou,
-            "n_scartate_no_quote": n_scartate_no_quote}
-
-
-# =====================================================================
-# 🧪 METRICHE AUDIT
-# =====================================================================
-def _clip_prob(p):
-    return float(np.clip(p, EPS_PROB, 1.0 - EPS_PROB))
-
-def calcola_metriche_1x2(risultati):
-    """Calcola accuracy, Brier multiclass e log loss dalle osservazioni OOS."""
-    if not risultati:
-        return None
-    n = len(risultati)
-    corrette = 0
-    brier = 0.0
-    logloss = 0.0
-    bins = {k: {"n": 0, "somma_p": 0.0, "positivi": 0} for k in ["0-20", "20-40", "40-60", "60-80", "80-100"]}
-    for r in risultati:
-        probs = r["probs"]
-        esito = r["esito"]
-        pred = max(probs, key=probs.get)
-        if pred == esito:
-            corrette += 1
-        y = {"1": 0.0, "X": 0.0, "2": 0.0}
-        y[esito] = 1.0
-        brier += sum((probs[k] - y[k]) ** 2 for k in y)
-        logloss -= np.log(_clip_prob(probs[esito]))
-        pmax = max(probs.values()) * 100.0
-        if pmax < 20: b = "0-20"
-        elif pmax < 40: b = "20-40"
-        elif pmax < 60: b = "40-60"
-        elif pmax < 80: b = "60-80"
-        else: b = "80-100"
-        bins[b]["n"] += 1
-        bins[b]["somma_p"] += pmax
-        bins[b]["positivi"] += int(pred == esito)
-    return {
-        "n": n,
-        "accuracy": corrette / n * 100.0,
-        "brier": brier / n,
-        "log_loss": logloss / n,
-        "bins": bins,
-    }
-
-def esegui_audit_1x2(dati_completi, rho, ewma_span, emivita, stagione_corrente=True):
-    """Backtest rigoroso: per ogni partita usa esclusivamente partite precedenti.
-    NON carica calibratori salvati: questa funzione misura il modello grezzo.
-    """
-    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
-    if stagione_corrente and 'Stagione' in tutte.columns:
-        indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
-    else:
-        indici = list(range(15, len(tutte)))
-    osservazioni = []
-    for i in indici:
-        partita = tutte.iloc[i]
-        prec = tutte.iloc[:i]
-        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span, emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
-        if m is None:
-            continue
-        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
-        osservazioni.append({
-            "probs": {"1": m['prob_1']/100.0, "X": m['prob_X']/100.0, "2": m['prob_2']/100.0},
-            "esito": esito,
-            "data": partita.get('Date_parsed'),
-            "casa": partita['HomeTeam'],
-            "trasferta": partita['AwayTeam'],
-        })
-    return osservazioni
-
-
-
-# =====================================================================
-# 💰 V3 — BACKTEST ECONOMICO OOS (ROI / EV)
-# Valuta il modello con quote storiche PRE-PARTITA disponibili nei CSV.
-# Importante: per ROI usiamo la MEDIA DELLE QUOTE GREZZE dei bookmaker
-# disponibili, non la quota "equa" depurata dal margine. È quindi una
-# proxy storica del prezzo medio disponibile, non la prova di esecuzione
-# presso un bookmaker specifico.
-# Il modello viene sempre calcolato usando esclusivamente il passato.
-# Non vengono usati calibratori salvati.
-# Le combo 1X2 + O/U + Goal/NoGoal NON hanno una quota storica combo nei
-# file gratuiti: non inventiamo un ROI combo. Le combo restano valutate
-# separatamente per accuratezza, come nella V2.
-# =====================================================================
-def quote_medie_grezze_1x2(riga, colonne_h, colonne_d, colonne_a):
-    def media_valori(cols):
-        vals = []
-        for c in cols:
-            v = riga.get(c)
-            if pd.notna(v) and isinstance(v, (int, float)) and v > 1.0:
-                vals.append(float(v))
-        return float(np.mean(vals)) if vals else None
-    qh, qd, qa = media_valori(colonne_h), media_valori(colonne_d), media_valori(colonne_a)
-    if qh is None or qd is None or qa is None:
-        return None
-    return {"1": qh, "X": qd, "2": qa,
-            "n_bookmakers": min(sum(pd.notna(riga[c]) and isinstance(riga.get(c), (int, float)) and riga.get(c) > 1.0 for c in colonne_h),
-                                  sum(pd.notna(riga[c]) and isinstance(riga.get(c), (int, float)) and riga.get(c) > 1.0 for c in colonne_d),
-                                  sum(pd.notna(riga[c]) and isinstance(riga.get(c), (int, float)) and riga.get(c) > 1.0 for c in colonne_a))}
-
-
-def quote_medie_grezze_ou(riga, colonne_over, colonne_under):
-    def media_valori(cols):
-        vals = []
-        for c in cols:
-            v = riga.get(c)
-            if pd.notna(v) and isinstance(v, (int, float)) and v > 1.0:
-                vals.append(float(v))
-        return float(np.mean(vals)) if vals else None
-    qo, qu = media_valori(colonne_over), media_valori(colonne_under)
-    if qo is None or qu is None:
-        return None
-    return {"Over": qo, "Under": qu,
-            "n_bookmakers": min(sum(pd.notna(riga[c]) and isinstance(riga.get(c), (int, float)) and riga.get(c) > 1.0 for c in colonne_over),
-                                  sum(pd.notna(riga[c]) and isinstance(riga.get(c), (int, float)) and riga.get(c) > 1.0 for c in colonne_under))}
-
-
-def _stat_roi(n_bet, wins, profit, ev_sum, odds_sum, drawdown):
-    if n_bet <= 0:
-        return {"scommesse": 0, "vinte": 0, "strike_rate": None, "profitto": 0.0,
-                "roi": None, "ev_medio": None, "quota_media": None, "max_drawdown": 0.0}
-    return {"scommesse": n_bet, "vinte": wins, "strike_rate": wins / n_bet * 100.0,
-            "profitto": profit, "roi": profit / n_bet * 100.0,
-            "ev_medio": ev_sum / n_bet * 100.0, "quota_media": odds_sum / n_bet,
-            "max_drawdown": drawdown}
-
-
-def _aggiorna_pnl(equity, profit, peak):
-    equity += profit
-    peak = max(peak, equity)
-    return equity, peak, peak - equity
-
-
-def esegui_backtest_roi_1x2(dati_completi, rho, ewma_span, emivita, usa_oos=True,
-                            soglia_ev=0.0, richiedi_accordo_mercato=False):
-    """ROI OOS sul segno 1X2. Una puntata flat da 1 unita per selezione.
-    La selezione è il segno più probabile del modello raw. Si scommette solo
-    se EV = p_modello * quota_media_grezza - 1 >= soglia_ev.
-    """
-    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
-    if usa_oos and 'Stagione' in tutte.columns:
-        indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
-    else:
-        indici = list(range(15, len(tutte)))
-    colonne_h, colonne_d, colonne_a = classifica_colonne_quote(tutte.columns)
-    bets = []
-    equity, peak, max_dd = 0.0, 0.0, 0.0
-    for i in indici:
-        partita = tutte.iloc[i]
-        prec = tutte.iloc[:i]
-        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
-                                      emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
-        if m is None: continue
-        q = quote_medie_grezze_1x2(partita, colonne_h, colonne_d, colonne_a)
-        if q is None: continue
-        probs = {"1": m['prob_1']/100.0, "X": m['prob_X']/100.0, "2": m['prob_2']/100.0}
-        scelta = max(probs, key=probs.get)
-        if richiedi_accordo_mercato:
-            favorito_mercato = min(q, key=q.get)
-            if scelta != favorito_mercato:
-                continue
-        quota = q[scelta]
-        ev = probs[scelta] * quota - 1.0
-        if ev < soglia_ev:
-            continue
-        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
-        win = scelta == esito
-        profit = quota - 1.0 if win else -1.0
-        equity, peak, dd = _aggiorna_pnl(equity, profit, peak)
-        max_dd = max(max_dd, dd)
-        bets.append({"data": partita.get('Date_parsed'), "casa": partita['HomeTeam'], "trasferta": partita['AwayTeam'],
-                     "mercato": "1X2", "scelta": scelta, "prob_modello": probs[scelta], "quota": quota,
-                     "ev": ev, "esito": esito, "vinta": win, "profitto": profit})
-    n = len(bets)
-    return _stat_roi(n, sum(b["vinta"] for b in bets), sum(b["profitto"] for b in bets),
-                     sum(b["ev"] for b in bets), sum(b["quota"] for b in bets), max_dd), pd.DataFrame(bets)
-
-
-def esegui_backtest_roi_ou(dati_completi, rho, ewma_span, emivita, usa_oos=True,
-                           soglia_ev=0.0, richiedi_accordo_mercato=False):
-    """ROI OOS su Over/Under 2.5 con quota media grezza pre-partita."""
-    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
-    if usa_oos and 'Stagione' in tutte.columns:
-        indici = [i for i in tutte.index[tutte['Stagione'] == 'corrente'].tolist() if i >= 15]
-    else:
-        indici = list(range(15, len(tutte)))
-    colonne_over, colonne_under = classifica_colonne_over_under(tutte.columns, "2.5")
-    bets = []
-    equity, peak, max_dd = 0.0, 0.0, 0.0
-    for i in indici:
-        partita = tutte.iloc[i]
-        prec = tutte.iloc[:i]
-        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
-                                      emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
-        if m is None: continue
-        q = quote_medie_grezze_ou(partita, colonne_over, colonne_under)
-        if q is None: continue
-        probs = {"Over": (100.0 - m['prob_under'][2.5]) / 100.0,
-                 "Under": m['prob_under'][2.5] / 100.0}
-        scelta = max(probs, key=probs.get)
-        if richiedi_accordo_mercato:
-            favorito_mercato = min(q, key=q.get)
-            if scelta != favorito_mercato:
-                continue
-        quota = q[scelta]
-        ev = probs[scelta] * quota - 1.0
-        if ev < soglia_ev:
-            continue
-        tot_gol = partita['FTHG'] + partita['FTAG']
-        esito = "Over" if tot_gol > 2.5 else "Under"
-        win = scelta == esito
-        profit = quota - 1.0 if win else -1.0
-        equity, peak, dd = _aggiorna_pnl(equity, profit, peak)
-        max_dd = max(max_dd, dd)
-        bets.append({"data": partita.get('Date_parsed'), "casa": partita['HomeTeam'], "trasferta": partita['AwayTeam'],
-                     "mercato": "O/U 2.5", "scelta": scelta, "prob_modello": probs[scelta], "quota": quota,
-                     "ev": ev, "esito": esito, "vinta": win, "profitto": profit})
-    n = len(bets)
-    return _stat_roi(n, sum(b["vinta"] for b in bets), sum(b["profitto"] for b in bets),
-                     sum(b["ev"] for b in bets), sum(b["quota"] for b in bets), max_dd), pd.DataFrame(bets)
-
-
-def mostra_roi(ris, titolo):
-    st.write(f"**{titolo}**")
-    if ris["scommesse"] == 0:
-        st.warning("Nessuna scommessa qualificata con questi criteri.")
-        return
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Scommesse", ris["scommesse"])
-    c2.metric("Strike rate", f"{ris['strike_rate']:.1f}%")
-    c3.metric("ROI", f"{ris['roi']:+.1f}%")
-    c4.metric("Profitto (1u)", f"{ris['profitto']:+.2f}")
-    st.caption(f"Quota media: {ris['quota_media']:.2f} — EV medio teorico: {ris['ev_medio']:+.1f}% — Max drawdown: {ris['max_drawdown']:.2f} unità")
-
-
-def mostra_sezione_roi_v3(dati, campionato, id_fd, rho_val, ewma_span_val, emivita_val):
-    st.divider()
-    st.write("**💰 V3 — Backtest economico OOS: ROI / EV**")
-    st.caption("Testa il modello grezzo su quote storiche pre-partita. Una puntata = 1 unità. "
-               "La quota è la media grezza dei bookmaker disponibili nel CSV: è una proxy storica, non una garanzia di esecuzione.")
-    st.warning("⚠️ Questo test NON usa la quota combo stimata. Le combo libere non hanno una quota storica combo nel dataset gratuito, quindi qui misuriamo 1X2 e O/U 2.5 separatamente.")
-    col1, col2 = st.columns(2)
-    with col1:
-        periodo = st.selectbox("Periodo ROI", ["Stagione corrente OOS", "Tutto lo storico"], key=f"roi_periodo_{id_fd}")
-    with col2:
-        soglia_ev_pct = st.selectbox("EV minimo", [0, 5, 10, 15, 20], index=0, key=f"roi_ev_{id_fd}")
-    accordo_segno = st.checkbox("Solo se modello e mercato concordano sul segno", value=False, key=f"roi_segno_{id_fd}")
-    accordo_ou = st.checkbox("Solo se modello e mercato concordano su Over/Under 2.5", value=False, key=f"roi_ou_{id_fd}")
-    usa_oos = periodo == "Stagione corrente OOS"
-    soglia = soglia_ev_pct / 100.0
-    if st.button("💰 Esegui backtest ROI / EV", key=f"roi_run_{id_fd}"):
-        with st.spinner("Calcolo ROI/EV OOS in corso..."):
-            if accordo_ou:
-                # Il filtro O/U vale per entrambi i mercati; viene applicato
-                # separatamente nella funzione del mercato corrispondente.
-                pass
-            r1, df1 = esegui_backtest_roi_1x2(dati, rho_val, ewma_span_val, emivita_val, usa_oos, soglia, accordo_segno)
-            r2, df2 = esegui_backtest_roi_ou(dati, rho_val, ewma_span_val, emivita_val, usa_oos, soglia, accordo_ou)
-            mostra_roi(r1, "1X2 — selezione più probabile del modello")
-            mostra_roi(r2, "Over/Under 2.5 — selezione più probabile del modello")
-            if not df1.empty or not df2.empty:
-                df_out = pd.concat([df1, df2], ignore_index=True)
-                st.dataframe(df_out[['data','casa','trasferta','mercato','scelta','prob_modello','quota','ev','esito','vinta','profitto']],
-                             use_container_width=True, hide_index=True)
-                st.download_button("⬇️ Scarica dettaglio ROI come CSV", data=df_out.to_csv(index=False).encode('utf-8'),
-                                   file_name=f"roi_ev_{id_fd}.csv", mime="text/csv", key=f"roi_dl_{id_fd}")
-            st.caption("Interpretazione: ROI > 0 significa profitto storico sul campione e sulle quote usate dal test. "
-                       "Non implica che il risultato si ripeta nel futuro. EV è il valore teorico calcolato dalla probabilità del modello e dalla quota storica usata.")
-
-
-# =====================================================================
-# 🔎 V4 — AUDIT QUOTE / EV
-# Confronta quattro oggetti distinti, senza confonderli:
-#   1) quota media grezza dei bookmaker (proxy del prezzo storico);
-#   2) probabilità implicita dalla quota media grezza;
-#   3) probabilità implicita normalizzata bookmaker-per-bookmaker;
-#   4) probabilità del modello e relativo EV teorico.
-# Questo audit NON modifica il modello e NON usa calibratori salvati.
-# =====================================================================
-def _float_quote(v):
-    return float(v) if pd.notna(v) and isinstance(v, (int, float, np.number)) and float(v) > 1.0 else None
-
-
-def _bookmaker_prefix(col, suffixes):
-    for suf in suffixes:
-        if str(col).endswith(suf):
-            return str(col)[:-len(suf)]
-    return None
-
-
-def _audit_quote_1x2(riga, colonne_h, colonne_d, colonne_a):
-    gruppi = {}
-    for c in colonne_h:
-        pre = _bookmaker_prefix(c, ['H'])
-        q = _float_quote(riga.get(c))
-        if pre and q is not None: gruppi.setdefault(pre, {})['1'] = q
-    for c in colonne_d:
-        pre = _bookmaker_prefix(c, ['D'])
-        q = _float_quote(riga.get(c))
-        if pre and q is not None: gruppi.setdefault(pre, {})['X'] = q
-    for c in colonne_a:
-        pre = _bookmaker_prefix(c, ['A'])
-        q = _float_quote(riga.get(c))
-        if pre and q is not None: gruppi.setdefault(pre, {})['2'] = q
-
-    completi = [g for g in gruppi.values() if all(k in g for k in ('1','X','2'))]
-    if not completi:
-        return None
-
-    q_media = {k: float(np.mean([g[k] for g in completi])) for k in ('1','X','2')}
-    implied_raw = {k: 1.0/q_media[k] for k in q_media}
-    over_raw = sum(implied_raw.values())
-    p_norm_da_media_quote = {k: implied_raw[k]/over_raw for k in implied_raw}
-
-    norm_per_book = []
-    overrounds = []
-    for g in completi:
-        inv = {k: 1.0/g[k] for k in ('1','X','2')}
-        ov = sum(inv.values())
-        overrounds.append(ov)
-        norm_per_book.append({k: inv[k]/ov for k in inv})
-    p_market = {k: float(np.mean([x[k] for x in norm_per_book])) for k in ('1','X','2')}
-
-    return {
-        'quota_media': q_media,
-        'p_implicita_quota_media': implied_raw,
-        'overround_quota_media': over_raw,
-        'p_norm_da_quota_media': p_norm_da_media_quote,
-        'p_market_norm_media_bookmaker': p_market,
-        'overround_medio_bookmaker': float(np.mean(overrounds)),
-        'n_bookmakers': len(completi),
-    }
-
-
-def _audit_quote_ou(riga, colonne_over, colonne_under):
-    gruppi = {}
-    for c in colonne_over:
-        pre = _bookmaker_prefix(c, ['>2.5'])
-        q = _float_quote(riga.get(c))
-        if pre and q is not None: gruppi.setdefault(pre, {})['Over'] = q
-    for c in colonne_under:
-        pre = _bookmaker_prefix(c, ['<2.5'])
-        q = _float_quote(riga.get(c))
-        if pre and q is not None: gruppi.setdefault(pre, {})['Under'] = q
-    completi = [g for g in gruppi.values() if 'Over' in g and 'Under' in g]
-    if not completi:
-        return None
-    q_media = {k: float(np.mean([g[k] for g in completi])) for k in ('Over','Under')}
-    implied_raw = {k: 1.0/q_media[k] for k in q_media}
-    over_raw = sum(implied_raw.values())
-    p_norm_da_media_quote = {k: implied_raw[k]/over_raw for k in implied_raw}
-    norm_per_book, overrounds = [], []
-    for g in completi:
-        inv = {k: 1.0/g[k] for k in ('Over','Under')}
-        ov = sum(inv.values())
-        overrounds.append(ov)
-        norm_per_book.append({k: inv[k]/ov for k in inv})
-    p_market = {k: float(np.mean([x[k] for x in norm_per_book])) for k in ('Over','Under')}
-    return {
-        'quota_media': q_media,
-        'p_implicita_quota_media': implied_raw,
-        'overround_quota_media': over_raw,
-        'p_norm_da_quota_media': p_norm_da_media_quote,
-        'p_market_norm_media_bookmaker': p_market,
-        'overround_medio_bookmaker': float(np.mean(overrounds)),
-        'n_bookmakers': len(completi),
-    }
-
-
-def _audit_quote_statistiche(df):
-    if df is None or df.empty:
-        return pd.DataFrame()
-    rows = []
-    for lo, hi, label in [(0, .4, '0-40%'), (.4, .5, '40-50%'), (.5, .6, '50-60%'),
-                          (.6, .7, '60-70%'), (.7, .8, '70-80%'), (.8, 1.01, '80-100%')]:
-        x = df[(df['prob_modello'] >= lo) & (df['prob_modello'] < hi)]
-        if x.empty: continue
-        rows.append({
-            'Fascia prob. modello': label,
-            'Bet': len(x),
-            'Prob. modello media': x['prob_modello'].mean()*100,
-            'Prob. mercato fair media': x['p_mercato_fair'].mean()*100,
-            'Frequenza reale': x['vinta'].mean()*100,
-            'EV teorico medio': x['ev_raw'].mean()*100,
-            'ROI': x['profitto'].sum()/len(x)*100,
-        })
-    return pd.DataFrame(rows)
-
-
-def esegui_audit_quote_1x2(dati_completi, rho, ewma_span, emivita):
-    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
-    colonne_h, colonne_d, colonne_a = classifica_colonne_quote(tutte.columns)
-    rows = []
-    for i in range(15, len(tutte)):
-        partita = tutte.iloc[i]
-        prec = tutte.iloc[:i]
-        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span, emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
-        if m is None: continue
-        q = _audit_quote_1x2(partita, colonne_h, colonne_d, colonne_a)
-        if q is None: continue
-        probs = {'1': m['prob_1']/100, 'X': m['prob_X']/100, '2': m['prob_2']/100}
-        scelta = max(probs, key=probs.get)
-        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
-        quota = q['quota_media'][scelta]
-        p_imp = q['p_implicita_quota_media'][scelta]
-        p_fair = q['p_market_norm_media_bookmaker'][scelta]
-        ev_raw = probs[scelta]*quota - 1
-        win = scelta == esito
-        profitto = quota-1 if win else -1
-        rows.append({
-            'data': partita.get('Date_parsed'), 'casa': partita['HomeTeam'], 'trasferta': partita['AwayTeam'],
-            'scelta': scelta, 'prob_modello': probs[scelta], 'quota': quota,
-            'p_mercato_implicita_raw': p_imp, 'p_mercato_fair': p_fair,
-            'edge_vs_fair': probs[scelta]-p_fair, 'overround_medio': q['overround_medio_bookmaker']-1,
-            'ev_raw': ev_raw, 'esito': esito, 'vinta': win, 'profitto': profitto,
-            'n_bookmakers': q['n_bookmakers'],
-        })
-    return pd.DataFrame(rows)
-
-
-def esegui_audit_quote_ou(dati_completi, rho, ewma_span, emivita):
-    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
-    colonne_over, colonne_under = classifica_colonne_over_under(tutte.columns, '2.5')
-    rows = []
-    for i in range(15, len(tutte)):
-        partita = tutte.iloc[i]
-        prec = tutte.iloc[:i]
-        m = calcola_modello_completo(prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span, emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed'))
-        if m is None: continue
-        q = _audit_quote_ou(partita, colonne_over, colonne_under)
-        if q is None: continue
-        probs = {'Over': (100-m['prob_under'][2.5])/100, 'Under': m['prob_under'][2.5]/100}
-        scelta = max(probs, key=probs.get)
-        tot = partita['FTHG'] + partita['FTAG']
-        esito = 'Over' if tot > 2.5 else 'Under'
-        quota = q['quota_media'][scelta]
-        p_imp = q['p_implicita_quota_media'][scelta]
-        p_fair = q['p_market_norm_media_bookmaker'][scelta]
-        ev_raw = probs[scelta]*quota - 1
-        win = scelta == esito
-        profitto = quota-1 if win else -1
-        rows.append({
-            'data': partita.get('Date_parsed'), 'casa': partita['HomeTeam'], 'trasferta': partita['AwayTeam'],
-            'scelta': scelta, 'prob_modello': probs[scelta], 'quota': quota,
-            'p_mercato_implicita_raw': p_imp, 'p_mercato_fair': p_fair,
-            'edge_vs_fair': probs[scelta]-p_fair, 'overround_medio': q['overround_medio_bookmaker']-1,
-            'ev_raw': ev_raw, 'esito': esito, 'vinta': win, 'profitto': profitto,
-            'n_bookmakers': q['n_bookmakers'],
-        })
-    return pd.DataFrame(rows)
-
-
-def mostra_audit_quote_v4(dati, campionato, id_fd, rho_val, ewma_span_val, emivita_val):
-    st.divider()
-    st.write('**🔎 V4 — Audit quote, probabilità di mercato ed EV**')
-    st.caption('Questa sezione non modifica il modello. Ricostruisce il prezzo medio storico e separa quota grezza, probabilità implicita, probabilità di mercato normalizzata ed EV teorico.')
-    if st.button('🔎 Esegui audit quote / EV', key=f'v4_quote_{id_fd}'):
-        with st.spinner('Audit quote/EV in corso...'):
-            df1 = esegui_audit_quote_1x2(dati, rho_val, ewma_span_val, emivita_val)
-            df2 = esegui_audit_quote_ou(dati, rho_val, ewma_span_val, emivita_val)
-        for titolo, df in [('1X2 — selezione più probabile', df1), ('O/U 2.5 — selezione più probabile', df2)]:
-            st.markdown(f'### {titolo}')
-            if df.empty:
-                st.warning('Nessun dato sufficiente per l’audit.')
-                continue
-            roi = df['profitto'].sum()/len(df)*100
-            evm = df['ev_raw'].mean()*100
-            edge = df['edge_vs_fair'].mean()*100
-            st.write(f'Bet: **{len(df)}** · Strike: **{df["vinta"].mean()*100:.1f}%** · ROI: **{roi:+.1f}%** · EV teorico medio: **{evm:+.1f}%** · Edge medio vs mercato fair: **{edge:+.1f} punti**')
-            st.dataframe(_audit_quote_statistiche(df).round(3), use_container_width=True, hide_index=True)
-            st.caption('Mercato fair = media delle probabilità implicite normalizzate bookmaker-per-bookmaker. EV teorico usa invece la quota media grezza, cioè il prezzo storico della puntata.')
-            st.dataframe(df[['data','casa','trasferta','scelta','prob_modello','quota','p_mercato_implicita_raw','p_mercato_fair','edge_vs_fair','overround_medio','ev_raw','esito','vinta','profitto','n_bookmakers']].round(4), use_container_width=True, hide_index=True)
-        if not df1.empty or not df2.empty:
-            out = pd.concat([df1.assign(mercato='1X2'), df2.assign(mercato='O/U 2.5')], ignore_index=True)
-            st.download_button('⬇️ Scarica audit quote V4 CSV', data=out.to_csv(index=False).encode('utf-8'), file_name=f'audit_quote_v4_{id_fd}.csv', mime='text/csv', key=f'v4_dl_{id_fd}')
-
-
-# =====================================================================
-# 🧪 V2 — CALIBRAZIONE FUORI CAMPIONE
-# =====================================================================
-def _costruisci_osservazioni_raw(dati_completi, rho, ewma_span, emivita):
-    """Calcola una previsione raw 1X2 per ogni partita usando solo il passato.
-    Restituisce un DataFrame ordinato temporalmente con stagione e probabilità.
-    Nessun calibratore salvato viene letto.
-    """
-    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True).copy()
-    righe = []
-    for i in range(15, len(tutte)):
-        partita = tutte.iloc[i]
-        prec = tutte.iloc[:i]
-        m = calcola_modello_completo(
-            prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
-            emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed')
-        )
-        if m is None:
-            continue
-        esito = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
-        righe.append({
-            'indice': i,
-            'data': partita.get('Date_parsed'),
-            'stagione': partita.get('Stagione', ''),
-            'p1': float(m['prob_1']) / 100.0,
-            'px': float(m['prob_X']) / 100.0,
-            'p2': float(m['prob_2']) / 100.0,
-            'esito': esito,
-        })
-    return pd.DataFrame(righe)
-
-
-def _fit_calibratore_1x2_temporale(df_train):
-    """Calibrazione isotonic 1X2 su osservazioni storiche precedenti al test.
-    Le tre probabilità sono trattate one-vs-rest, come nel progetto originale,
-    e poi rinormalizzate quando applicate.
-    """
-    if df_train is None or len(df_train) < 100:
-        return None
-    oss = []
-    for _, r in df_train.iterrows():
-        oss.append((r['p1'], r['esito'] == '1'))
-        oss.append((r['px'], r['esito'] == 'X'))
-        oss.append((r['p2'], r['esito'] == '2'))
-    if len(oss) < 100:
-        return None
-    return _allena_isotonic(oss)
-
-
-def _applica_calibratore_row(r, calibratore):
-    if calibratore is None:
-        return {'1': r['p1'], 'X': r['px'], '2': r['p2']}
-    vals = {
-        '1': float(calibratore.predict([r['p1']])[0]),
-        'X': float(calibratore.predict([r['px']])[0]),
-        '2': float(calibratore.predict([r['p2']])[0]),
-    }
-    tot = sum(vals.values())
-    if tot <= 0:
-        return {'1': r['p1'], 'X': r['px'], '2': r['p2']}
-    return {k: v / tot for k, v in vals.items()}
-
-
-def _metriche_da_df(df_eval, calibratore=None):
-    if df_eval is None or df_eval.empty:
-        return None
-    raw_obs = []
-    cal_obs = []
-    for _, r in df_eval.iterrows():
-        raw_obs.append({
-            'probs': {'1': r['p1'], 'X': r['px'], '2': r['p2']},
-            'esito': r['esito']
-        })
-        cp = _applica_calibratore_row(r, calibratore)
-        cal_obs.append({'probs': cp, 'esito': r['esito']})
-    raw = calcola_metriche_1x2(raw_obs)
-    cal = calcola_metriche_1x2(cal_obs)
-    return raw, cal
-
-
-def esegui_audit_calibrazione_oos(dati_completi, rho, ewma_span, emivita, modalita='storico'):
-    """Confronto raw vs isotonic OOS.
-
-    - corrente: train = stagione precedente, test = stagione corrente.
-    - storico: train = primo 70% delle osservazioni temporali, test = ultimo 30%.
-    In entrambi i casi il calibratore non vede gli esiti del test.
-    """
-    df = _costruisci_osservazioni_raw(dati_completi, rho, ewma_span, emivita)
-    if df.empty:
-        return None
-
-    if modalita == 'corrente' and 'stagione' in df.columns:
-        train = df[df['stagione'] == 'precedente'].copy()
-        test = df[df['stagione'] == 'corrente'].copy()
-        metodo = 'Train = stagione precedente; Test = stagione corrente'
-    else:
-        cut = max(1, int(len(df) * 0.70))
-        train = df.iloc[:cut].copy()
-        test = df.iloc[cut:].copy()
-        metodo = f'Train = primo 70% temporale ({len(train)}), Test = ultimo 30% ({len(test)})'
-
-    calibratore = _fit_calibratore_1x2_temporale(train)
-    if calibratore is None:
-        return {
-            'ok': False,
-            'n_raw': len(df),
-            'n_train': len(train),
-            'n_test': len(test),
-            'metodo': metodo,
-            'motivo': 'Dati insufficienti per allenare la calibrazione isotonic (servono almeno 100 osservazioni 1X2 nel train).'
-        }
-
-    metriche = _metriche_da_df(test, calibratore)
-    return {
-        'ok': True,
-        'n_raw': len(df),
-        'n_train': len(train),
-        'n_test': len(test),
-        'metodo': metodo,
-        'raw': metriche[0],
-        'cal': metriche[1],
-    }
-
-
-def _tabella_calibrazione_metriche(met):
-    righe = []
-    for fascia, d in met['bins'].items():
-        righe.append({
-            'Fascia probabilità massima': fascia + '%',
-            'Partite': d['n'],
-            'Prob. media prevista': f"{(d['somma_p']/d['n']):.1f}%" if d['n'] else '—',
-            'Accuracy reale': f"{(d['positivi']/d['n']*100):.1f}%" if d['n'] else '—',
-        })
-    return pd.DataFrame(righe)
-
-# =====================================================================
-# 🖥️ INTERFACCIA
-# =====================================================================
-st.title("🧪 COMBO — Audit Model V13.6 Operativa")
-
-
-# =====================================================================
-# 💰 V5 — CALIBRAZIONE OOS APPLICATA ALL'EV
-# Questo modulo è separato e non modifica il motore originale.
-# Per ogni partita storica:
-#   1) calcola la probabilità raw usando SOLO il passato;
-#   2) allena la calibrazione isotonic SOLO sulle osservazioni precedenti;
-#   3) applica la calibrazione alla partita corrente;
-#   4) seleziona la giocata sulla probabilità calibrata;
-#   5) ricalcola EV = p_calibrata * quota_storica - 1.
-# Il confronto Raw vs Calibrated è effettuato sul MEDESIMO campione
-# warm-up OOS, così ROI e profitto sono confrontabili.
-# =====================================================================
-V5_CAL_MIN_TRAIN = 100
-
-
-def _v5_fit_iso_binary(p_list, y_list):
-    if len(p_list) < V5_CAL_MIN_TRAIN:
-        return None
-    if len(set(y_list)) < 2:
-        return None
-    cal = IsotonicRegression(out_of_bounds='clip', y_min=0.001, y_max=0.999)
-    cal.fit(np.asarray(p_list, dtype=float), np.asarray(y_list, dtype=float))
-    return cal
-
-
-def _v5_raw_history(dati_completi, rho, ewma_span, emivita):
-    """Previsioni raw walk-forward per tutto lo storico con quote disponibili."""
-    tutte = dati_completi[dati_completi['FTHG'].notna()].reset_index(drop=True)
-    ch, cd, ca = classifica_colonne_quote(tutte.columns)
-    co, cu = classifica_colonne_over_under(tutte.columns, '2.5')
-    righe = []
-    for i in range(15, len(tutte)):
-        partita = tutte.iloc[i]
-        prec = tutte.iloc[:i]
-        m = calcola_modello_completo(
-            prec, partita['HomeTeam'], partita['AwayTeam'], rho, ewma_span,
-            emivita, pd.DataFrame(), data_riferimento=partita.get('Date_parsed')
-        )
-        if m is None:
-            continue
-        q12 = quote_medie_grezze_1x2(partita, ch, cd, ca)
-        qou = quote_medie_grezze_ou(partita, co, cu)
-        if q12 is None or qou is None:
-            continue
-        esito12 = '1' if partita['FTHG'] > partita['FTAG'] else ('2' if partita['FTHG'] < partita['FTAG'] else 'X')
-        tot = partita['FTHG'] + partita['FTAG']
-        esito_ou = 'Over' if tot > 2.5 else 'Under'
-        p1 = float(m['prob_1']) / 100.0
-        px = float(m['prob_X']) / 100.0
-        p2 = float(m['prob_2']) / 100.0
-        po = (100.0 - float(m['prob_under'][2.5])) / 100.0
-        pu = 1.0 - po
-        righe.append({
-            'indice': i, 'data': partita.get('Date_parsed'),
-            'casa': partita['HomeTeam'], 'trasferta': partita['AwayTeam'],
-            'p1': p1, 'px': px, 'p2': p2, 'po': po, 'pu': pu,
-            'esito12': esito12, 'esito_ou': esito_ou,
-            'q1': q12['1'], 'qx': q12['X'], 'q2': q12['2'],
-            'qo': qou['Over'], 'qu': qou['Under'],
-        })
-    return pd.DataFrame(righe)
-
-
-def _v5_stats(bets):
-    if not bets:
-        return {'n': 0, 'strike': None, 'roi': None, 'profit': 0.0, 'ev': None,
-                'avg_odds': None, 'max_dd': 0.0}
-    equity = 0.0; peak = 0.0; max_dd = 0.0
-    wins = 0; evs = []; odds = []
-    for b in bets:
-        if b['vinta']:
-            wins += 1
-            profit = b['quota'] - 1.0
-        else:
-            profit = -1.0
-        equity += profit
-        peak = max(peak, equity)
-        max_dd = max(max_dd, peak - equity)
-        evs.append(b['ev']); odds.append(b['quota'])
-    n = len(bets)
-    return {'n': n, 'strike': wins/n*100.0, 'roi': equity/n*100.0,
-            'profit': equity, 'ev': float(np.mean(evs))*100.0,
-            'avg_odds': float(np.mean(odds)), 'max_dd': max_dd}
-
-
-def _v5_bucket_df(df, prob_col, ev_col='ev_cal'):
-    if df.empty:
-        return pd.DataFrame()
-    bins = [0.0, .40, .50, .60, .70, .80, 1.000001]
-    labels = ['0-40%', '40-50%', '50-60%', '60-70%', '70-80%', '80-100%']
-    x = df.copy()
-    x['fascia'] = pd.cut(x[prob_col], bins=bins, labels=labels, right=False, include_lowest=True)
-    rows=[]
-    for lab,g in x.groupby('fascia', observed=False):
-        if g.empty: continue
-        rows.append({
-            'Fascia prob. modello': str(lab), 'Bet': len(g),
-            'Prob. media': g[prob_col].mean()*100.0,
-            'Prob. mercato fair media': g['p_mercato_fair'].mean()*100.0,
-            'Frequenza reale': g['vinta'].mean()*100.0,
-            'EV teorico medio': g[ev_col].mean()*100.0,
-            'ROI': g['profitto'].sum()/len(g)*100.0,
-        })
-    return pd.DataFrame(rows)
-
-
-def _v5_run_economic(dati_completi, rho, ewma_span, emivita, soglia_ev=0.10, warmup=100):
-    """Raw vs calibrato OOS temporale, su 1X2 e O/U 2.5.
-    La calibrazione di ogni riga usa esclusivamente righe precedenti.
-    """
-    hist = _v5_raw_history(dati_completi, rho, ewma_span, emivita)
-    if hist.empty:
-        return None
-    raw12=[]; cal12=[]; rawou=[]; calou=[]
-    prior12_p={'1':[], 'X':[], '2':[]}; prior12_y={'1':[], 'X':[], '2':[]}
-    prior_ou_p=[]; prior_ou_y=[]
-    for j, r in hist.iterrows():
-        if j < warmup:
-            # Accumula il train iniziale, ma non usa la riga corrente come propria calibrazione.
-            prior12_p['1'].append(r.p1); prior12_y['1'].append(1 if r.esito12=='1' else 0)
-            prior12_p['X'].append(r.px); prior12_y['X'].append(1 if r.esito12=='X' else 0)
-            prior12_p['2'].append(r.p2); prior12_y['2'].append(1 if r.esito12=='2' else 0)
-            prior_ou_p.append(r.po); prior_ou_y.append(1 if r.esito_ou=='Over' else 0)
-            continue
-
-        cal12_models = {s: _v5_fit_iso_binary(prior12_p[s], prior12_y[s]) for s in ['1','X','2']}
-        cal_ou = _v5_fit_iso_binary(prior_ou_p, prior_ou_y)
-
-        raw_probs={'1':r.p1,'X':r.px,'2':r.p2}
-        raw_choice=max(raw_probs, key=raw_probs.get)
-        raw_q={'1':r.q1,'X':r.qx,'2':r.q2}[raw_choice]
-        raw_ev=raw_probs[raw_choice]*raw_q-1.0
-        if raw_ev >= soglia_ev:
-            fair={'1':1/r.q1,'X':1/r.qx,'2':1/r.q2}; sm=sum(fair.values())
-            fair={k:v/sm for k,v in fair.items()}
-            raw12.append({'data':r.data,'casa':r.casa,'trasferta':r.trasferta,'scelta':raw_choice,
-                          'prob_modello':raw_probs[raw_choice],'p_mercato_fair':fair[raw_choice],
-                          'quota':raw_q,'ev':raw_ev,'vinta':raw_choice==r.esito12})
-
-        if all(cal12_models[s] is not None for s in ['1','X','2']):
-            cv={s:float(cal12_models[s].predict([raw_probs[s]])[0]) for s in ['1','X','2']}
-            tot=sum(cv.values())
-            if tot>0: cv={s:v/tot for s,v in cv.items()}
-        else:
-            cv=raw_probs
-        cal_choice=max(cv, key=cv.get)
-        cal_q={'1':r.q1,'X':r.qx,'2':r.q2}[cal_choice]
-        cal_ev=cv[cal_choice]*cal_q-1.0
-        if cal_ev >= soglia_ev:
-            fair={'1':1/r.q1,'X':1/r.qx,'2':1/r.q2}; sm=sum(fair.values())
-            fair={k:v/sm for k,v in fair.items()}
-            cal12.append({'data':r.data,'casa':r.casa,'trasferta':r.trasferta,'scelta':cal_choice,
-                          'prob_modello':cv[cal_choice],'p_mercato_fair':fair[cal_choice],
-                          'quota':cal_q,'ev_cal':cal_ev,'vinta':cal_choice==r.esito12})
-
-        # O/U
-        raw_ou={'Over':r.po,'Under':r.pu}
-        raw_ou_choice=max(raw_ou,key=raw_ou.get)
-        raw_ou_q={'Over':r.qo,'Under':r.qu}[raw_ou_choice]
-        raw_ou_ev=raw_ou[raw_ou_choice]*raw_ou_q-1.0
-        if raw_ou_ev >= soglia_ev:
-            fair_o=1/r.qo; fair_u=1/r.qu; sm=fair_o+fair_u
-            fair_ou={'Over':fair_o/sm,'Under':fair_u/sm}
-            rawou.append({'data':r.data,'casa':r.casa,'trasferta':r.trasferta,'scelta':raw_ou_choice,
-                          'prob_modello':raw_ou[raw_ou_choice],'p_mercato_fair':fair_ou[raw_ou_choice],
-                          'quota':raw_ou_q,'ev':raw_ou_ev,'vinta':raw_ou_choice==r.esito_ou})
-
-        if cal_ou is not None:
-            pco=float(cal_ou.predict([r.po])[0])
-            pco=min(max(pco,0.001),0.999)
-            cal_ou_probs={'Over':pco,'Under':1-pco}
-        else:
-            cal_ou_probs=raw_ou
-        cal_ou_choice=max(cal_ou_probs,key=cal_ou_probs.get)
-        cal_ou_q={'Over':r.qo,'Under':r.qu}[cal_ou_choice]
-        cal_ou_ev=cal_ou_probs[cal_ou_choice]*cal_ou_q-1.0
-        if cal_ou_ev >= soglia_ev:
-            fair_o=1/r.qo; fair_u=1/r.qu; sm=fair_o+fair_u
-            fair_ou={'Over':fair_o/sm,'Under':fair_u/sm}
-            calou.append({'data':r.data,'casa':r.casa,'trasferta':r.trasferta,'scelta':cal_ou_choice,
-                          'prob_modello':cal_ou_probs[cal_ou_choice],'p_mercato_fair':fair_ou[cal_ou_choice],
-                          'quota':cal_ou_q,'ev_cal':cal_ou_ev,'vinta':cal_ou_choice==r.esito_ou})
-
-        # La riga corrente entra nel train SOLO dopo essere stata valutata.
-        prior12_p['1'].append(r.p1); prior12_y['1'].append(1 if r.esito12=='1' else 0)
-        prior12_p['X'].append(r.px); prior12_y['X'].append(1 if r.esito12=='X' else 0)
-        prior12_p['2'].append(r.p2); prior12_y['2'].append(1 if r.esito12=='2' else 0)
-        prior_ou_p.append(r.po); prior_ou_y.append(1 if r.esito_ou=='Over' else 0)
-
-    def finish(rows, prob_key='prob_modello', ev_key='ev'):
-        for b in rows:
-            b['profitto'] = b['quota']-1.0 if b['vinta'] else -1.0
-            if ev_key=='ev_cal':
-                b['ev']=b['ev_cal']
-        return rows
-    raw12=finish(raw12); cal12=finish(cal12,'prob_modello','ev_cal')
-    rawou=finish(rawou); calou=finish(calou,'prob_modello','ev_cal')
-    return {'hist':hist,'raw12':pd.DataFrame(raw12),'cal12':pd.DataFrame(cal12),
-            'rawou':pd.DataFrame(rawou),'calou':pd.DataFrame(calou)}
-
-
-def _v5_show_pair(raw_df, cal_df, titolo):
-    st.markdown(f"### {titolo}")
-    for name,df,evcol in [('RAW',raw_df,'ev'),('CALIBRATO OOS',cal_df,'ev_cal')]:
-        if df.empty:
-            st.warning(f"{name}: nessuna scommessa qualificata.")
-            continue
-        # Normalizza colonna EV per la tabella bucket.
-        d=df.copy()
-        if evcol not in d.columns: d[evcol]=d['ev']
-        s=_v5_stats([{'vinta':bool(x.vinta),'quota':float(x.quota),'ev':float(x.ev)} for _,x in d.iterrows()])
-        st.write(f"**{name}**")
-        c1,c2,c3,c4,c5=st.columns(5)
-        c1.metric('Bet',s['n']); c2.metric('Strike',f"{s['strike']:.1f}%")
-        c3.metric('ROI',f"{s['roi']:+.1f}%"); c4.metric('Profitto',f"{s['profit']:+.2f}u")
-        c5.metric('EV medio',f"{s['ev']:+.1f}%")
-        st.caption(f"Quota media {s['avg_odds']:.2f} · Max drawdown {s['max_dd']:.2f}u")
-        st.dataframe(_v5_bucket_df(d,'prob_modello',evcol),use_container_width=True,hide_index=True)
-
-
-# =====================================================================
-# 🚀 V6 — BATCH TEST AUTOMATICO DEI 5 CAMPIONATI
-# Esegue in una sola passata i test principali fatti manualmente sulla
-# Serie A: audit grezzo, calibrazione OOS, audit quote/EV e V5 economico.
-# V5 economico viene eseguito con EV minimo 10%, storico OOS, come nel test
-# di riferimento usato per la Serie A. In più V3 viene riepilogato a 0/5/10/15/20%.
-# =====================================================================
-def _v6_stats_df(df):
-    if df is None or df.empty:
-        return {'bet':0,'strike':None,'roi':None,'profit':0.0,'avg_odds':None,'ev':None,'max_dd':None}
-    wins = df['vinta'].astype(bool)
-    profit = df['quota'].astype(float).where(wins, -1.0)
-    cum = profit.cumsum()
-    peak = cum.cummax()
-    dd = peak-cum
-    return {
-        'bet': int(len(df)),
-        'strike': float(wins.mean()*100),
-        'roi': float(profit.mean()*100),
-        'profit': float(profit.sum()),
-        'avg_odds': float(df['quota'].mean()),
-        'ev': float(df['ev'].mean()*100) if 'ev' in df.columns else (float(df['ev_raw'].mean()*100) if 'ev_raw' in df.columns else None),
-        'max_dd': float(dd.max()) if len(dd) else 0.0,
-    }
-
-
-def _v6_run_batch(rho, ewma_span, emivita, soglia_v5=0.10, warmup=100):
-    risultati=[]
-    errori=[]
-    campioni=list(CAMPIONATI_DOMESTICI.items())
-    for nome, info in campioni:
-        try:
-            dati_b = carica_dati_campionato(info['id_fd'])
-            if dati_b is None or dati_b.empty:
-                errori.append((nome, 'dati non disponibili'))
-                continue
-
-            # V1/V2: modello grezzo storico OOS
-            raw_obs = esegui_audit_1x2(dati_b, rho, ewma_span, emivita, stagione_corrente=False)
-            raw_met = calcola_metriche_1x2(raw_obs) if raw_obs else None
-
-            # V2: calibrazione OOS temporale
-            cal_res = esegui_audit_calibrazione_oos(dati_b, rho, ewma_span, emivita, modalita='storico')
-
-            # V4: quote/EV storico, 1X2 + O/U
-            q12 = esegui_audit_quote_1x2(dati_b, rho, ewma_span, emivita)
-            qou = esegui_audit_quote_ou(dati_b, rho, ewma_span, emivita)
-            q12s = _v6_stats_df(q12)
-            qous = _v6_stats_df(qou)
-
-            # V5: RAW vs CALIBRATO OOS applicato realmente alla selezione EV
-            v5 = _v5_run_economic(dati_b, rho, ewma_span, emivita, soglia_v5, warmup)
-            v5raw12=_v6_stats_df(v5['raw12']) if v5 else _v6_stats_df(None)
-            v5cal12=_v6_stats_df(v5['cal12']) if v5 else _v6_stats_df(None)
-            v5rawou=_v6_stats_df(v5['rawou']) if v5 else _v6_stats_df(None)
-            v5calou=_v6_stats_df(v5['calou']) if v5 else _v6_stats_df(None)
-
-            # V3: economico RAW a tutte le soglie, storico OOS
-            v3=[]
-            for evp in [0,5,10,15,20]:
-                r1,d1=esegui_backtest_roi_1x2(dati_b,rho,ewma_span,emivita,False,evp/100.0,False)
-                r2,d2=esegui_backtest_roi_ou(dati_b,rho,ewma_span,emivita,False,evp/100.0,False)
-                v3.append({
-                    'campionato':nome,'EV minimo %':evp,
-                    '1X2 bet':r1.get('scommesse',0) if r1 else 0,
-                    '1X2 strike %':r1.get('strike_rate',None) if r1 else None,
-                    '1X2 ROI %':r1.get('roi',None) if r1 else None,
-                    '1X2 profit u':r1.get('profitto',None) if r1 else None,
-                    'OU bet':r2.get('scommesse',0) if r2 else 0,
-                    'OU strike %':r2.get('strike_rate',None) if r2 else None,
-                    'OU ROI %':r2.get('roi',None) if r2 else None,
-                    'OU profit u':r2.get('profitto',None) if r2 else None,
-                })
-
-            risultati.append({
-                'campionato':nome,
-                'partite_raw_audit': raw_met['n'] if raw_met else 0,
-                'raw_accuracy_%': raw_met['accuracy'] if raw_met else None,
-                'raw_brier': raw_met['brier'] if raw_met else None,
-                'raw_logloss': raw_met['log_loss'] if raw_met else None,
-                'cal_train': cal_res.get('n_train') if cal_res else None,
-                'cal_test': cal_res.get('n_test') if cal_res else None,
-                'cal_accuracy_%': cal_res.get('cal',{}).get('accuracy') if cal_res and cal_res.get('ok') else None,
-                'cal_brier': cal_res.get('cal',{}).get('brier') if cal_res and cal_res.get('ok') else None,
-                'cal_logloss': cal_res.get('cal',{}).get('log_loss') if cal_res and cal_res.get('ok') else None,
-                'V4_1X2_bet':q12s['bet'],'V4_1X2_ROI_%':q12s['roi'],'V4_1X2_EV_%':q12s['ev'],
-                'V4_OU_bet':qous['bet'],'V4_OU_ROI_%':qous['roi'],'V4_OU_EV_%':qous['ev'],
-                'V5_1X2_RAW_bet':v5raw12['bet'],'V5_1X2_RAW_ROI_%':v5raw12['roi'],'V5_1X2_RAW_profit_u':v5raw12['profit'],
-                'V5_1X2_CAL_bet':v5cal12['bet'],'V5_1X2_CAL_ROI_%':v5cal12['roi'],'V5_1X2_CAL_profit_u':v5cal12['profit'],
-                'V5_OU_RAW_bet':v5rawou['bet'],'V5_OU_RAW_ROI_%':v5rawou['roi'],'V5_OU_RAW_profit_u':v5rawou['profit'],
-                'V5_OU_CAL_bet':v5calou['bet'],'V5_OU_CAL_ROI_%':v5calou['roi'],'V5_OU_CAL_profit_u':v5calou['profit'],
-            })
-            risultati[-1]['_v3']=v3
-        except Exception as e:
-            errori.append((nome, f'{type(e).__name__}: {e}'))
-    return risultati,errori
-
-
-def mostra_batch_v6(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🚀 V6 — TEST COMPLETO AUTOMATICO: 5 CAMPIONATI')
-    st.caption('Un solo pulsante esegue in sequenza i test principali fatti sulla Serie A: audit grezzo, calibrazione OOS, V4 quote/EV, V3 ROI alle soglie 0/5/10/15/20% e V5 RAW vs CALIBRATO OOS con EV 10%.')
-    st.warning('⚠️ È un test massivo: può richiedere diversi minuti. I risultati sono storici OOS e le quote sono proxy storiche, non quote combo eseguibili.')
-    if st.button('🚀 ESEGUI TUTTO SUI 5 CAMPIONATI', key='v6_batch_run'):
-        prog=st.progress(0.0,text='Avvio test batch...')
-        # La funzione stessa esegue i campionati in sequenza; aggiorniamo una barra
-        # prima/dopo ogni campionato tramite una versione locale più semplice non è
-        # possibile senza duplicare la logica. Manteniamo quindi un indicatore di attività.
-        with st.spinner('Analisi completa dei 5 campionati in corso...'):
-            res,err=_v6_run_batch(rho,ewma_span,emivita,0.10,100)
-        prog.progress(1.0,text='Completato!')
-        if res:
-            df=pd.DataFrame([{k:v for k,v in x.items() if k!='_v3'} for x in res])
-            st.success(f'Completati {len(res)} campionati su {len(CAMPIONATI_DOMESTICI)}.')
-            st.dataframe(df,use_container_width=True,hide_index=True)
-            st.markdown('### 📊 V3 — ROI RAW per soglia EV')
-            v3rows=[]
-            for x in res: v3rows.extend(x.get('_v3',[]))
-            if v3rows:
-                st.dataframe(pd.DataFrame(v3rows),use_container_width=True,hide_index=True)
-            st.markdown('### 🔬 V5 — confronto economico RAW vs CALIBRATO OOS (EV 10%)')
-            v5cols=['campionato','V5_1X2_RAW_bet','V5_1X2_RAW_ROI_%','V5_1X2_CAL_bet','V5_1X2_CAL_ROI_%','V5_OU_RAW_bet','V5_OU_RAW_ROI_%','V5_OU_CAL_bet','V5_OU_CAL_ROI_%']
-            st.dataframe(df[v5cols],use_container_width=True,hide_index=True)
-            out=pd.DataFrame(v3rows)
-            summary=df.to_csv(index=False).encode('utf-8')
-            details=out.to_csv(index=False).encode('utf-8') if not out.empty else b''
-            st.download_button('⬇️ Scarica riepilogo completo CSV',data=summary,file_name='V6_batch_5_campionati_summary.csv',mime='text/csv',key='v6_dl_summary')
-            if details:
-                st.download_button('⬇️ Scarica V3 tutte le soglie CSV',data=details,file_name='V6_batch_5_campionati_V3.csv',mime='text/csv',key='v6_dl_v3')
-        if err:
-            st.error('Alcuni campionati non sono stati completati:')
-            for nome,msg in err: st.write(f'- **{nome}**: {msg}')
-        st.info('Confronto da leggere senza classifiche: il batch serve a verificare se gli effetti osservati sulla Serie A si ripetono anche sugli altri campionati. V5 confronta selezioni diverse, quindi RAW e CAL non sono lo stesso identico insieme di scommesse.')
-
-
-def mostra_sezione_v5_calibrazione_ev(dati, campionato, rho_val, ewma_span_val, emivita_val):
-    st.divider()
-    st.markdown('## 💰 V5 — Calibrazione OOS realmente applicata all\'EV')
-    st.caption('Confronto RAW vs calibrato sullo stesso backtest storico. La calibrazione viene allenata solo sulle partite precedenti a ciascuna partita test; la probabilità calibrata determina selezione ed EV.')
-    c1,c2=st.columns(2)
-    with c1:
-        periodo=st.selectbox('Periodo V5',['Storico OOS'],key='v5_periodo')
-    with c2:
-        soglia_pct=st.selectbox('EV minimo V5',[0,5,10,15,20],index=2,key='v5_ev')
-    if st.button('🧪 Esegui V5: Raw vs Calibrato OOS',key='v5_run'):
-        with st.spinner('Calcolo V5 walk-forward + calibrazione OOS...'):
-            res=_v5_run_economic(dati,rho_val,ewma_span_val,emivita_val,soglia_pct/100.0,V5_CAL_MIN_TRAIN)
-        if res is None:
-            st.error('Nessun dato sufficiente.')
-            return
-        st.success(f"Campione storico raw: {len(res['hist'])} partite con quote disponibili. Warm-up calibrazione: {V5_CAL_MIN_TRAIN} partite.")
-        _v5_show_pair(res['raw12'],res['cal12'],'1X2 — EV calcolato sulla probabilità usata per la selezione')
-        _v5_show_pair(res['rawou'],res['calou'],'O/U 2.5 — EV calcolato sulla probabilità usata per la selezione')
-        st.info('Lettura corretta: se il ROI cambia insieme all\'EV medio dopo la calibrazione, la calibrazione sta modificando davvero il filtro economico. Il confronto è OOS temporale e non usa i calibratori salvati.')
-        allrows=[]
-        for label,df in [('1X2 RAW',res['raw12']),('1X2 CAL',res['cal12']),('OU RAW',res['rawou']),('OU CAL',res['calou'])]:
-            if not df.empty:
-                z=df.copy(); z['versione']=label; allrows.append(z)
-        if allrows:
-            out=pd.concat(allrows,ignore_index=True)
-            st.download_button('⬇️ Scarica dettaglio V5 CSV',data=out.to_csv(index=False).encode('utf-8'),file_name='v5_calibrazione_ev.csv',mime='text/csv',key='v5_dl')
-
-
-
-# =====================================================================
-# 🧊 V15 — OPERATIVO: PLATT TOP1 COMBO CON REGOLA CONGELATA
-# Freeze validato nei test V14:
-#   - soglia di attivazione sulla Top1 RAW: >= 35%
-#   - training PLATT: 100 osservazioni precedenti
-#   - stesso campionato
-#   - walk-forward, nessuna informazione futura
-#   - salvaguardia monotona: pendenza > 0; altrimenti si mantiene RAW
-# Importante: PLATT calibra la probabilità dell'evento Top1, non ricostruisce
-# le altre 11 probabilità e non modifica il ranking delle combo.
-# =====================================================================
-V15_TOP1_THRESHOLD = 0.35
-V15_TOP1_TRAIN = 100
-V15_TOP1_MIN_TRAIN = 50
-V15_TOP1_MAX_TRAIN = 100
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def _v15_build_top1_history(id_fd, rho, ewma_span, emivita):
-    """Costruisce la storia OOS della Top1 Combo RAW per un singolo campionato."""
-    try:
-        dati_hist = carica_dati_campionato(id_fd)
-        if dati_hist is None or dati_hist.empty:
-            return pd.DataFrame()
-        tutte = dati_hist[dati_hist['FTHG'].notna() & dati_hist['FTAG'].notna()].reset_index(drop=True)
-        rows = []
-        for i in range(15, len(tutte)):
-            partita = tutte.iloc[i]
-            try:
-                m = calcola_modello_completo(
-                    tutte.iloc[:i],
-                    partita['HomeTeam'], partita['AwayTeam'],
-                    rho, ewma_span, emivita, pd.DataFrame(),
-                    data_riferimento=partita.get('Date_parsed')
-                )
-                if m is None or 'griglia' not in m:
-                    continue
-                probs = {}
-                for segno in ['1', 'X', '2']:
-                    for gg in ['Goal', 'NoGoal']:
-                        for tipo in ['Over', 'Under']:
-                            key = f'{segno}_{gg}_{tipo}'
-                            probs[key] = float(calcola_combo_libera(
-                                m['griglia'], segno=segno, soglia_gol=2.5,
-                                tipo_soglia=tipo, gol_nogol=gg
-                            )) / 100.0
-                if not probs:
-                    continue
-                top1_key, top1_prob = max(probs.items(), key=lambda kv: kv[1])
-                esito = ('1' if float(partita['FTHG']) > float(partita['FTAG'])
-                         else ('2' if float(partita['FTHG']) < float(partita['FTAG']) else 'X'))
-                gg_true = 'Goal' if float(partita['FTHG']) > 0 and float(partita['FTAG']) > 0 else 'NoGoal'
-                tt_true = 'Over' if float(partita['FTHG']) + float(partita['FTAG']) > 2.5 else 'Under'
-                true_key = f'{esito}_{gg_true}_{tt_true}'
-                rows.append({
-                    'data': partita.get('Date_parsed'),
-                    'top1_prob': float(np.clip(top1_prob, 1e-6, 1.0 - 1e-6)),
-                    'top1_hit': int(top1_key == true_key),
-                })
-            except Exception:
-                continue
-        if not rows:
-            return pd.DataFrame()
-        h = pd.DataFrame(rows)
-        h['data'] = pd.to_datetime(h['data'], errors='coerce')
-        h['top1_prob'] = pd.to_numeric(h['top1_prob'], errors='coerce')
-        h['top1_hit'] = pd.to_numeric(h['top1_hit'], errors='coerce')
-        h = h.dropna(subset=['top1_prob', 'top1_hit'])
-        return h.sort_values('data', kind='mergesort').reset_index(drop=True)
-    except Exception:
-        return pd.DataFrame()
-
-
-def _v15_logit(p):
-    p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
-    return float(np.log(p / (1.0 - p)))
-
-
-def _v15_fit_platt_top1(hist_df, n_train=V15_TOP1_TRAIN):
-    """Fit Platt sulla Top1 con sole osservazioni precedenti e guardia monotona."""
-    if hist_df is None or hist_df.empty:
-        return None, np.nan, 'nessun training', 0
-    x = hist_df.copy()
-    required = ['top1_prob', 'top1_hit']
-    if any(c not in x.columns for c in required):
-        return None, np.nan, 'colonne mancanti', 0
-    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
-    x['top1_hit'] = pd.to_numeric(x['top1_hit'], errors='coerce')
-    x = x.dropna(subset=required).copy()
-    x = x[x['top1_prob'].between(1e-6, 1.0 - 1e-6)].copy()
-    x['top1_hit'] = x['top1_hit'].astype(int)
-    limit = int(min(max(n_train, V15_TOP1_MIN_TRAIN), V15_TOP1_MAX_TRAIN))
-    x = x.tail(limit).reset_index(drop=True)
-    n = len(x)
-    if n < V15_TOP1_MIN_TRAIN:
-        return None, np.nan, 'campione insufficiente', n
-    y = x['top1_hit'].to_numpy(dtype=int).reshape(-1)
-    if np.unique(y).size < 2:
-        return None, np.nan, 'un solo esito presente nel training', n
-    z = np.asarray([_v15_logit(v) for v in x['top1_prob'].to_numpy(dtype=float)], dtype=float).reshape(-1, 1)
-    model = LogisticRegression(solver='lbfgs', C=1e6, max_iter=1000)
-    model.fit(z, y)
-    coef_arr = np.asarray(model.coef_, dtype=float).reshape(-1)
-    coef = float(coef_arr[0]) if coef_arr.size else np.nan
-    if not np.isfinite(coef) or coef <= 0.0:
-        return None, coef, 'fit non monotono: pendenza non positiva', n
-    return model, coef, 'applicabile', n
-
-
-def _v15_predict_platt_top1(p_raw, model):
-    p_raw = float(np.clip(p_raw, 1e-6, 1.0 - 1e-6))
-    if model is None:
-        return p_raw
-    z = np.asarray([[_v15_logit(p_raw)]], dtype=float)
-    proba = np.asarray(model.predict_proba(z), dtype=float).reshape(-1)
-    if proba.size < 2:
-        return p_raw
-    return float(np.clip(proba[1], 1e-6, 1.0 - 1e-6))
-
-
-def _v15_operational_top1_platt(id_fd, rho, ewma_span, emivita, modello, data_riferimento):
-    """Applica il freeze V15 alla sola probabilità della Top1 Combo."""
-    probs = {}
-    if modello is None or 'griglia' not in modello:
-        return None
-    for segno in ['1', 'X', '2']:
-        for gg in ['Goal', 'NoGoal']:
-            for tipo in ['Over', 'Under']:
-                key = f'{segno}_{gg}_{tipo}'
-                try:
-                    probs[key] = float(calcola_combo_libera(
-                        modello['griglia'], segno=segno, soglia_gol=2.5,
-                        tipo_soglia=tipo, gol_nogol=gg
-                    )) / 100.0
-                except Exception:
-                    continue
-    if not probs:
-        return None
-    top1_key, p_raw = max(probs.items(), key=lambda kv: kv[1])
-    info = {
-        'top1_key': top1_key,
-        'top1_raw': float(np.clip(p_raw, 1e-6, 1.0 - 1e-6)),
-        'threshold': V15_TOP1_THRESHOLD,
-        'selected': bool(p_raw >= V15_TOP1_THRESHOLD),
-        'platt_applied': False,
-        'platt_prob': float(np.clip(p_raw, 1e-6, 1.0 - 1e-6)),
-        'coef': np.nan,
-        'train_n': 0,
-        'reason': 'Top1 RAW < 35%'
-    }
-    if p_raw < V15_TOP1_THRESHOLD:
-        return info
-
-    hist = _v15_build_top1_history(id_fd, rho, ewma_span, emivita)
-    if data_riferimento is not None and pd.notna(data_riferimento) and not hist.empty:
-        hist = hist[hist['data'] < pd.to_datetime(data_riferimento)].copy()
-
-    model, coef, reason, n_eff = _v15_fit_platt_top1(hist[['top1_prob','top1_hit']] if not hist.empty else hist, V15_TOP1_TRAIN)
-    info['train_n'] = int(n_eff)
-    info['coef'] = coef
-    info['reason'] = reason
-    if model is not None:
-        info['platt_prob'] = _v15_predict_platt_top1(p_raw, model)
-        info['platt_applied'] = True
-    return info
-
-
-st.caption("Versione operativa V15 — modello V11 completo + PLATT O/U 2.5 + PLATT Top1 Combo (freeze: 35% / 100 osservazioni)")
-
-st.info("Uso operativo: il modello completo resta invariato. V13 calibra O/U 2.5; V15 calibra la probabilità della Top1 Combo con PLATT walk-forward (100 osservazioni precedenti dello stesso campionato) solo quando la Top1 RAW è ≥35%. Nessuna informazione futura.")
-
-# Parametri del modello fissati ai valori di default validati — non più
-# esposti nell'interfaccia: erano controlli tecnici che richiedevano di
-# sapere cosa fanno per essere usati bene, e nell'uso normale non si toccano.
-rho_val = -0.10        # correzione Dixon-Coles (valore tipico da letteratura)
-ewma_span_val = 6      # finestra della forma recente
-emivita_val = 180      # decadimento temporale in giorni
-
-with st.sidebar:
-    st.header("⚙️ Configurazione & API")
-    api_key_input = st.text_input("Chiave API football-data.org (per Coppe)", type="password",
-                                   help="Gratuita: football-data.org/client/register")
-    st.divider()
-    usa_calibrazione = st.checkbox(
-        "🎯 Applica calibrazione 1X2 (se allenata)",
-        value=False,
-        help="Calibrazione separata del mercato 1X2. Disattivata di default."
-    )
-    usa_platt_v13 = st.checkbox(
-        "🎯 V13 — PLATT solo O/U 2.5",
-        value=True,
-        help="Corregge esclusivamente la probabilità Over/Under 2.5 usando un fit walk-forward sulle partite precedenti."
-    )
-    mostra_diagnostica_v11 = st.checkbox(
-        "🔬 Mostra diagnostica V11",
-        value=False,
-        help="Mostra la diagnostica tecnica completa. Lascia disattivata per l'uso operativo."
-    )
-
-
-# =====================================================================
-# 🚀 V15.1 — PULSANTE DI AVVIO OPERATIVO
-# Il modello e la regola V15 restano invariati. Questo blocco aggiunge
-# esclusivamente un comando esplicito per avviare l'interfaccia operativa.
-# =====================================================================
-if "v15_operativo_avviato" not in st.session_state:
-    st.session_state.v15_operativo_avviato = False
-
-st.divider()
-st.markdown("## 🚀 V15 — AVVIO OPERATIVO")
-st.caption(
-    "Premi il pulsante per avviare l'analisi delle partite. Dopo l'avvio "
-    "puoi scegliere campionato e partita; la regola V15 viene applicata "
-    "automaticamente alla Top1 Combo quando le condizioni del freeze sono soddisfatte."
+import streamlit as str_lit
+
+# --- CONFIGURAZIONE PAGINA ---
+str_lit.set_page_config(
+    page_title="COMBO Master Pro Betting & Deep Analytics Suite — V15.2 Mercati aggiuntivi",
+    layout="wide",
+    page_icon="⚽",
 )
 
-col_start, col_status = st.columns([1, 2])
-with col_start:
-    if st.button("▶️ AVVIA V15 OPERATIVO", key="v15_start", type="primary"):
-        st.session_state.v15_operativo_avviato = True
-with col_status:
-    if st.session_state.v15_operativo_avviato:
-        st.success("✅ V15 operativo avviato")
-    else:
-        st.info("⏸️ V15 non ancora avviato")
-
-if not st.session_state.v15_operativo_avviato:
-    st.stop()
-
-scelta_categoria = st.radio("Categoria Torneo", ["Campionati Nazionali (Gratuiti)", "Coppe Europee (Richiede API Key)"], horizontal=True)
-
-if scelta_categoria == "Campionati Nazionali (Gratuiti)":
-    campionato = st.selectbox("Seleziona Campionato", list(CAMPIONATI_DOMESTICI.keys()))
-    info = CAMPIONATI_DOMESTICI[campionato]
-    id_fd = info["id_fd"]
-
-    with st.spinner("Caricamento dataset campionato e quote automatiche..."):
-        dati = carica_dati_campionato(id_fd)
-        fixture_future = carica_fixture_future(id_fd)
-
-    if dati is None or len(dati) == 0:
-        st.error("Impossibile scaricare i dati. Riprova tra poco.")
-        st.stop()
-
-    opzioni_partite, mappa_partite = [], []
-    if not fixture_future.empty:
-        for _, r in fixture_future.iterrows():
-            opzioni_partite.append(f"FUTURA ({r.get('Date','?')}): {r.get('HomeTeam','?')} vs {r.get('AwayTeam','?')}")
-            mappa_partite.append(r.to_dict())
-
-    storiche = dati[dati['FTHG'].notna()].tail(15)
-    for _, r in storiche.iterrows():
-        opzioni_partite.append(f"RECENTE ({r.get('Date','?')}): {r.get('HomeTeam','?')} vs {r.get('AwayTeam','?')}")
-        mappa_partite.append(r.to_dict())
-    df_globale = pd.DataFrame()
-    is_coppa = False
-
-    with st.expander("🧪 AUDIT RIGOROSO — modello grezzo", expanded=False):
-        st.write("**Obiettivo:** capire se le probabilità del modello sono affidabili prima di usare calibrazione e value bet.")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            run_curr = st.button("🧪 Audit stagione corrente", key="audit_current")
-        with col_b:
-            run_all = st.button("🧪 Audit tutto lo storico", key="audit_all")
-
-        if run_curr or run_all:
-            with st.spinner("Esecuzione audit partita per partita..."):
-                obs = esegui_audit_1x2(dati, rho_val, ewma_span_val, emivita_val, stagione_corrente=run_curr)
-            met = calcola_metriche_1x2(obs)
-            if met is None:
-                st.warning("Nessuna osservazione disponibile.")
-            else:
-                c1,c2,c3,c4 = st.columns(4)
-                c1.metric("Partite", met["n"])
-                c2.metric("Accuracy", f"{met['accuracy']:.1f}%")
-                c3.metric("Brier", f"{met['brier']:.4f}")
-                c4.metric("Log Loss", f"{met['log_loss']:.4f}")
-                righe=[]
-                for fascia,d in met["bins"].items():
-                    righe.append({
-                        "Fascia probabilità massima": fascia+"%",
-                        "Partite": d["n"],
-                        "Probabilità media prevista": f"{(d['somma_p']/d['n']):.1f}%" if d["n"] else "—",
-                        "Accuracy reale": f"{(d['positivi']/d['n']*100):.1f}%" if d["n"] else "—",
-                    })
-                st.write("**Calibrazione delle previsioni principali**")
-                st.table(pd.DataFrame(righe))
-                st.caption("Una previsione al 70% dovrebbe, su un campione sufficientemente grande, verificarsi circa 70% delle volte. La tabella serve a controllare questa proprietà; non è una garanzia su piccoli campioni.")
-
-    with st.expander("🧪 V2 — Confronto calibrazione fuori campione", expanded=False):
-        st.write("**Obiettivo:** verificare se una calibrazione isotonic migliora le probabilità senza vedere gli esiti del periodo di test.")
-        st.caption("La v2 non legge i calibratori salvati: li allena temporalmente e li applica solo al blocco successivo.")
-        col_v2a, col_v2b = st.columns(2)
-        with col_v2a:
-            run_v2_curr = st.button("🧪 V2 corrente: calibrazione OOS", key="audit_v2_current")
-        with col_v2b:
-            run_v2_all = st.button("🧪 V2 storico: calibrazione OOS", key="audit_v2_all")
-
-        if run_v2_curr or run_v2_all:
-            modalita_v2 = 'corrente' if run_v2_curr else 'storico'
-            with st.spinner("Calcolo previsioni walk-forward e calibrazione fuori campione..."):
-                res_v2 = esegui_audit_calibrazione_oos(
-                    dati, rho_val, ewma_span_val, emivita_val, modalita=modalita_v2
-                )
-            if res_v2 is None:
-                st.warning("Nessuna osservazione disponibile.")
-            elif not res_v2['ok']:
-                st.warning(res_v2['motivo'])
-                st.write(f"Train: **{res_v2['n_train']}** partite · Test: **{res_v2['n_test']}** partite")
-                st.caption(res_v2['metodo'])
-            else:
-                st.success("✅ Test OOS valido: il calibratore non ha visto gli esiti del blocco di test.")
-                st.caption(res_v2['metodo'])
-                st.write(f"Dataset audit: **{res_v2['n_raw']}** partite · Train: **{res_v2['n_train']}** · Test: **{res_v2['n_test']}**")
-
-                st.markdown("### Modello grezzo vs calibrato")
-                tab_v2 = pd.DataFrame([
-                    {
-                        'Versione': 'Grezzo',
-                        'Accuracy': f"{res_v2['raw']['accuracy']:.1f}%",
-                        'Brier ↓': f"{res_v2['raw']['brier']:.4f}",
-                        'Log Loss ↓': f"{res_v2['raw']['log_loss']:.4f}",
-                    },
-                    {
-                        'Versione': 'Calibrato OOS',
-                        'Accuracy': f"{res_v2['cal']['accuracy']:.1f}%",
-                        'Brier ↓': f"{res_v2['cal']['brier']:.4f}",
-                        'Log Loss ↓': f"{res_v2['cal']['log_loss']:.4f}",
-                    },
-                ])
-                st.table(tab_v2)
-
-                delta_brier = res_v2['cal']['brier'] - res_v2['raw']['brier']
-                delta_ll = res_v2['cal']['log_loss'] - res_v2['raw']['log_loss']
-                delta_acc = res_v2['cal']['accuracy'] - res_v2['raw']['accuracy']
-                st.write(
-                    f"**Delta calibrato − grezzo:** Accuracy {delta_acc:+.1f} punti · "
-                    f"Brier {delta_brier:+.4f} · Log Loss {delta_ll:+.4f}"
-                )
-
-                st.markdown("### Calibrazione sul test — grezzo")
-                st.table(_tabella_calibrazione_metriche(res_v2['raw']))
-                st.markdown("### Calibrazione sul test — calibrato OOS")
-                st.table(_tabella_calibrazione_metriche(res_v2['cal']))
-                st.caption("Per Brier e Log Loss, più basso è migliore. La v2 non decide da sola se la calibrazione è utile: la confrontiamo numericamente sul test fuori campione.")
-
-    with st.expander("📈 Verifica storica (backtest)"):
-
-        st.caption("Quante volte la previsione principale del modello (il segno più probabile) "
-                   "ha indovinato il risultato vero — su TUTTE le partite disponibili, senza "
-                   "nessun filtro. Confronta stagione corrente e storico completo per vedere "
-                   "se il modello regge o se il risultato dipende dal periodo.")
-
-        richiedi_accordo = st.checkbox(
-            "💡 Idea #1: valuta solo quando modello e mercato sono d'accordo sul favorito",
-            value=False,
-            help="Filtro di fiducia, non una correzione della stima: scarta le partite dove il "
-                 "modello si discosta dal favorito del mercato. Riduce il campione."
-        )
-
-        col_bt_a, col_bt_b = st.columns(2)
-        with col_bt_a:
-            cliccato_corrente = st.button("🎯 Backtest — solo stagione corrente")
-        with col_bt_b:
-            cliccato_tutto = st.button("📚 Backtest — tutto lo storico")
-
-        def mostra_risultato_backtest(risultato, etichetta):
-            if risultato is None:
-                st.warning(f"⚠️ {etichetta}: nessuna partita disponibile per questa modalità.")
-                return
-            if risultato["n_partite"] == 0:
-                st.warning(f"⚠️ {etichetta}: nessuna partita valutabile (o tutte scartate dal filtro).")
-                return
-            win_rate_tot = risultato["n_corrette"] / risultato["n_partite"] * 100
-            st.write(f"**{etichetta}**")
-            c1, c2 = st.columns(2)
-            c1.metric("Partite valutate", risultato["n_partite"])
-            c2.metric("Accuratezza", f"{win_rate_tot:.1f}%")
-            if risultato.get("n_scartate_disaccordo", 0) > 0 or risultato.get("n_scartate_no_quote", 0) > 0:
-                st.caption(f"Scartate per disaccordo modello/mercato: {risultato['n_scartate_disaccordo']} — "
-                          f"scartate per quote mancanti: {risultato['n_scartate_no_quote']}.")
-            righe_segno = []
-            for s, d in risultato["per_segno"].items():
-                wr_s = (d["corrette"]/d["previste"]*100) if d["previste"] > 0 else None
-                righe_segno.append({
-                    "Segno previsto": s, "Volte previsto": d["previste"],
-                    "Corrette": d["corrette"],
-                    "Accuratezza": f"{wr_s:.1f}%" if wr_s is not None else "—",
-                })
-            st.table(pd.DataFrame(righe_segno))
-
-        if cliccato_corrente:
-            with st.spinner("Backtest su stagione corrente..."):
-                ris = esegui_backtest_senza_filtro(dati, rho_val, ewma_span_val, emivita_val,
-                                                    True, id_fd=id_fd, usa_calibrazione=usa_calibrazione,
-                                                    richiedi_accordo_mercato=richiedi_accordo)
-            mostra_risultato_backtest(ris, "Solo stagione corrente (out-of-sample)")
-
-        if cliccato_tutto:
-            with st.spinner("Backtest su tutto lo storico (può richiedere più tempo)..."):
-                ris = esegui_backtest_senza_filtro(dati, rho_val, ewma_span_val, emivita_val,
-                                                    False, id_fd=id_fd, usa_calibrazione=usa_calibrazione,
-                                                    richiedi_accordo_mercato=richiedi_accordo)
-            mostra_risultato_backtest(ris, "Tutto lo storico disponibile")
-
-        if cliccato_corrente or cliccato_tutto:
-            st.caption("Se il modello prevede quasi sempre '1' e quasi mai 'X', è normale: il pareggio "
-                       "è statisticamente l'esito più difficile da prevedere, per qualunque modello. "
-                       "Un'accuratezza intorno al 45-55% su 1X2 è nella norma per modelli di questo tipo — "
-                       "il mercato stesso, con molte più informazioni, non fa enormemente meglio.")
-
-        st.divider()
-        st.write("**🔥 Backtest COMBO — accuratezza della combo più probabile**")
-        st.caption("Stessa logica del backtest 1X2, applicata alla combo automatica con probabilità "
-                   "più alta tra le 12 possibili (usa la calibrazione per-combo se allenata e attiva). "
-                   "Più difficile del semplice 1X2 per costruzione: una combo richiede che TRE "
-                   "condizioni si avverino insieme, non una sola.")
-        st.caption("Il checkbox 'Idea #1' qui sopra filtra solo sul segno. Quello qui sotto (idea #1b, "
-                   "da verificare) filtra ANCHE sull'Over/Under — copre 2 delle 3 dimensioni di una combo "
-                   "invece di 1 sola. Prova le combinazioni: nessuno dei due, solo #1, solo #1b, entrambi.")
-        richiedi_accordo_ou = st.checkbox(
-            "💡 Idea #1b: richiedi accordo anche su Over/Under 2.5 col mercato",
-            value=False,
-        )
-
-        col_cb_a, col_cb_b = st.columns(2)
-        with col_cb_a:
-            cliccato_combo_corrente = st.button("🎯 Backtest combo — solo stagione corrente")
-        with col_cb_b:
-            cliccato_combo_tutto = st.button("📚 Backtest combo — tutto lo storico")
-
-        def mostra_risultato_backtest_combo(risultato, etichetta):
-            if risultato is None:
-                st.warning(f"⚠️ {etichetta}: nessuna partita disponibile per questa modalità.")
-                return
-            if risultato["n_partite"] == 0:
-                st.warning(f"⚠️ {etichetta}: nessuna partita valutabile (o tutte scartate dai filtri).")
-                return
-            win_rate_combo = risultato["n_corrette"] / risultato["n_partite"] * 100
-            st.write(f"**{etichetta}**")
-            c1, c2 = st.columns(2)
-            c1.metric("Partite valutate", risultato["n_partite"])
-            c2.metric("Accuratezza combo", f"{win_rate_combo:.1f}%")
-            if (risultato.get("n_scartate_disaccordo", 0) > 0 or risultato.get("n_scartate_disaccordo_ou", 0) > 0
-                    or risultato.get("n_scartate_no_quote", 0) > 0):
-                st.caption(f"Scartate per disaccordo sul segno: {risultato.get('n_scartate_disaccordo', 0)} — "
-                          f"scartate per disaccordo su Over/Under: {risultato.get('n_scartate_disaccordo_ou', 0)} — "
-                          f"scartate per quote mancanti: {risultato.get('n_scartate_no_quote', 0)}.")
-            righe_combo_bt = []
-            for chiave, d in sorted(risultato["per_combo"].items(), key=lambda x: x[1]["previste"], reverse=True):
-                if d["previste"] == 0: continue
-                wr_c = d["corrette"]/d["previste"]*100
-                righe_combo_bt.append({
-                    "Combo prevista": chiave.replace("_", " "), "Volte prevista": d["previste"],
-                    "Corrette": d["corrette"], "Accuratezza": f"{wr_c:.1f}%",
-                })
-            if righe_combo_bt:
-                st.table(pd.DataFrame(righe_combo_bt))
-
-        if cliccato_combo_corrente:
-            with st.spinner("Backtest combo su stagione corrente..."):
-                ris_c = esegui_backtest_combo(dati, rho_val, ewma_span_val, emivita_val,
-                                              True, id_fd=id_fd, usa_calibrazione=usa_calibrazione,
-                                              richiedi_accordo_mercato=richiedi_accordo,
-                                              richiedi_accordo_ou=richiedi_accordo_ou)
-            mostra_risultato_backtest_combo(ris_c, "Solo stagione corrente (out-of-sample)")
-
-        if cliccato_combo_tutto:
-            with st.spinner("Backtest combo su tutto lo storico (può richiedere più tempo)..."):
-                ris_c = esegui_backtest_combo(dati, rho_val, ewma_span_val, emivita_val,
-                                              False, id_fd=id_fd, usa_calibrazione=usa_calibrazione,
-                                              richiedi_accordo_mercato=richiedi_accordo,
-                                              richiedi_accordo_ou=richiedi_accordo_ou)
-            mostra_risultato_backtest_combo(ris_c, "Tutto lo storico disponibile")
-
-        if cliccato_combo_corrente or cliccato_combo_tutto:
-            st.caption("Confronta questa accuratezza con quella 1X2 qui sopra: se è molto più bassa, "
-                       "è normale (tre condizioni insieme sono più difficili), non necessariamente "
-                       "un problema — ma dà la misura reale di quanto ci si può fidare delle combo.")
-
-        st.divider()
-        st.write("**⚡ Test completo automatico (le 8 combinazioni insieme)**")
-        st.caption("Invece di lanciare i due bottoni sopra 4 volte a mano (con/senza ciascun filtro) e "
-                   "copiare ogni tabella, questo le fa tutte in un colpo solo e ti dà un file da "
-                   "scaricare e mandarmi direttamente — niente più copia-incolla su Word.")
-
-        if st.button("⚡ Esegui tutte le 8 combinazioni per questo campionato"):
-            righe_test_completo = []
-            combinazioni = [
-                ("Solo stagione corrente", True, False, False),
-                ("Solo stagione corrente", True, True, False),
-                ("Solo stagione corrente", True, False, True),
-                ("Solo stagione corrente", True, True, True),
-                ("Tutto lo storico", False, False, False),
-                ("Tutto lo storico", False, True, False),
-                ("Tutto lo storico", False, False, True),
-                ("Tutto lo storico", False, True, True),
-            ]
-            barra_avanzamento = st.progress(0.0, text="Avvio...")
-            for idx, (etichetta_periodo, oos, filtro_segno, filtro_ou) in enumerate(combinazioni):
-                barra_avanzamento.progress((idx)/8, text=f"{idx+1}/8 — {etichetta_periodo}, "
-                                           f"segno={'sì' if filtro_segno else 'no'}, O/U={'sì' if filtro_ou else 'no'}...")
-                ris = esegui_backtest_combo(dati, rho_val, ewma_span_val, emivita_val, oos, id_fd=id_fd,
-                                            usa_calibrazione=usa_calibrazione,
-                                            richiedi_accordo_mercato=filtro_segno, richiedi_accordo_ou=filtro_ou)
-                if ris is None or ris["n_partite"] == 0:
-                    righe_test_completo.append({
-                        "Campionato": campionato, "Periodo": etichetta_periodo,
-                        "Filtro segno": "sì" if filtro_segno else "no", "Filtro O/U": "sì" if filtro_ou else "no",
-                        "Partite valutate": 0, "Corrette": 0, "Accuratezza %": None,
-                    })
-                else:
-                    righe_test_completo.append({
-                        "Campionato": campionato, "Periodo": etichetta_periodo,
-                        "Filtro segno": "sì" if filtro_segno else "no", "Filtro O/U": "sì" if filtro_ou else "no",
-                        "Partite valutate": ris["n_partite"], "Corrette": ris["n_corrette"],
-                        "Accuratezza %": round(ris["n_corrette"]/ris["n_partite"]*100, 1),
-                    })
-            barra_avanzamento.progress(1.0, text="Completato!")
-
-            df_test_completo = pd.DataFrame(righe_test_completo)
-            st.dataframe(df_test_completo, use_container_width=True, hide_index=True)
-
-            csv_bytes = df_test_completo.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "⬇️ Scarica questi risultati come CSV",
-                data=csv_bytes,
-                file_name=f"backtest_combo_{id_fd}.csv",
-                mime="text/csv",
-            )
-            st.caption("Scarica il CSV per ogni campionato che testi, poi mandameli tutti insieme — "
-                       "posso leggerli direttamente, non serve più copiarli su Word.")
-
-
-        mostra_sezione_roi_v3(dati, campionato, id_fd, rho_val, ewma_span_val, emivita_val)
-        mostra_audit_quote_v4(dati, campionato, id_fd, rho_val, ewma_span_val, emivita_val)
-        mostra_batch_v6(rho_val, ewma_span_val, emivita_val)
-
-        mostra_sezione_v5_calibrazione_ev(dati, campionato, rho_val, ewma_span_val, emivita_val)
-
-        st.divider()
-        st.write("**🎯 Calibrazione (1X2 + le 12 combo automatiche)**")
-        st.caption("Allena i correttori su tutto lo storico disponibile. Una sola passata sui dati "
-                   "calcola il modello una volta per partita e allena tutti i 13 correttori insieme "
-                   "(1X2 + le 12 combinazioni segno × Gol/No Gol × Over/Under 2.5).")
-        if st.button("🎯 Allena tutte le calibrazioni per questo campionato"):
-            with st.spinner("Allenamento in corso (può richiedere qualche secondo)..."):
-                risultati_calib = allena_tutte_le_calibrazioni(dati, rho_val, ewma_span_val, emivita_val, id_fd)
-            ok_1x2 = risultati_calib["1x2"]["ok"]
-            n_combo_ok = sum(1 for k, v in risultati_calib.items() if k != "1x2" and v["ok"])
-            if ok_1x2:
-                st.success(f"✅ 1X2: calibrato su {risultati_calib['1x2']['n']} osservazioni.")
-            else:
-                st.warning(f"⚠️ 1X2: campione insufficiente ({risultati_calib['1x2']['n']} osservazioni, "
-                          f"ne servono almeno 100).")
-            st.write(f"**Combo calibrate con successo: {n_combo_ok} su 12.**")
-            righe_combo_calib = []
-            for chiave, v in risultati_calib.items():
-                if chiave == "1x2": continue
-                righe_combo_calib.append({"Combo": chiave.replace("_", " "), "Osservazioni": v["n"],
-                                          "Calibrata": "✅" if v["ok"] else "⚠️ campione scarso"})
-            st.dataframe(pd.DataFrame(righe_combo_calib), use_container_width=True, hide_index=True)
-            st.caption("Le combo più rare (es. 'X + NoGoal + Over') hanno naturalmente meno osservazioni "
-                       "delle più comuni — è normale, non un errore.")
-
-else:
-    if not api_key_input:
-        st.warning("⚠️ Inserisci la tua chiave API di football-data.org nella barra laterale per sbloccare le coppe europee.")
-        st.stop()
-    campionato = st.selectbox("Seleziona Coppe", list(CAMPIONATI_COPPE.keys()))
-    info = CAMPIONATI_COPPE[campionato]
-    code_api = info["code"]
-    if not info.get("gratis_confermato", False):
-        st.info("ℹ️ Questa competizione non risultava nell'elenco confermato del piano gratuito "
-                "di football-data.org — se ricevi 'Accesso Negato' è un limite del piano, non un bug.")
-
-    with st.spinner("Connessione alle API delle Coppe e caricamento dati di supporto..."):
-        risultato_api = carica_dati_api_europee(code_api, api_key_input)
-        df_globale = carica_tutti_i_campionati()
-
-    if isinstance(risultato_api, str) and risultato_api == "ERRORE_403":
-        st.error("❌ **Accesso Negato (Errore 403)**: la tua chiave API gratuita non ha accesso a questa competizione.")
-        st.stop()
-    elif isinstance(risultato_api, str):
-        st.error(f"Errore di connessione API: {risultato_api}")
-        st.stop()
-
-    dati = risultato_api
-    if dati is None or len(dati) == 0:
-        st.error("Nessun dato trovato per questa competizione.")
-        st.stop()
-
-    dati_storico = dati[dati['Status'] == 'FINISHED'].copy()
-    dati_future = dati[dati['Status'] != 'FINISHED'].copy()
-
-    opzioni_partite, mappa_partite = [], []
-    for _, r in dati_future.iterrows():
-        opzioni_partite.append(f"FUTURA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
-        mappa_partite.append(r.to_dict())
-    for _, r in dati_storico.tail(10).iterrows():
-        opzioni_partite.append(f"GIOCATA ({r['Date']}): {r['HomeTeam']} vs {r['AwayTeam']}")
-        mappa_partite.append(r.to_dict())
-    is_coppa = True
-
-if not opzioni_partite:
-    st.warning("Nessuna partita disponibile al momento.")
-else:
-    scelta = st.selectbox("Seleziona Partita", opzioni_partite)
-    idx_sel = opzioni_partite.index(scelta)
-    partita_sel = mappa_partite[idx_sel]
-
-    # =====================================================================
-    # 🔧 FIX #2 — FILTRO NO-LOOK-AHEAD
-    # Prima: il modello riceveva TUTTO il dataset, comprese le giornate
-    # successive alla partita selezionata (per le partite "GIOCATA"/
-    # "RECENTE" già nel passato) — calcolava quindi le statistiche anche
-    # con risultati che, a quella data, non erano ancora accaduti.
-    # Ora: filtriamo sempre a "solo partite precedenti alla data selezionata".
-    # =====================================================================
-    data_rif_sel = partita_sel.get('Date_parsed')
-    if pd.notna(data_rif_sel):
-        dati_filtrati = dati[(dati['FTHG'].notna()) & (dati['Date_parsed'] < data_rif_sel)].copy() if 'Date_parsed' in dati.columns else dati
-        df_globale_filtrato = df_globale[(df_globale['FTHG'].notna()) & (df_globale['Date_parsed'] < data_rif_sel)].copy() \
-            if (df_globale is not None and not df_globale.empty and 'Date_parsed' in df_globale.columns) else df_globale
-    else:
-        dati_filtrati = dati[dati['FTHG'].notna()].copy() if 'FTHG' in dati.columns else dati
-        df_globale_filtrato = df_globale
-
-    modello = calcola_modello_completo(dati_filtrati, partita_sel['HomeTeam'], partita_sel['AwayTeam'],
-                                        rho_val, ewma_span_val, emivita_val, df_globale_filtrato,
-                                        data_riferimento=data_rif_sel if pd.notna(data_rif_sel) else None)
-
-    # Snapshot delle lambda V15 prima che alcune sezioni UI riutilizzino
-    # il nome "modello" per variabili testuali (es. favorito 1X2).
-    _combo_model_lambdas = (
-        (float(modello['lambda_casa']), float(modello['lambda_trasferta']))
-        if isinstance(modello, dict)
-        and modello.get('lambda_casa') is not None
-        and modello.get('lambda_trasferta') is not None
-        else None
-    )
-
-    calib_1x2_info = None
-    if modello is not None and not is_coppa and usa_calibrazione:
-        calib_1x2_info = carica_calibratore(id_fd, "1x2")
-        if calib_1x2_info:
-            modello = applica_calibrazione_1x2(modello, calib_1x2_info["calibratore"])
-
-    platt_v13_info = None
-    if modello is not None and not is_coppa and usa_platt_v13:
-        try:
-            train_platt = _v13_training_ou_platt(
-                dati, rho_val, ewma_span_val, emivita_val,
-                data_rif_sel if pd.notna(data_rif_sel) else None,
-                n_train=100
-            )
-            platt_v13, platt_coef, platt_status = _v13_fit_platt_ou(train_platt)
-            p_raw = 1.0 - float(modello['prob_under'][2.5]) / 100.0
-            if platt_v13 is not None:
-                p_new = _v13_predict_platt_ou(p_raw, platt_v13)
-                modello = _v13_apply_platt_ou(modello, platt_v13)
-                platt_v13_info = {
-                    'stato': 'applicato',
-                    'n_train': len(train_platt),
-                    'coef': platt_coef,
-                    'raw_over': p_raw * 100.0,
-                    'platt_over': p_new * 100.0,
-                    'raw_under': (1.0 - p_raw) * 100.0,
-                    'platt_under': (1.0 - p_new) * 100.0,
-                }
-            else:
-                platt_v13_info = {
-                    'stato': 'escluso',
-                    'n_train': len(train_platt),
-                    'coef': platt_coef,
-                    'raw_over': p_raw * 100.0,
-                    'raw_under': (1.0 - p_raw) * 100.0,
-                    'motivo': platt_status,
-                }
-        except Exception as _platt_err:
-            platt_v13_info = {'errore': f'{type(_platt_err).__name__}: {_platt_err}'}
-
-    if modello is None:
-        st.warning(f"⚠️ Impossibile elaborare il match per **{partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}**.")
-    else:
-        st.subheader(f"📊 Analisi Match: {partita_sel['HomeTeam']} vs {partita_sel['AwayTeam']}")
-        if calib_1x2_info:
-            st.caption(f"🎯 Probabilità 1X2 corrette con calibrazione (allenata su "
-                       f"{calib_1x2_info['n_osservazioni']} osservazioni, {calib_1x2_info['timestamp']}).")
-
-        # V15 operativo: PLATT Top1 Combo con regola congelata.
-        v15_top1_info = None
-        if not is_coppa:
-            try:
-                v15_top1_info = _v15_operational_top1_platt(
-                    id_fd, rho_val, ewma_span_val, emivita_val, modello,
-                    data_rif_sel if pd.notna(data_rif_sel) else None
-                )
-                if v15_top1_info is not None and v15_top1_info.get('selected'):
-                    p_raw_pct = 100.0 * v15_top1_info['top1_raw']
-                    p_final_pct = 100.0 * v15_top1_info['platt_prob']
-                    if v15_top1_info.get('platt_applied'):
-                        st.success(
-                            f"🧊 **V15 TOP1 COMBO ATTIVA** — {v15_top1_info['top1_key']} · "
-                            f"RAW {p_raw_pct:.1f}% → PLATT {p_final_pct:.1f}% · "
-                            f"training: {v15_top1_info['train_n']} osservazioni · "
-                            f"pendenza: {v15_top1_info['coef']:.4f}."
-                        )
-                    else:
-                        st.warning(
-                            f"⚠️ **V15 TOP1 ≥35%, ma PLATT non applicato** — {v15_top1_info['top1_key']} · "
-                            f"RAW {p_raw_pct:.1f}% · training: {v15_top1_info['train_n']} · "
-                            f"motivo: {v15_top1_info['reason']}. Resta la probabilità RAW."
-                        )
-                elif v15_top1_info is not None:
-                    st.info(
-                        f"ℹ️ **V15 TOP1 COMBO non attiva** — {v15_top1_info['top1_key']} · "
-                        f"probabilità RAW {100.0*v15_top1_info['top1_raw']:.1f}% < soglia 35%."
-                    )
-            except Exception as _v15_err:
-                st.warning(f"⚠️ V15 PLATT Top1 Combo non applicato per errore tecnico: {type(_v15_err).__name__}: {_v15_err}")
-
-        if platt_v13_info and platt_v13_info.get('stato') == 'applicato':
-            st.info(
-                f"🎯 **V13 PLATT O/U 2.5 applicato** — training walk-forward: {platt_v13_info['n_train']} partite · "
-                f"pendenza: {platt_v13_info['coef']:.4f}. "
-                f"Over 2.5: {platt_v13_info['raw_over']:.1f}% → {platt_v13_info['platt_over']:.1f}% · "
-                f"Under 2.5: {platt_v13_info['raw_under']:.1f}% → {platt_v13_info['platt_under']:.1f}%."
-            )
-        elif platt_v13_info and platt_v13_info.get('stato') == 'escluso':
-            st.info(
-                f"ℹ️ **V13 PLATT O/U 2.5 escluso automaticamente** — training: {platt_v13_info['n_train']} partite · "
-                f"pendenza: {platt_v13_info['coef']:.4f}. "
-                f"Il fit non e' monotono; resta la probabilita RAW: "
-                f"Over 2.5 {platt_v13_info['raw_over']:.1f}% · Under 2.5 {platt_v13_info['raw_under']:.1f}%."
-            )
-        elif platt_v13_info and 'errore' in platt_v13_info:
-            st.warning(f"⚠️ PLATT O/U 2.5 non applicato per errore tecnico: {platt_v13_info['errore']}")
-
-        # Avviso trasparenza dati (sostituisce il vecchio generatore silenzioso di dati finti)
-        SOGLIA_AVVISO = 5
-        avvisi = []
-        if modello["n_casa"] < SOGLIA_AVVISO:
-            avvisi.append(f"{partita_sel['HomeTeam']} (solo {modello['n_casa']} partite trovate)")
-        if modello["n_trasf"] < SOGLIA_AVVISO:
-            avvisi.append(f"{partita_sel['AwayTeam']} (solo {modello['n_trasf']} partite trovate)")
-        if avvisi:
-            st.warning("⚠️ Stima poco affidabile per: " + " e ".join(avvisi) +
-                       " — il modello converge verso la media di lega/competizione per compensare "
-                       "la scarsità di dati specifici, ma la previsione resta meno precisa del solito.")
-
-        def crea_tabella(dati_dict, col_nome="Mercato"):
-            df = pd.DataFrame(list(dati_dict.items()), columns=[col_nome, "Probabilità (%)"])
-            df["Probabilità (%)"] = df["Probabilità (%)"].round(1)
-            df = df.sort_values(by="Probabilità (%)", ascending=False).reset_index(drop=True)
-            df["Probabilità (%)"] = df["Probabilità (%)"].astype(str) + "%"
-            return df
-
-        st.markdown("### 🏆 Esito Finale (1X2)")
-        df_1x2 = crea_tabella({"1 (Casa)": modello['prob_1'], "X (Pareggio)": modello['prob_X'], "2 (Trasferta)": modello['prob_2']}, "Segno")
-        st.dataframe(df_1x2, use_container_width=True, hide_index=True)
-
-        quote, quote_ou_25 = None, None  # usate più sotto per la stima combo approssimata (Punto C)
-
-        if not is_coppa:
-            # =====================================================================
-            # ✅ INDICATORE DI CONCORDANZA MODELLO/MERCATO — come scegliere le partite
-            # Il backtest ha confermato: quando la previsione principale del modello
-            # coincide col favorito del mercato, l'accuratezza sale (idea #1: segno,
-            # +5/+10 punti; idea #1b: anche Over/Under 2.5, ulteriore miglioramento
-            # in La Liga, Bundesliga, Ligue 1 — più debole ma comunque presente su
-            # Serie A e Premier League). Due badge separati, stesso criterio già
-            # validato nel backtest, applicato partita per partita.
-            # =====================================================================
-            colonne_h_pre, colonne_d_pre, colonne_a_pre = classifica_colonne_quote(dati.columns)
-            quote_pre = quote_mercato_normalizzate(partita_sel, colonne_h_pre, colonne_d_pre, colonne_a_pre)
-            if quote_pre:
-                probabilita_1x2 = {"1": modello['prob_1'], "X": modello['prob_X'], "2": modello['prob_2']}
-                previsione_modello = max(probabilita_1x2, key=probabilita_1x2.get)
-                quote_per_segno_pre = {"1": quote_pre["q_casa_equa"], "X": quote_pre["q_x_equa"], "2": quote_pre["q_trasf_equa"]}
-                favorito_mercato_pre = min(quote_per_segno_pre, key=quote_per_segno_pre.get)
-                if previsione_modello == favorito_mercato_pre:
-                    st.success(f"✅ **Segno — modello e mercato d'accordo** (entrambi favoriscono '{previsione_modello}') — "
-                              f"nel backtest, su questo tipo di partite l'accuratezza è stata sensibilmente più alta.")
-                else:
-                    st.warning(f"⚠️ **Segno — disaccordo**: il modello preferisce '{previsione_modello}', il mercato "
-                              f"favorisce '{favorito_mercato_pre}' — nel backtest, questo tipo di partite ha "
-                              f"un'accuratezza più bassa. Trattala con più cautela.")
-
-            colonne_over_pre, colonne_under_pre = classifica_colonne_over_under(dati.columns, "2.5")
-            quote_ou_pre = quote_over_under_normalizzate(partita_sel, colonne_over_pre, colonne_under_pre)
-            if quote_ou_pre:
-                p_under_modello = modello['prob_under'][2.5]
-                previsione_ou_modello = "Under" if p_under_modello >= 50 else "Over"
-                favorito_ou_mercato_pre = "Over" if quote_ou_pre["q_over_equa"] < quote_ou_pre["q_under_equa"] else "Under"
-                if previsione_ou_modello == favorito_ou_mercato_pre:
-                    st.success(f"✅ **Over/Under 2.5 — modello e mercato d'accordo** (entrambi favoriscono "
-                              f"'{previsione_ou_modello}') — segnale aggiuntivo utile soprattutto per le combo.")
-                else:
-                    st.warning(f"⚠️ **Over/Under 2.5 — disaccordo**: il modello preferisce '{previsione_ou_modello}', "
-                              f"il mercato favorisce '{favorito_ou_mercato_pre}'.")
-
-        if not is_coppa:
-            st.markdown("### 💰 Controllo Value Bet (media multi-bookmaker, quote depurate dal margine)")
-            colonne_h, colonne_d, colonne_a = classifica_colonne_quote(dati.columns)
-            quote = quote_mercato_normalizzate(partita_sel, colonne_h, colonne_d, colonne_a)
-            colonne_over, colonne_under = classifica_colonne_over_under(dati.columns, "2.5")
-            quote_ou_25 = quote_over_under_normalizzate(partita_sel, colonne_over, colonne_under)
-            if quote:
-                ev_1 = (modello['prob_1'] / 100.0) * quote['q_casa_equa']
-                ev_x = (modello['prob_X'] / 100.0) * quote['q_x_equa']
-                ev_2 = (modello['prob_2'] / 100.0) * quote['q_trasf_equa']
-                dati_ev = [
-                    {"Segno": "1 (Casa)", "Quota Equa": f"{quote['q_casa_equa']:.2f}", "Valutazione": "🔥 ALTO VALORE" if ev_1 > 1.05 else ("📈 Leggero Valore" if ev_1 > 1.0 else "Nessun Valore")},
-                    {"Segno": "X (Pareggio)", "Quota Equa": f"{quote['q_x_equa']:.2f}", "Valutazione": "🔥 ALTO VALORE" if ev_x > 1.05 else ("📈 Leggero Valore" if ev_x > 1.0 else "Nessun Valore")},
-                    {"Segno": "2 (Trasferta)", "Quota Equa": f"{quote['q_trasf_equa']:.2f}", "Valutazione": "🔥 ALTO VALORE" if ev_2 > 1.05 else ("📈 Leggero Valore" if ev_2 > 1.0 else "Nessun Valore")},
-                ]
-                st.caption(f"Media su {quote['n_bookmakers']} bookmaker, margine rimosso: {(quote['overround']-1)*100:.1f}%")
-                st.dataframe(pd.DataFrame(dati_ev), use_container_width=True, hide_index=True)
-            else:
-                st.info("ℹ️ Quote dei bookmaker non disponibili per questa specifica partita.")
-        else:
-            st.markdown("### 🎯 Quota Equa Statistica (Coppe Europee)")
-            st.caption("Nessuna quota di mercato disponibile per le coppe: il modello mostra la quota equa "
-                       "basata sulla probabilità pura. Cerca sui bookmaker quote superiori a questi valori.")
-            q_fair_1 = 100.0 / modello['prob_1'] if modello['prob_1'] > 0 else 0.0
-            q_fair_x = 100.0 / modello['prob_X'] if modello['prob_X'] > 0 else 0.0
-            q_fair_2 = 100.0 / modello['prob_2'] if modello['prob_2'] > 0 else 0.0
-            dati_fair = [
-                {"Segno": "1 (Casa)", "Probabilità": f"{modello['prob_1']:.1f}%", "Quota Equa Minima": f"{q_fair_1:.2f}"},
-                {"Segno": "X (Pareggio)", "Probabilità": f"{modello['prob_X']:.1f}%", "Quota Equa Minima": f"{q_fair_x:.2f}"},
-                {"Segno": "2 (Trasferta)", "Probabilità": f"{modello['prob_2']:.1f}%", "Quota Equa Minima": f"{q_fair_2:.2f}"},
-            ]
-            st.dataframe(pd.DataFrame(dati_fair), use_container_width=True, hide_index=True)
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("### ⚽ Goal / No Goal")
-            st.dataframe(crea_tabella({"Goal": modello['prob_goal'], "No Goal": modello['prob_nogoal']}, "Opzione"),
-                        use_container_width=True, hide_index=True)
-        with col_b:
-            st.markdown("### 📉 Under / Over")
-            oo_dict = {}
-            for soglia, prob_u in modello['prob_under'].items():
-                oo_dict[f"Under {soglia}"] = prob_u
-                oo_dict[f"Over {soglia}"] = 100 - prob_u
-            st.dataframe(crea_tabella(oo_dict, "Linea"), use_container_width=True, hide_index=True)
-
-        col_c, col_d = st.columns(2)
-        with col_c:
-            st.markdown("### 🏠 Multigol Casa")
-            st.dataframe(crea_tabella(modello['multigol_casa'], "Intervallo"), use_container_width=True, hide_index=True)
-        with col_d:
-            st.markdown("### ✈️ Multigol Ospite")
-            st.dataframe(crea_tabella(modello['multigol_trasf'], "Intervallo"), use_container_width=True, hide_index=True)
-
-        st.markdown("### 🔥 Combo Rapide")
-        st.dataframe(crea_tabella(modello['combo'], "Combinazione"), use_container_width=True, hide_index=True)
-
-        # =====================================================================
-        # 🏆 TOP COMBO AUTOMATICHE
-        # Scopre da sola le combinazioni più probabili tra tutte le 12
-        # possibili (segno × Gol/No Gol × Over/Under 2.5), riusando la stessa
-        # funzione calcola_combo_libera del motore libero qui sotto — nessuna
-        # logica duplicata, un solo posto dove le combo vengono calcolate.
-        # =====================================================================
-        st.markdown("### 🏆 Top 4 Combo Automatiche (su Over/Under 2.5)")
-        st.caption("Tutte le 12 combinazioni possibili (1/X/2 × Gol/No Gol × Over/Under 2.5), calibrate "
-                   "se disponibile, filtrate per affidabilità (esclude combo troppo rare o su dati scarsi) "
-                   "e ordinate per probabilità.")
-
-        # Punto A — filtro di affidabilità: escludiamo le combo troppo rare
-        # (rumore, non segnale) o calcolate su squadre con pochi dati specifici.
-        SOGLIA_MIN_PROB_COMBO = 8.0  # sotto questa probabilità, troppo raro per essere utile
-        dati_scarsi = bool(avvisi)
-
-        tutte_le_combo = {}
-        for segno_auto in ["1", "X", "2"]:
-            for gg_auto in ["Goal", "NoGoal"]:
-                for tipo_auto in ["Over", "Under"]:
-                    prob_grezza = calcola_combo_libera(modello['griglia'], segno=segno_auto, soglia_gol=2.5,
-                                                        tipo_soglia=tipo_auto, gol_nogol=gg_auto)
-                    nome_chiave = f"{segno_auto}_{gg_auto}_{tipo_auto}"
-                    prob_finale = prob_grezza
-                    calib_combo_info = None
-                    if not is_coppa and usa_calibrazione:
-                        calib_combo_info = carica_calibratore(id_fd, nome_chiave)
-                        if calib_combo_info:
-                            prob_finale = float(calib_combo_info["calibratore"].predict([prob_grezza/100])[0]) * 100
-                    chiave_vis = f"{segno_auto} + {'Gol' if gg_auto=='Goal' else 'No Gol'} + {tipo_auto} 2.5"
-                    tutte_le_combo[chiave_vis] = {
-                        "prob": prob_finale, "segno": segno_auto, "tipo": tipo_auto,
-                        "calibrata": calib_combo_info is not None,
-                    }
-
-        combo_affidabili = {k: v for k, v in tutte_le_combo.items() if v["prob"] >= SOGLIA_MIN_PROB_COMBO}
-        top4_combo = dict(sorted(combo_affidabili.items(), key=lambda x: x[1]["prob"], reverse=True)[:4])
-
-        # Etichetta esplicita sulla Top1 RAW usata dal freeze V15; il ranking delle
-        # 4 combo rimane quello già presente nell'interfaccia.
-        if v15_top1_info is not None and v15_top1_info.get('selected'):
-            st.caption(
-                f"🧊 Freeze V15: Top1 RAW {100.0*v15_top1_info['top1_raw']:.1f}% ≥ 35% · "
-                f"probabilità operativa Top1 = {100.0*v15_top1_info['platt_prob']:.1f}%"
-                if v15_top1_info.get('platt_applied') else
-                f"🧊 Freeze V15: Top1 RAW {100.0*v15_top1_info['top1_raw']:.1f}% ≥ 35% · PLATT non applicato ({v15_top1_info.get('reason','')})"
-            )
-
-        if dati_scarsi:
-            st.warning("⚠️ Combo calcolate su dati limitati per una delle due squadre (vedi avviso sopra) "
-                      "— trattale con più cautela del solito.")
-        if not top4_combo:
-            st.info(f"Nessuna combo sopra la soglia minima di affidabilità ({SOGLIA_MIN_PROB_COMBO}%) "
-                   "per questa partita.")
-        else:
-            righe_top4 = []
-            for chiave, info_c in top4_combo.items():
-                q_stimata, non_prezzate = stima_quota_combo_approssimata(info_c["segno"], 2.5, info_c["tipo"], quote, quote_ou_25)
-                righe_top4.append({
-                    "Combo": chiave + (" 🎯" if info_c["calibrata"] else ""),
-                    "Probabilità (%)": f"{info_c['prob']:.1f}%",
-                    "Quota stimata*": f"~{q_stimata:.2f}" if q_stimata else "n/d",
-                })
-            st.dataframe(pd.DataFrame(righe_top4), use_container_width=True, hide_index=True)
-            st.caption("🎯 = probabilità corretta con calibrazione specifica per questa combo. "
-                       "*Quota STIMATA per approssimazione (1X2 × Over/Under come se fossero indipendenti — "
-                       "non lo sono del tutto). Il componente Gol/No Gol non ha una quota nel file, quindi "
-                       "non entra nella stima: il numero reale del bookmaker sarà diverso.")
-
-        st.divider()
-        st.markdown("### ⚔️ Ultimi Scontri Diretti (H2H)")
-        df_h2h = estrai_scontri_diretti(partita_sel['HomeTeam'], partita_sel['AwayTeam'], dati_filtrati, df_globale_filtrato)
-        if not df_h2h.empty:
-            cols_mostra = [c for c in ['Date', 'HomeTeam', 'FTHG', 'FTAG', 'AwayTeam'] if c in df_h2h.columns]
-            st.dataframe(df_h2h[cols_mostra], use_container_width=True, hide_index=True)
-        else:
-            st.info("Nessun precedente recente trovato negli archivi disponibili tra queste due squadre.")
-
-        st.divider()
-        st.markdown("### 🎯 Statistiche Match (Stimate)")
-        nota_stima = ""
-        if avvisi:
-            nota_stima = " ⚠️ (basate parzialmente sulla media di lega per scarsità di dati specifici)"
-        st.info(f"🚩 Angoli Totali Stimati: **{modello['angoli_stimati']}** | "
-                f"🎯 Tiri in Porta Totali Stimati: **{modello['tiri_stimati']}**{nota_stima}")
-# =====================================================================
-# V8 — VALIDAZIONE STATISTICA AGGREGATA / OOS
-# Non modifica il modello originale. Parte dai quattro DataFrame V5 OOS per
-# ciascun campionato e aggiunge: bootstrap ROI, IC95%, confronto CAL-RAW,
-# bootstrap della differenza di ROI e aggregazione sui 5 campionati.
-#
-# Nota metodologica: RAW e CAL non sono necessariamente gli stessi bet.
-# La differenza CAL-RAW è quindi una differenza tra strategie, non un test
-# appaiato sugli stessi eventi.
-# =====================================================================
-
-def _v7_bootstrap_roi(df, n_boot=2000, seed=42):
-    """Bootstrap a livello di scommessa per ROI/profitto."""
-    if df is None or df.empty or 'vinta' not in df.columns or 'quota' not in df.columns:
-        return {'n': 0, 'roi': None, 'roi_lo': None, 'roi_hi': None,
-                'profit': None, 'profit_lo': None, 'profit_hi': None}
-    import numpy as _np
-    wins = df['vinta'].astype(bool).to_numpy()
-    odds = df['quota'].astype(float).to_numpy()
-    profit = _np.where(wins, odds - 1.0, -1.0)
-    roi = float(profit.mean() * 100.0)
-    total = float(profit.sum())
-    rng = _np.random.default_rng(seed)
-    idx = rng.integers(0, len(profit), size=(n_boot, len(profit)))
-    samples = profit[idx].mean(axis=1) * 100.0
-    lo, hi = _np.percentile(samples, [2.5, 97.5])
-    totals = profit[idx].sum(axis=1)
-    plo, phi = _np.percentile(totals, [2.5, 97.5])
-    return {'n': int(len(profit)), 'roi': roi, 'roi_lo': float(lo), 'roi_hi': float(hi),
-            'profit': total, 'profit_lo': float(plo), 'profit_hi': float(phi)}
-
-
-def _v7_make_row(campionato, mercato, versione, df, ev_col='ev', seed=42):
-    if df is None or df.empty:
-        return {'campionato': campionato, 'mercato': mercato, 'versione': versione,
-                'bet': 0, 'strike_%': None, 'brier': None, 'logloss': None,
-                'EV_%': None, 'ROI_%': None, 'ROI_IC95_low_%': None,
-                'ROI_IC95_high_%': None, 'profit_u': None,
-                'profit_IC95_low_u': None, 'profit_IC95_high_u': None,
-                'quota_media': None, 'max_dd_u': None}
-    d = df.copy()
-    if 'vinta' in d.columns and 'quota' in d.columns:
-        s = _v6_stats_df(d)
-        bs = _v7_bootstrap_roi(d, seed=seed)
-    else:
-        s = {'bet': len(d), 'strike': None, 'roi': None, 'profit': None,
-             'avg_odds': None, 'ev': None, 'max_dd': None}
-        bs = {'roi_lo': None, 'roi_hi': None, 'profit_lo': None, 'profit_hi': None}
-    ev = None
-    if ev_col in d.columns and len(d):
-        ev = float(d[ev_col].astype(float).mean() * 100.0)
-    elif 'ev' in d.columns and len(d):
-        ev = float(d['ev'].astype(float).mean() * 100.0)
-    return {'campionato': campionato, 'mercato': mercato, 'versione': versione,
-            'bet': int(s.get('bet', len(d))), 'strike_%': s.get('strike'),
-            'brier': None, 'logloss': None, 'EV_%': ev,
-            'ROI_%': s.get('roi'), 'ROI_IC95_low_%': bs.get('roi_lo'),
-            'ROI_IC95_high_%': bs.get('roi_hi'), 'profit_u': s.get('profit'),
-            'profit_IC95_low_u': bs.get('profit_lo'),
-            'profit_IC95_high_u': bs.get('profit_hi'),
-            'quota_media': s.get('avg_odds'), 'max_dd_u': s.get('max_dd')}
-
-
-def _v8_bootstrap_compare(df_raw, df_cal, n_boot=3000, seed=42):
-    import numpy as _np
-    def prof(df):
-        if df is None or df.empty or 'vinta' not in df.columns or 'quota' not in df.columns:
-            return _np.array([], dtype=float)
-        return _np.where(df['vinta'].astype(bool).to_numpy(),
-                         df['quota'].astype(float).to_numpy()-1.0, -1.0)
-    a, b = prof(df_raw), prof(df_cal)
-    if len(a)==0 or len(b)==0:
-        return {'delta':None,'lo':None,'hi':None,'p_two_sided':None}
-    rng=_np.random.default_rng(seed)
-    ia=rng.integers(0,len(a),size=(n_boot,len(a)))
-    ib=rng.integers(0,len(b),size=(n_boot,len(b)))
-    deltas=(b[ib].mean(axis=1)-a[ia].mean(axis=1))*100.0
-    delta=(b.mean()-a.mean())*100.0
-    lo,hi=_np.percentile(deltas,[2.5,97.5])
-    # Two-sided bootstrap sign probability; descriptive, not a formal paired test.
-    p=2.0*min(float((deltas<=0).mean()), float((deltas>=0).mean()))
-    return {'delta':float(delta),'lo':float(lo),'hi':float(hi),'p_two_sided':float(min(1.0,p))}
-
-
-def _v8_aggregate(rows, camp_weights=False):
-    if not rows:
-        return pd.DataFrame()
-    d=pd.DataFrame(rows)
-    # Aggregazione economica corretta: somma profitti / numero di bet.
-    out=[]
-    for (merc,ver), g in d.groupby(['mercato','versione'], sort=False):
-        bets=pd.to_numeric(g['bet'],errors='coerce').fillna(0).sum()
-        profit=pd.to_numeric(g['profit_u'],errors='coerce').fillna(0).sum()
-        roi=100.0*profit/bets if bets else None
-        out.append({'mercato':merc,'versione':ver,'bet_totali':int(bets),
-                    'profit_totale_u':float(profit),'ROI_aggregato_%':roi,
-                    'quota_media_pesata':None})
-    return pd.DataFrame(out)
-
-
-def _v8_build_all(n_boot=3000, warmup=100):
-    rows=[]; compares=[]; errors=[]
-    for camp, info in CAMPIONATI_DOMESTICI.items():
-        try:
-            dati_b=carica_dati_campionato(info['id_fd'])
-            v5=_v5_run_economic(dati_b, rho_val, ewma_span_val, emivita_val, 0.10, warmup)
-            pairs=[('1X2','RAW',v5.get('raw12')),('1X2','CALIBRATO OOS',v5.get('cal12')),
-                   ('O/U 2.5','RAW',v5.get('rawou')),('O/U 2.5','CALIBRATO OOS',v5.get('calou'))]
-            for merc,ver,d in pairs:
-                r=_v7_make_row(camp,merc,ver,d,'ev',seed=42)
-                rows.append(r)
-            compares.append((camp,'1X2',_v8_bootstrap_compare(v5.get('raw12'),v5.get('cal12'),n_boot,101)))
-            compares.append((camp,'O/U 2.5',_v8_bootstrap_compare(v5.get('rawou'),v5.get('calou'),n_boot,202)))
-        except Exception as e:
-            errors.append((camp,f'{type(e).__name__}: {e}'))
-    return rows,compares,errors
-
-
-
-# =====================================================================
-# V9 — CONFRONTO APPAIATO CAL vs RAW SULLA STESSA OPPORTUNITÀ
-# Per ogni riga OOS, RAW e CAL vedono la stessa partita e le stesse quote.
-# Si calcolano due viste: ALL OOS (0 profit se la strategia non entra) e
-# COMMON BETS (solo righe dove entrambe entrano). Il bootstrap è appaiato
-# sulla differenza di profitto per riga, non su due campioni indipendenti.
-# =====================================================================
-def _v9_build_paired(dati_completi, rho, ewma_span, emivita, soglia_ev=0.10, warmup=100):
-    hist = _v5_raw_history(dati_completi, rho, ewma_span, emivita)
-    if hist.empty:
-        return None
-    rows12=[]; rowsou=[]
-    prior12_p={'1':[], 'X':[], '2':[]}; prior12_y={'1':[], 'X':[], '2':[]}
-    prior_ou_p=[]; prior_ou_y=[]
-    for j,r in hist.iterrows():
-        if j < warmup:
-            prior12_p['1'].append(r.p1); prior12_y['1'].append(1 if r.esito12=='1' else 0)
-            prior12_p['X'].append(r.px); prior12_y['X'].append(1 if r.esito12=='X' else 0)
-            prior12_p['2'].append(r.p2); prior12_y['2'].append(1 if r.esito12=='2' else 0)
-            prior_ou_p.append(r.po); prior_ou_y.append(1 if r.esito_ou=='Over' else 0)
-            continue
-
-        cal12_models={s:_v5_fit_iso_binary(prior12_p[s],prior12_y[s]) for s in ['1','X','2']}
-        rawp={'1':float(r.p1),'X':float(r.px),'2':float(r.p2)}
-        if all(cal12_models[s] is not None for s in ['1','X','2']):
-            cp={s:float(cal12_models[s].predict([rawp[s]])[0]) for s in ['1','X','2']}
-            tot=sum(cp.values()); cp={s:v/tot for s,v in cp.items()} if tot>0 else rawp.copy()
-        else: cp=rawp.copy()
-        rc=max(rawp,key=rawp.get); cc=max(cp,key=cp.get)
-        rq={'1':float(r.q1),'X':float(r.qx),'2':float(r.q2)}
-        raw_ev=rawp[rc]*rq[rc]-1.0; cal_ev=cp[cc]*rq[cc]-1.0
-        raw_in=raw_ev>=soglia_ev; cal_in=cal_ev>=soglia_ev
-        raw_prof=(rq[rc]-1.0 if rc==r.esito12 else -1.0) if raw_in else 0.0
-        cal_prof=(rq[cc]-1.0 if cc==r.esito12 else -1.0) if cal_in else 0.0
-        rows12.append({'data':r.data,'raw_in':raw_in,'cal_in':cal_in,'raw_profit':raw_prof,'cal_profit':cal_prof,
-                       'raw_ev':raw_ev,'cal_ev':cal_ev,'raw_choice':rc,'cal_choice':cc,'quota_raw':rq[rc],'quota_cal':rq[cc],
-                       'raw_hit':bool(rc==r.esito12) if raw_in else None,'cal_hit':bool(cc==r.esito12) if cal_in else None})
-
-        cal_ou_model=_v5_fit_iso_binary(prior_ou_p,prior_ou_y)
-        rawou={'Over':float(r.po),'Under':float(r.pu)}
-        if cal_ou_model is not None:
-            pco=min(max(float(cal_ou_model.predict([r.po])[0]),0.001),0.999)
-            cou={'Over':pco,'Under':1-pco}
-        else: cou=rawou.copy()
-        ro=max(rawou,key=rawou.get); co=max(cou,key=cou.get)
-        oq={'Over':float(r.qo),'Under':float(r.qu)}
-        rev=rawou[ro]*oq[ro]-1.0; cev=cou[co]*oq[co]-1.0
-        rin=rev>=soglia_ev; cin=cev>=soglia_ev
-        rp=(oq[ro]-1.0 if ro==r.esito_ou else -1.0) if rin else 0.0
-        cpv=(oq[co]-1.0 if co==r.esito_ou else -1.0) if cin else 0.0
-        rowsou.append({'data':r.data,'raw_in':rin,'cal_in':cin,'raw_profit':rp,'cal_profit':cpv,
-                       'raw_ev':rev,'cal_ev':cev,'raw_choice':ro,'cal_choice':co,'quota_raw':oq[ro],'quota_cal':oq[co],
-                       'raw_hit':bool(ro==r.esito_ou) if rin else None,'cal_hit':bool(co==r.esito_ou) if cin else None})
-
-        prior12_p['1'].append(r.p1); prior12_y['1'].append(1 if r.esito12=='1' else 0)
-        prior12_p['X'].append(r.px); prior12_y['X'].append(1 if r.esito12=='X' else 0)
-        prior12_p['2'].append(r.p2); prior12_y['2'].append(1 if r.esito12=='2' else 0)
-        prior_ou_p.append(r.po); prior_ou_y.append(1 if r.esito_ou=='Over' else 0)
-    return {'1X2':pd.DataFrame(rows12),'O/U 2.5':pd.DataFrame(rowsou)}
-
-
-def _v9_paired_stats(df, n_boot=3000, seed=42, common_only=False):
-    import numpy as _np
-    if df is None or df.empty: return {'n':0,'raw_bets':0,'cal_bets':0,'delta_profit':None,'delta_roi_pp':None,'lo':None,'hi':None,'p_two_sided':None}
-    d=df[df.raw_in & df.cal_in].copy() if common_only else df.copy()
-    if d.empty: return {'n':0,'raw_bets':0,'cal_bets':0,'delta_profit':None,'delta_roi_pp':None,'lo':None,'hi':None,'p_two_sided':None}
-    raw=d.raw_profit.to_numpy(float); cal=d.cal_profit.to_numpy(float); diff=cal-raw
-    rng=_np.random.default_rng(seed); idx=rng.integers(0,len(diff),size=(n_boot,len(diff)))
-    boot=diff[idx].mean(axis=1)*100.0
-    lo,hi=_np.percentile(boot,[2.5,97.5]); delta=diff.mean()*100.0
-    p=2*min(float((boot<=0).mean()),float((boot>=0).mean()))
-    raw_b=int(d.raw_in.sum()); cal_b=int(d.cal_in.sum())
-    raw_profit=float(raw.sum()); cal_profit=float(cal.sum())
-    raw_roi=100*raw_profit/raw_b if raw_b else None; cal_roi=100*cal_profit/cal_b if cal_b else None
-    return {'n':len(d),'raw_bets':raw_b,'cal_bets':cal_b,'raw_profit':raw_profit,'cal_profit':cal_profit,
-            'raw_roi':raw_roi,'cal_roi':cal_roi,'delta_profit':delta,'delta_roi_pp':(cal_roi-raw_roi) if raw_roi is not None and cal_roi is not None else None,
-            'lo':float(lo),'hi':float(hi),'p_two_sided':float(min(1,p))}
-
-
-def _v9_build_all(n_boot=3000,warmup=100):
-    rows=[]; errors=[]
-    for camp,info in CAMPIONATI_DOMESTICI.items():
-        try:
-            dati=carica_dati_campionato(info['id_fd'])
-            paired=_v9_build_paired(dati,rho_val,ewma_span_val,emivita_val,0.10,warmup)
-            for merc,df in paired.items():
-                for mode,common in [('ALL OOS',False),('COMMON BETS',True)]:
-                    st=_v9_paired_stats(df,n_boot,42 if merc=='1X2' else 43,common)
-                    rows.append({'campionato':camp,'mercato':merc,'universo':mode,**st})
-        except Exception as e: errors.append((camp,f'{type(e).__name__}: {e}'))
-    return pd.DataFrame(rows),errors
-
-
-def mostra_v9_validation():
-    st.divider(); st.markdown('## 🧪 V9 — PAIRED TEST RAW vs CAL OOS')
-    st.caption('RAW e CAL vengono confrontati sulla stessa partita e sulle stesse quote. Il bootstrap ricampiona la differenza CAL−RAW per partita; non sono due bootstrap indipendenti.')
-    c1,c2=st.columns(2)
-    with c1: nb=st.number_input('Bootstrap V9',500,10000,3000,500,key='v9_boot')
-    with c2: wu=st.number_input('Warm-up V9',50,300,100,10,key='v9_warm')
-    st.info('ALL OOS assegna profitto 0 quando una strategia non entra: misura l’effetto complessivo della strategia. COMMON BETS usa solo le partite in cui entrambe entrano: misura il confronto diretto sulle opportunità condivise.')
-    if st.button('🧪 ESEGUI V9 — PAIRED TEST',key='v9_run'):
-        try:
-            with st.spinner('V9 in esecuzione sui 5 campionati...'):
-                out,errors=_v9_build_all(int(nb),int(wu))
-            if not out.empty:
-                cols=['campionato','mercato','universo','n','raw_bets','cal_bets','raw_profit','cal_profit','raw_roi','cal_roi','delta_profit','delta_roi_pp','lo','hi','p_two_sided']
-                st.dataframe(out[cols],use_container_width=True,hide_index=True)
-                st.download_button('⬇️ Scarica V9 paired test',data=out.to_csv(index=False).encode('utf-8'),file_name='V9_paired_test.csv',mime='text/csv',key='v9_dl')
-                st.markdown('### Come leggere il test')
-                st.write('`delta_profit` è il vantaggio medio per partita di CAL rispetto a RAW, in unità. `lo/hi` è il suo IC95% bootstrap. Se l’intervallo attraversa 0, il campione non separa nettamente le due strategie.')
-            if errors:
-                st.error('Campionati non completati:'); [st.write(f'- **{n}**: {m}') for n,m in errors]
-        except Exception as e: st.error(f'Errore V9: {type(e).__name__}: {e}')
-
-def mostra_v8_validation():
-    st.divider()
-    st.markdown('## 🧪 V8 — VALIDAZIONE STATISTICA AGGREGATA / OOS')
-    st.caption('Confronto RAW vs CALIBRATO OOS sui 5 campionati, con bootstrap del ROI, IC95% e intervallo della differenza CAL−RAW. I risultati economici restano backtest storici con quote proxy.')
-    c1,c2=st.columns(2)
-    with c1:
-        n_boot=st.number_input('Bootstrap V8',min_value=500,max_value=10000,value=3000,step=500,key='v8_boot')
-    with c2:
-        warm=st.number_input('Warm-up OOS',min_value=50,max_value=300,value=100,step=10,key='v8_warm')
-    st.warning('⚠️ V8 può richiedere alcuni minuti: esegue una sola volta per campionato e poi calcola il confronto statistico. RAW e CAL non sono necessariamente gli stessi bet.')
-    if st.button('🧪 ESEGUI V8 — VALIDAZIONE COMPLETA',key='v8_run'):
-        try:
-            with st.spinner('V8 in esecuzione sui 5 campionati...'):
-                rows,compares,errors=_v8_build_all(int(n_boot),int(warm))
-            if rows:
-                out=pd.DataFrame(rows)
-                st.markdown('### 1. Risultati per campionato')
-                st.dataframe(out,use_container_width=True,hide_index=True)
-                st.download_button('⬇️ Scarica V8 risultati per campionato',data=out.to_csv(index=False).encode('utf-8'),file_name='V8_per_campionato.csv',mime='text/csv',key='v8_dl1')
-                agg=_v8_aggregate(rows)
-                st.markdown('### 2. Aggregazione dei 5 campionati')
-                st.dataframe(agg,use_container_width=True,hide_index=True)
-                st.download_button('⬇️ Scarica V8 aggregato',data=agg.to_csv(index=False).encode('utf-8'),file_name='V8_aggregato.csv',mime='text/csv',key='v8_dl2')
-            if compares:
-                comp_rows=[]
-                for camp,merc,x in compares:
-                    comp_rows.append({'campionato':camp,'mercato':merc,
-                                      'delta_ROI_CAL_minus_RAW_pp':x['delta'],
-                                      'IC95_low_pp':x['lo'],'IC95_high_pp':x['hi'],
-                                      'p_bootstrap_due_code':x['p_two_sided']})
-                comp=pd.DataFrame(comp_rows)
-                st.markdown('### 3. Differenza CAL − RAW')
-                st.dataframe(comp,use_container_width=True,hide_index=True)
-                st.caption('Interpretazione: se l’IC95% della differenza attraversa 0, il campione non mostra una separazione netta tra le due strategie. Il p-value bootstrap è descrittivo e non sostituisce un test appaiato.')
-                st.download_button('⬇️ Scarica V8 confronto CAL-RAW',data=comp.to_csv(index=False).encode('utf-8'),file_name='V8_confronto_CAL_RAW.csv',mime='text/csv',key='v8_dl3')
-            if errors:
-                st.error('Campionati non completati:')
-                for nome,msg in errors: st.write(f'- **{nome}**: {msg}')
-        except Exception as e:
-            st.error(f'Errore V8: {type(e).__name__}: {e}')
-
-try:
-    mostra_v8_validation()
-except Exception as _v8_err:
-    st.error(f'V8 non disponibile: {type(_v8_err).__name__}: {_v8_err}')
-
-# V9 — render della sezione nell'app
-try:
-    mostra_v9_validation()
-except Exception as _v9_err:
-    st.error(f"V9 non disponibile: {type(_v9_err).__name__}: {_v9_err}")
-
-
-# =====================================================================
-# V10 — AGGREGATO PAIRED + BOOTSTRAP STRATIFICATO + QUALITÀ PROBABILISTICA
-# =====================================================================
-def _v10_build_paired(dati_completi, rho, ewma_span, emivita, soglia_ev=0.10, warmup=100):
-    """Come V9, ma conserva anche le probabilità RAW/CAL per Brier e Log Loss OOS."""
-    hist = _v5_raw_history(dati_completi, rho, ewma_span, emivita)
-    if hist.empty:
-        return None
-    rows12=[]; rowsou=[]
-    prior12_p={'1':[], 'X':[], '2':[]}; prior12_y={'1':[], 'X':[], '2':[]}
-    prior_ou_p=[]; prior_ou_y=[]
-    for j,r in hist.iterrows():
-        if j < warmup:
-            prior12_p['1'].append(r.p1); prior12_y['1'].append(1 if r.esito12=='1' else 0)
-            prior12_p['X'].append(r.px); prior12_y['X'].append(1 if r.esito12=='X' else 0)
-            prior12_p['2'].append(r.p2); prior12_y['2'].append(1 if r.esito12=='2' else 0)
-            prior_ou_p.append(r.po); prior_ou_y.append(1 if r.esito_ou=='Over' else 0)
-            continue
-
-        # 1X2: calibratori isotonic separati, fit solo sul passato.
-        cal12_models={s:_v5_fit_iso_binary(prior12_p[s],prior12_y[s]) for s in ['1','X','2']}
-        rawp={'1':float(r.p1),'X':float(r.px),'2':float(r.p2)}
-        if all(cal12_models[s] is not None for s in ['1','X','2']):
-            cp={s:float(cal12_models[s].predict([rawp[s]])[0]) for s in ['1','X','2']}
-            tot=sum(cp.values()); cp={s:v/tot for s,v in cp.items()} if tot>0 else rawp.copy()
-        else:
-            cp=rawp.copy()
-        rc=max(rawp,key=rawp.get); cc=max(cp,key=cp.get)
-        rq={'1':float(r.q1),'X':float(r.qx),'2':float(r.q2)}
-        raw_ev=rawp[rc]*rq[rc]-1.0; cal_ev=cp[cc]*rq[cc]-1.0
-        raw_in=raw_ev>=soglia_ev; cal_in=cal_ev>=soglia_ev
-        raw_prof=(rq[rc]-1.0 if rc==r.esito12 else -1.0) if raw_in else 0.0
-        cal_prof=(rq[cc]-1.0 if cc==r.esito12 else -1.0) if cal_in else 0.0
-        rows12.append({
-            'data':r.data,'raw_in':raw_in,'cal_in':cal_in,'raw_profit':raw_prof,'cal_profit':cal_prof,
-            'raw_ev':raw_ev,'cal_ev':cal_ev,'raw_choice':rc,'cal_choice':cc,
-            'quota_raw':rq[rc],'quota_cal':rq[cc],
-            'raw_hit':bool(rc==r.esito12) if raw_in else None,'cal_hit':bool(cc==r.esito12) if cal_in else None,
-            'p1_raw':rawp['1'],'px_raw':rawp['X'],'p2_raw':rawp['2'],
-            'p1_cal':cp['1'],'px_cal':cp['X'],'p2_cal':cp['2'],'esito':r.esito12
-        })
-
-        # O/U 2.5: isotonic sull'Over, Under = 1-Over.
-        cal_ou_model=_v5_fit_iso_binary(prior_ou_p,prior_ou_y)
-        rawou={'Over':float(r.po),'Under':float(r.pu)}
-        if cal_ou_model is not None:
-            pco=min(max(float(cal_ou_model.predict([r.po])[0]),0.001),0.999)
-            cou={'Over':pco,'Under':1-pco}
-        else:
-            cou=rawou.copy()
-        ro=max(rawou,key=rawou.get); co=max(cou,key=cou.get)
-        oq={'Over':float(r.qo),'Under':float(r.qu)}
-        rev=rawou[ro]*oq[ro]-1.0; cev=cou[co]*oq[co]-1.0
-        rin=rev>=soglia_ev; cin=cev>=soglia_ev
-        rp=(oq[ro]-1.0 if ro==r.esito_ou else -1.0) if rin else 0.0
-        cpv=(oq[co]-1.0 if co==r.esito_ou else -1.0) if cin else 0.0
-        rowsou.append({
-            'data':r.data,'raw_in':rin,'cal_in':cin,'raw_profit':rp,'cal_profit':cpv,
-            'raw_ev':rev,'cal_ev':cev,'raw_choice':ro,'cal_choice':co,
-            'quota_raw':oq[ro],'quota_cal':oq[co],
-            'raw_hit':bool(ro==r.esito_ou) if rin else None,'cal_hit':bool(co==r.esito_ou) if cin else None,
-            'po_raw':rawou['Over'],'pu_raw':rawou['Under'],
-            'po_cal':cou['Over'],'pu_cal':cou['Under'],'esito':r.esito_ou
-        })
-
-        prior12_p['1'].append(r.p1); prior12_y['1'].append(1 if r.esito12=='1' else 0)
-        prior12_p['X'].append(r.px); prior12_y['X'].append(1 if r.esito12=='X' else 0)
-        prior12_p['2'].append(r.p2); prior12_y['2'].append(1 if r.esito12=='2' else 0)
-        prior_ou_p.append(r.po); prior_ou_y.append(1 if r.esito_ou=='Over' else 0)
-    return {'1X2':pd.DataFrame(rows12),'O/U 2.5':pd.DataFrame(rowsou)}
-
-
-def _v10_metrics(df, merc, common_only=False):
-    """Metriche OOS descrittive RAW/CAL, inclusi Brier e Log Loss."""
-    if df is None or df.empty:
-        return None
-    d=df[df.raw_in & df.cal_in].copy() if common_only else df.copy()
-    if d.empty:
-        return None
-    if merc=='1X2':
-        ymap={'1':0,'X':1,'2':2}
-        y=np.array([ymap[x] for x in d.esito],dtype=int)
-        raw=np.column_stack([d.p1_raw,d.px_raw,d.p2_raw]).astype(float)
-        cal=np.column_stack([d.p1_cal,d.px_cal,d.p2_cal]).astype(float)
-        raw_brier=np.mean(np.sum((raw-np.eye(3)[y])**2,axis=1))
-        cal_brier=np.mean(np.sum((cal-np.eye(3)[y])**2,axis=1))
-        raw_ll=float(-np.mean(np.log(np.clip(raw[np.arange(len(y)),y],EPS_PROB,1-EPS_PROB))))
-        cal_ll=float(-np.mean(np.log(np.clip(cal[np.arange(len(y)),y],EPS_PROB,1-EPS_PROB))))
-        raw_acc=float(np.mean(np.argmax(raw,axis=1)==y)*100)
-        cal_acc=float(np.mean(np.argmax(cal,axis=1)==y)*100)
-    else:
-        y=np.array([1 if x=='Over' else 0 for x in d.esito],dtype=int)
-        raw=np.asarray(d.po_raw,dtype=float); cal=np.asarray(d.po_cal,dtype=float)
-        raw_brier=float(np.mean((raw-y)**2)); cal_brier=float(np.mean((cal-y)**2))
-        raw_ll=float(-np.mean(y*np.log(np.clip(raw,EPS_PROB,1-EPS_PROB))+(1-y)*np.log(np.clip(1-raw,EPS_PROB,1-EPS_PROB))))
-        cal_ll=float(-np.mean(y*np.log(np.clip(cal,EPS_PROB,1-EPS_PROB))+(1-y)*np.log(np.clip(1-cal,EPS_PROB,1-EPS_PROB))))
-        raw_acc=float(np.mean((raw>=0.5)==(y==1))*100); cal_acc=float(np.mean((cal>=0.5)==(y==1))*100)
-    return {'n':len(d),'raw_acc':raw_acc,'cal_acc':cal_acc,'delta_acc_pp':cal_acc-raw_acc,
-            'raw_brier':raw_brier,'cal_brier':cal_brier,'delta_brier':cal_brier-raw_brier,
-            'raw_logloss':raw_ll,'cal_logloss':cal_ll,'delta_logloss':cal_ll-raw_ll}
-
-
-def _v10_bootstrap_stratified(dfs, merc, n_boot=3000, common_only=False, seed=42):
-    """Bootstrap stratificato per campionato. Ogni replica ricampiona dentro ogni lega e poi aggrega."""
-    valid=[]
-    for camp,df in dfs.items():
-        if df is None or df.empty: continue
-        d=df[df.raw_in & df.cal_in].copy() if common_only else df.copy()
-        if not d.empty: valid.append((camp,d.reset_index(drop=True)))
-    if not valid: return None
-    rng=np.random.default_rng(seed)
-    deltas=[]; raw_rois=[]; cal_rois=[]; db=[]; dll=[]
-    # Ogni lega mantiene il proprio peso in numero di opportunità osservate.
-    for _ in range(int(n_boot)):
-        total_raw_profit=total_cal_profit=0.0; total_raw_bets=total_cal_bets=0
-        braw=bcal=llraw=llcal=0.0; nprob=0
-        for camp,d in valid:
-            idx=rng.integers(0,len(d),size=len(d)); x=d.iloc[idx]
-            total_raw_profit += float(x.raw_profit.sum()); total_cal_profit += float(x.cal_profit.sum())
-            total_raw_bets += int(x.raw_in.sum()); total_cal_bets += int(x.cal_in.sum())
-            m=_v10_metrics(x,merc,False)
-            if m:
-                braw += m['raw_brier']*m['n']; bcal += m['cal_brier']*m['n']
-                llraw += m['raw_logloss']*m['n']; llcal += m['cal_logloss']*m['n']; nprob += m['n']
-        raw_roi=100*total_raw_profit/total_raw_bets if total_raw_bets else np.nan
-        cal_roi=100*total_cal_profit/total_cal_bets if total_cal_bets else np.nan
-        if np.isfinite(raw_roi) and np.isfinite(cal_roi):
-            raw_rois.append(raw_roi); cal_rois.append(cal_roi); deltas.append(cal_roi-raw_roi)
-        if nprob:
-            db.append(bcal/nprob-braw/nprob); dll.append(llcal/nprob-llraw/nprob)
-    def ci(a):
-        return (float(np.percentile(a,2.5)),float(np.percentile(a,97.5))) if a else (None,None)
-    lo,hi=ci(deltas); blo,bhi=ci(db); llo,lhi=ci(dll)
-    obs_raw_profit=sum(float(d.raw_profit.sum()) for _,d in valid); obs_cal_profit=sum(float(d.cal_profit.sum()) for _,d in valid)
-    obs_raw_bets=sum(int(d.raw_in.sum()) for _,d in valid); obs_cal_bets=sum(int(d.cal_in.sum()) for _,d in valid)
-    obs_raw_roi=100*obs_raw_profit/obs_raw_bets if obs_raw_bets else None
-    obs_cal_roi=100*obs_cal_profit/obs_cal_bets if obs_cal_bets else None
-    def p2(a):
-        if not a: return None
-        return float(min(1,2*min(np.mean(np.asarray(a)<=0),np.mean(np.asarray(a)>=0))))
-    return {'leagues':len(valid),'n':sum(len(d) for _,d in valid),'raw_bets':obs_raw_bets,'cal_bets':obs_cal_bets,
-            'raw_profit':obs_raw_profit,'cal_profit':obs_cal_profit,'raw_roi':obs_raw_roi,'cal_roi':obs_cal_roi,
-            'delta_roi_pp':obs_cal_roi-obs_raw_roi if obs_raw_roi is not None and obs_cal_roi is not None else None,
-            'roi_lo':lo,'roi_hi':hi,'roi_p':p2(deltas),
-            'brier_delta':float(np.mean([_v10_metrics(d,merc,False)['delta_brier']*len(d) for _,d in valid])/sum(len(d) for _,d in valid)),
-            'brier_lo':blo,'brier_hi':bhi,'brier_p':p2(db),
-            'logloss_delta':float(np.mean([_v10_metrics(d,merc,False)['delta_logloss']*len(d) for _,d in valid])/sum(len(d) for _,d in valid)),
-            'logloss_lo':llo,'logloss_hi':lhi,'logloss_p':p2(dll)}
-
-
-def _v10_build_all(n_boot=3000,warmup=100):
-    per=[]; errors=[]; dfs12={}; dfsou={}
-    for camp,info in CAMPIONATI_DOMESTICI.items():
-        try:
-            dati=carica_dati_campionato(info['id_fd'])
-            paired=_v10_build_paired(dati,rho_val,ewma_span_val,emivita_val,0.10,warmup)
-            if paired is None: raise ValueError('dati OOS vuoti')
-            dfs12[camp]=paired['1X2']; dfsou[camp]=paired['O/U 2.5']
-            for merc,df in paired.items():
-                for common in [False,True]:
-                    m=_v10_metrics(df,merc,common)
-                    if m:
-                        per.append({'campionato':camp,'mercato':merc,'universo':'COMMON BETS' if common else 'ALL OOS',**m})
-        except Exception as e:
-            errors.append((camp,f'{type(e).__name__}: {e}'))
-    agg=[]
-    for merc,dfs in [('1X2',dfs12),('O/U 2.5',dfsou)]:
-        for common in [False,True]:
-            b=_v10_bootstrap_stratified(dfs,merc,n_boot,common,42 if merc=='1X2' else 43)
-            if b:
-                agg.append({'mercato':merc,'universo':'COMMON BETS' if common else 'ALL OOS',**b})
-    return pd.DataFrame(per),pd.DataFrame(agg),errors
-
-
-def mostra_v10_validation():
-    st.divider(); st.markdown('## 🧪 V10 — AGGREGATO 5 LEGHE: PAIRED + QUALITÀ PROBABILISTICA')
-    st.caption('V10 consolida le 5 leghe con bootstrap stratificato per campionato. Separa 1X2 e O/U 2.5, ALL OOS e COMMON BETS, e confronta anche Accuracy, Brier e Log Loss OOS.')
-    c1,c2=st.columns(2)
-    with c1: nb=st.number_input('Bootstrap V10',500,10000,3000,500,key='v10_boot')
-    with c2: wu=st.number_input('Warm-up V10',50,300,100,10,key='v10_warm')
-    st.info('Interpretazione: ROI/Profit misurano l’effetto economico storico; Brier e Log Loss misurano la qualità delle probabilità. Per Brier e Log Loss più basso è migliore. Gli IC bootstrap sono stratificati per lega e il p-value è descrittivo.')
-    if st.button('🧪 ESEGUI V10 — AGGREGATO 5 LEGHE',key='v10_run'):
-        try:
-            with st.spinner('V10 in esecuzione: una passata per ciascuna delle 5 leghe...'):
-                per,agg,errors=_v10_build_all(int(nb),int(wu))
-            if not per.empty:
-                st.markdown('### 1. Metriche OOS per lega')
-                cols=['campionato','mercato','universo','n','raw_acc','cal_acc','delta_acc_pp','raw_brier','cal_brier','delta_brier','raw_logloss','cal_logloss','delta_logloss']
-                st.dataframe(per[cols],use_container_width=True,hide_index=True)
-                st.download_button('⬇️ Scarica V10 metriche per lega',data=per.to_csv(index=False).encode('utf-8'),file_name='V10_metriche_per_lega.csv',mime='text/csv',key='v10_dl1')
-            if not agg.empty:
-                st.markdown('### 2. Aggregato 5 leghe — bootstrap stratificato')
-                cols=['mercato','universo','leagues','n','raw_bets','cal_bets','raw_profit','cal_profit','raw_roi','cal_roi','delta_roi_pp','roi_lo','roi_hi','roi_p','brier_delta','brier_lo','brier_hi','brier_p','logloss_delta','logloss_lo','logloss_hi','logloss_p']
-                st.dataframe(agg[cols],use_container_width=True,hide_index=True)
-                st.download_button('⬇️ Scarica V10 aggregato',data=agg.to_csv(index=False).encode('utf-8'),file_name='V10_aggregato_stratificato.csv',mime='text/csv',key='v10_dl2')
-                st.markdown('### 3. Regola di lettura')
-                st.write('Per ROI, Brier e Log Loss guarda il delta **CAL − RAW** insieme all’IC95%. Per ROI un delta positivo favorisce CAL; per Brier/Log Loss un delta negativo indica probabilità migliori. Un IC che attraversa 0 non separa nettamente le versioni nel campione.')
-            if errors:
-                st.error('Campionati non completati:')
-                for nome,msg in errors: st.write(f'- **{nome}**: {msg}')
-        except Exception as e:
-            st.error(f'Errore V10: {type(e).__name__}: {e}')
-
-try:
-    mostra_v10_validation()
-except Exception as _v10_err:
-    st.error(f"V10 non disponibile: {type(_v10_err).__name__}: {_v10_err}")
-
-# =====================================================================
-# V11 — DIAGNOSTICA DI CALIBRAZIONE OOS PER FASCE DI PROBABILITÀ
-# =====================================================================
-def _v11_build_paired(dati_completi, rho, ewma_span, emivita, soglia_ev=0.10, warmup=100):
-    """V11: come V10, ma mantiene anche le probabilità della scelta RAW/CAL
-    per costruire reliability tables OOS per fasce di confidenza."""
-    hist = _v5_raw_history(dati_completi, rho, ewma_span, emivita)
-    if hist.empty:
-        return None
-    rows12=[]; rowsou=[]
-    prior12_p={'1':[], 'X':[], '2':[]}; prior12_y={'1':[], 'X':[], '2':[]}
-    prior_ou_p=[]; prior_ou_y=[]
-    for j,r in hist.iterrows():
-        if j < warmup:
-            prior12_p['1'].append(r.p1); prior12_y['1'].append(1 if r.esito12=='1' else 0)
-            prior12_p['X'].append(r.px); prior12_y['X'].append(1 if r.esito12=='X' else 0)
-            prior12_p['2'].append(r.p2); prior12_y['2'].append(1 if r.esito12=='2' else 0)
-            prior_ou_p.append(r.po); prior_ou_y.append(1 if r.esito_ou=='Over' else 0)
-            continue
-
-        cal12_models={s:_v5_fit_iso_binary(prior12_p[s],prior12_y[s]) for s in ['1','X','2']}
-        rawp={'1':float(r.p1),'X':float(r.px),'2':float(r.p2)}
-        if all(cal12_models[s] is not None for s in ['1','X','2']):
-            cp={s:float(cal12_models[s].predict([rawp[s]])[0]) for s in ['1','X','2']}
-            tot=sum(cp.values()); cp={s:v/tot for s,v in cp.items()} if tot>0 else rawp.copy()
-        else:
-            cp=rawp.copy()
-        rc=max(rawp,key=rawp.get); cc=max(cp,key=cp.get)
-        rq={'1':float(r.q1),'X':float(r.qx),'2':float(r.q2)}
-        raw_ev=rawp[rc]*rq[rc]-1.0; cal_ev=cp[cc]*rq[cc]-1.0
-        raw_in=raw_ev>=soglia_ev; cal_in=cal_ev>=soglia_ev
-        raw_prof=(rq[rc]-1.0 if rc==r.esito12 else -1.0) if raw_in else 0.0
-        cal_prof=(rq[cc]-1.0 if cc==r.esito12 else -1.0) if cal_in else 0.0
-        rows12.append({
-            'data':r.data,'raw_in':raw_in,'cal_in':cal_in,'raw_profit':raw_prof,'cal_profit':cal_prof,
-            'raw_ev':raw_ev,'cal_ev':cal_ev,'raw_choice':rc,'cal_choice':cc,
-            'quota_raw':rq[rc],'quota_cal':rq[cc],
-            'raw_hit':bool(rc==r.esito12),'cal_hit':bool(cc==r.esito12),
-            'raw_conf':rawp[rc],'cal_conf':cp[cc],
-            'p1_raw':rawp['1'],'px_raw':rawp['X'],'p2_raw':rawp['2'],
-            'p1_cal':cp['1'],'px_cal':cp['X'],'p2_cal':cp['2'],'esito':r.esito12
-        })
-
-        cal_ou_model=_v5_fit_iso_binary(prior_ou_p,prior_ou_y)
-        rawou={'Over':float(r.po),'Under':float(r.pu)}
-        if cal_ou_model is not None:
-            pco=min(max(float(cal_ou_model.predict([r.po])[0]),0.001),0.999)
-            cou={'Over':pco,'Under':1-pco}
-        else:
-            cou=rawou.copy()
-        ro=max(rawou,key=rawou.get); co=max(cou,key=cou.get)
-        oq={'Over':float(r.qo),'Under':float(r.qu)}
-        rev=rawou[ro]*oq[ro]-1.0; cev=cou[co]*oq[co]-1.0
-        rin=rev>=soglia_ev; cin=cev>=soglia_ev
-        rp=(oq[ro]-1.0 if ro==r.esito_ou else -1.0) if rin else 0.0
-        cpv=(oq[co]-1.0 if co==r.esito_ou else -1.0) if cin else 0.0
-        rowsou.append({
-            'data':r.data,'raw_in':rin,'cal_in':cin,'raw_profit':rp,'cal_profit':cpv,
-            'raw_ev':rev,'cal_ev':cev,'raw_choice':ro,'cal_choice':co,
-            'quota_raw':oq[ro],'quota_cal':oq[co],
-            'raw_hit':bool(ro==r.esito_ou),'cal_hit':bool(co==r.esito_ou),
-            'raw_conf':rawou[ro],'cal_conf':cou[co],
-            'po_raw':rawou['Over'],'pu_raw':rawou['Under'],
-            'po_cal':cou['Over'],'pu_cal':cou['Under'],'esito':r.esito_ou
-        })
-
-        prior12_p['1'].append(r.p1); prior12_y['1'].append(1 if r.esito12=='1' else 0)
-        prior12_p['X'].append(r.px); prior12_y['X'].append(1 if r.esito12=='X' else 0)
-        prior12_p['2'].append(r.p2); prior12_y['2'].append(1 if r.esito12=='2' else 0)
-        prior_ou_p.append(r.po); prior_ou_y.append(1 if r.esito_ou=='Over' else 0)
-    return {'1X2':pd.DataFrame(rows12),'O/U 2.5':pd.DataFrame(rowsou)}
-
-
-def _v11_band_table(df, merc, common_only=False):
-    if df is None or df.empty:
-        return pd.DataFrame()
-    d=df[df.raw_in & df.cal_in].copy() if common_only else df.copy()
-    if d.empty:
-        return pd.DataFrame()
-    bins=[0.0,0.40,0.50,0.60,0.70,0.80,1.0000001]
-    labels=['0-40%','40-50%','50-60%','60-70%','70-80%','80-100%']
-    out=[]
-    for ver in ['raw','cal']:
-        conf=np.asarray(d[f'{ver}_conf'],dtype=float)
-        hit=np.asarray(d[f'{ver}_hit'],dtype=bool)
-        idx=np.digitize(conf,bins[1:-1],right=False)
-        for k,label in enumerate(labels):
-            mask=idx==k
-            n=int(mask.sum())
-            if not n: continue
-            p=conf[mask]; h=hit[mask]
-            profit=np.asarray(d.loc[mask,'{}_profit'.format(ver)],dtype=float)
-            bets=np.asarray(d.loc[mask,'{}_in'.format(ver)],dtype=bool)
-            nb=int(bets.sum())
-            out.append({
-                'version':ver.upper(),'fascia':label,'n_opportunita':n,
-                'prob_media':float(p.mean()),'frequenza_reale':float(h.mean()*100),
-                'errore_cal_pp':float(h.mean()*100-p.mean()*100),
-                'accuracy_pct':float(h.mean()*100),
-                'bets_ev10':nb,
-                'roi_ev10_pct':float(100*profit.sum()/nb) if nb else np.nan,
-                'profit_ev10_u':float(profit.sum())
-            })
-    return pd.DataFrame(out)
-
-
-def _v11_aggregate_band_tables(dfs, merc, common_only=False):
-    frames=[]
-    for camp,df in dfs.items():
-        t=_v11_band_table(df,merc,common_only)
-        if not t.empty:
-            t.insert(0,'campionato',camp); frames.append(t)
-    return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
-
-
-def _v11_build_all(warmup=100):
-    per=[]; dfs12={}; dfsou={}; errors=[]
-    for camp,info in CAMPIONATI_DOMESTICI.items():
-        try:
-            dati=carica_dati_campionato(info['id_fd'])
-            paired=_v11_build_paired(dati,rho_val,ewma_span_val,emivita_val,0.10,warmup)
-            if paired is None: raise ValueError('dati OOS vuoti')
-            dfs12[camp]=paired['1X2']; dfsou[camp]=paired['O/U 2.5']
-            for merc,df in paired.items():
-                for common in [False,True]:
-                    t=_v11_band_table(df,merc,common)
-                    if not t.empty:
-                        t.insert(0,'campionato',camp); t.insert(1,'mercato',merc); t.insert(2,'universo','COMMON BETS' if common else 'ALL OOS'); per.append(t)
-        except Exception as e:
-            errors.append((camp,f'{type(e).__name__}: {e}'))
-    return pd.concat(per,ignore_index=True) if per else pd.DataFrame(), dfs12, dfsou, errors
-
-
-def mostra_v11_validation():
-    st.divider(); st.markdown('## 🔬 V11 — DIAGNOSTICA CALIBRAZIONE OOS PER FASCE')
-    st.caption('V11 verifica se RAW e CAL sono calibrati per fasce di confidenza OOS. Per 1X2 usa la probabilità della scelta più probabile; per O/U usa la probabilità della scelta Over/Under più probabile. Include hit-rate reale, errore di calibrazione e ROI sulle sole selezioni EV≥10%.')
-    c1=st.columns(1)[0]
-    wu=st.number_input('Warm-up V11',50,300,100,10,key='v11_warm')
-    st.info('Interpretazione: errore_cal_pp = frequenza reale − probabilità media. Valore vicino a 0 indica migliore calibrazione. Valore negativo indica overconfidence; positivo indica underconfidence. ROI è separato dalla qualità probabilistica.')
-    if st.button('🔬 ESEGUI V11 — DIAGNOSTICA 5 LEGHE',key='v11_run'):
-        try:
-            with st.spinner('V11 in esecuzione: una passata per ciascuna delle 5 leghe...'):
-                per,dfs12,dfsou,errors=_v11_build_all(int(wu))
-            for merc,dfs in [('1X2',dfs12),('O/U 2.5',dfsou)]:
-                for common in [False,True]:
-                    titolo=f'{merc} — {"COMMON BETS" if common else "ALL OOS"}'
-                    st.markdown(f'### {titolo}')
-                    agg=_v11_aggregate_band_tables(dfs,merc,common)
-                    if not agg.empty:
-                        st.dataframe(agg,use_container_width=True,hide_index=True)
-                        st.download_button(f'⬇️ Scarica V11 {merc} {"COMMON" if common else "ALL"}',data=agg.to_csv(index=False).encode('utf-8'),file_name=f'V11_{merc.replace("/","_")}_{"COMMON" if common else "ALL"}.csv',mime='text/csv',key=f'v11_dl_{merc}_{common}')
-            if not per.empty:
-                st.markdown('### Tabella completa per lega')
-                st.dataframe(per,use_container_width=True,hide_index=True)
-                st.download_button('⬇️ Scarica V11 completo',data=per.to_csv(index=False).encode('utf-8'),file_name='V11_diagnostica_calibrazione.csv',mime='text/csv',key='v11_dl_all')
-            if errors:
-                st.error('Campionati non completati:')
-                for nome,msg in errors: st.write(f'- **{nome}**: {msg}')
-        except Exception as e:
-            st.error(f'Errore V11: {type(e).__name__}: {e}')
-
-if mostra_diagnostica_v11:
+# --- DESIGN MODERNO AVANZATO (CUSTOM CSS & GLASSMORPHISM) ---
+str_lit.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
+
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    
+    .stApp {
+        background-color: #0b0f19;
+        color: #f3f4f6;
+    }
+    
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+        max-width: 1250px;
+    }
+
+    [data-testid="stSidebar"] {
+        background-color: #111827;
+        border-right: 1px solid #1f2937;
+    }
+
+    .stButton>button {
+        background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
+        color: white;
+        border: none;
+        border-radius: 10px;
+        font-weight: 600;
+        padding: 0.5rem 1rem;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+    }
+    .stButton>button:hover {
+        background: linear-gradient(135deg, #2563eb 0%, #1e40af 100%);
+        box-shadow: 0 6px 16px rgba(59, 130, 246, 0.5);
+        transform: translateY(-1px);
+    }
+
+    [data-testid="stMetric"] {
+        background-color: #111827;
+        border: 1px solid #1f2937;
+        padding: 15px;
+        border-radius: 12px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    }
+    [data-testid="stMetricValue"] {
+        color: #38bdf8 !important;
+        font-weight: 700 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Header principale
+str_lit.markdown(
+    """
+    <div style="background: linear-gradient(135deg, #1e1b4b 0%, #0f172a 100%); padding: 25px; border-radius: 20px; border: 1px solid #312e81; text-align: center; margin-bottom: 20px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.4);">
+        <h1 style="color: #f8fafc; font-weight: 800; font-size: 2.0rem; margin: 0; letter-spacing: -0.5px;">⚽ COMBO MASTER PRO AI</h1>
+        <p style="color: #94a3b8; font-size: 0.95rem; margin-top: 8px;">Suite predittiva avanzata con Poisson, Monte Carlo e Value Analytics</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+LEAGUES = {
+    "Serie A (Italia)": ("SA", "football-data"),
+    "Premier League (Inghilterra)": ("PL", "football-data"),
+    "La Liga (Spagna)": ("PD", "football-data"),
+    "Bundesliga (Germania)": ("BL1", "football-data"),
+    "Ligue 1 (Francia)": ("FL1", "football-data"),
+    "Eredivisie (Olanda)": ("DED", "football-data"),
+    "Champions League": ("CL", "football-data"),
+}
+
+# --- SELETTORE PRINCIPALE IN EVIDENZA (OTTIMIZZATO ANCHE PER MOBILE) ---
+str_lit.markdown("### 🏆 Seleziona Campionato (Mobile & Desktop)")
+campionato_scelto = str_lit.selectbox("Scegli il torneo da analizzare", list(LEAGUES.keys()), label_visibility="collapsed")
+selezionati_dict = {campionato_scelto: LEAGUES[campionato_scelto]}
+
+str_lit.sidebar.markdown("### ⚙ Configurazione API")
+api_key = str_lit.sidebar.text_input("🔑 API Key (football-data.org)", value="", type="password")
+str_lit.sidebar.markdown("---")
+str_lit.sidebar.info("💡 Suggerimento: Da cellulare puoi cambiare campionato direttamente dal menu a tendina in alto nella pagina principale.")
+
+tab_calendario, tab_classifica, tab_value, tab_grafici, tab_ai_schedine, tab_value_finder, tab_monte_carlo, tab_audit = str_lit.tabs([
+    "📅 Calendario",
+    "🏆 Classifica",
+    "🔍 Value Bet",
+    "📊 Grafici",
+    "🤖 Schedine AI",
+    "⚡ Value Finder",
+    "🎲 Monte Carlo",
+    "🛡️ Audit"
+])
+
+# --- FUNZIONI DI SUPPORTO & MODELLAZIONE ---
+@str_lit.cache_data(ttl=3600)
+def scarica_dati_club(chiave, league_code):
+    if not chiave: return None
+    url = f"https://api.football-data.org/v4/competitions/{league_code}/matches"
+    headers = {"X-Auth-Token": chiave}
     try:
-        mostra_v11_validation()
-    except Exception as _v11_err:
-        st.error(f"V11 non disponibile: {type(_v11_err).__name__}: {_v11_err}")
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200: return res.json()
+    except Exception: pass
+    return None
 
+@str_lit.cache_data(ttl=3600)
+def scarica_classifica_club(chiave, league_code):
+    if not chiave: return None
+    url = f"https://api.football-data.org/v4/competitions/{league_code}/standings"
+    headers = {"X-Auth-Token": chiave}
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200: return res.json()
+    except Exception: pass
+    return None
 
-# =====================================================================
-# 🧪 V14 — AUDIT VALUE + COMBO
-# Diagnostica separata: NON modifica il motore operativo V11/V13.
-# 1) Value O/U 2.5: confronta RAW vs PLATT+guardia usando prezzo medio
-#    grezzo dei bookmaker e probabilita mercato normalizzata bookmaker-per-bookmaker.
-# 2) Combo: valuta le 12 probabilita congiunte direttamente dalla griglia
-#    di punteggio, senza moltiplicare probabilita come se fossero indipendenti.
-#    Nessuna calibrazione per-combo salvata viene usata in questo audit.
-# =====================================================================
-
-def _v14_build_ou_hist(dati, rho, ewma_span, emivita):
-    if dati is None or dati.empty or 'FTHG' not in dati.columns or 'FTAG' not in dati.columns:
-        return []
-    tutte = dati[dati['FTHG'].notna() & dati['FTAG'].notna()].reset_index(drop=True)
-    hist = []
-    for i in range(15, len(tutte)):
-        partita = tutte.iloc[i]
-        try:
-            m = calcola_modello_completo(
-                tutte.iloc[:i], partita['HomeTeam'], partita['AwayTeam'],
-                rho, ewma_span, emivita, pd.DataFrame(),
-                data_riferimento=partita.get('Date_parsed')
-            )
-            if m is None or 'prob_under' not in m or 2.5 not in m['prob_under']:
-                continue
-            p_over = float(np.clip(1.0 - float(m['prob_under'][2.5]) / 100.0, 0.001, 0.999))
-            hist.append({
-                'i': i,
-                'data': partita.get('Date_parsed'),
-                'home': partita['HomeTeam'],
-                'away': partita['AwayTeam'],
-                'p_raw': p_over,
-                'y_over': int(float(partita['FTHG']) + float(partita['FTAG']) > 2.5),
-                'row': partita,
-            })
-        except Exception:
-            continue
-    return hist
-
-
-def _v14_stats(bets):
-    if not bets:
-        return {'bets': 0, 'wins': 0, 'strike': np.nan, 'profit': 0.0, 'roi': np.nan,
-                'avg_ev': np.nan, 'avg_edge_pp': np.nan, 'avg_odds': np.nan}
-    n = len(bets)
-    wins = sum(int(b['win']) for b in bets)
-    profit = sum(float(b['profit']) for b in bets)
-    return {
-        'bets': n,
-        'wins': wins,
-        'strike': 100.0 * wins / n,
-        'profit': profit,
-        'roi': 100.0 * profit / n,
-        'avg_ev': 100.0 * float(np.mean([b['ev'] for b in bets])),
-        'avg_edge_pp': 100.0 * float(np.mean([b['edge'] for b in bets])),
-        'avg_odds': float(np.mean([b['quota_media_book'] for b in bets])),
+@str_lit.cache_data(ttl=21600, show_spinner=False)
+def carica_storico_audit_gratuito():
+    """Carica risultati e statistiche reali gratuite per l'Audit.
+    I campi statistici sono conservati separatamente dai dati operativi.
+    Valori mancanti restano None: non vengono mai trasformati in zero.
+    """
+    leghe_csv = {
+        "Serie A (Italia)": "I1",
+        "Premier League (Inghilterra)": "E0",
+        "La Liga (Spagna)": "SP1",
+        "Bundesliga (Germania)": "D1",
+        "Ligue 1 (Francia)": "F1",
+        "Eredivisie (Olanda)": "N1",
     }
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def _v14_value_leg(id_fd, rho, ewma_span, emivita, n_train=100, solo_corrente=False):
-    dati = carica_dati_campionato(id_fd)
-    hist = _v14_build_ou_hist(dati, rho, ewma_span, emivita)
-    if len(hist) <= n_train:
-        return None, pd.DataFrame()
-    tutte = dati[dati['FTHG'].notna() & dati['FTAG'].notna()].reset_index(drop=True)
-    cols_over, cols_under = classifica_colonne_over_under(tutte.columns, '2.5')
-    if not cols_over or not cols_under:
-        return None, pd.DataFrame()
-
-    test = [(j, hist[j]) for j in range(n_train, len(hist))]
-    if solo_corrente:
-        test = [(j, h) for j, h in test if str(h['row'].get('Stagione','')) == 'corrente']
-
-    details = []
-    applied = excluded = 0
-    for j, h in test:
-        if j < n_train:
-            continue
-        train_df = pd.DataFrame([{'p_raw': x['p_raw'], 'y_over': x['y_over']}
-                                 for x in hist[j-n_train:j]])
-        cal, coef, reason = _v13_fit_platt_ou(train_df)
-        p_raw = h['p_raw']
-        if cal is not None:
-            p_platt = _v13_predict_platt_ou(p_raw, cal)
-            applied += 1
-        else:
-            p_platt = p_raw
-            excluded += 1
-
-        qfair = _audit_quote_ou(h['row'], cols_over, cols_under)
-        qraw = quote_medie_grezze_ou(h['row'], cols_over, cols_under)
-        if qfair is None or qraw is None:
-            continue
-
-        p_market = qfair['p_market_norm_media_bookmaker']
-        for strategy, p_over in [('RAW', p_raw), ('PLATT', p_platt)]:
-            probs = {'Over': p_over, 'Under': 1.0 - p_over}
-            scelta = max(probs, key=probs.get)
-            p_sel = float(probs[scelta])
-            odds = float(qraw[scelta])
-            ev = p_sel * odds - 1.0
-            edge = p_sel - float(p_market[scelta])
-            esito = 'Over' if h['y_over'] else 'Under'
-            details.append({
-                'Campionato': next((k for k,v in CAMPIONATI_DOMESTICI.items() if v['id_fd']==id_fd), id_fd),
-                'data': h['data'], 'casa': h['home'], 'trasferta': h['away'],
-                'strategy': strategy, 'scelta': scelta, 'prob': p_sel,
-                'prob_over_raw': p_raw, 'prob_over_platt': p_platt,
-                'quota_media_book': odds, 'p_market_fair': float(p_market[scelta]),
-                'edge': edge, 'ev': ev, 'esito': esito,
-                'win': scelta == esito, 'profit': odds - 1.0 if scelta == esito else -1.0,
-                'platt_applied': bool(cal is not None), 'coef': coef if cal is not None else np.nan,
-                'platt_reason': reason,
-            })
-
-    detail = pd.DataFrame(details)
-    if detail.empty:
-        return None, detail
-    rows = []
-    for soglia_pct in [0, 5, 10]:
-        thr = soglia_pct / 100.0
-        for strategy in ['RAW', 'PLATT']:
-            d = detail[(detail['strategy'] == strategy) & (detail['ev'] >= thr)].copy()
-            s = _v14_stats(d.to_dict('records'))
-            rows.append({
-                'Campionato': next((k for k,v in CAMPIONATI_DOMESTICI.items() if v['id_fd']==id_fd), id_fd),
-                'EV minimo %': soglia_pct, 'Strategia': strategy,
-                'Bet': s['bets'], 'Strike %': s['strike'], 'Profit': s['profit'], 'ROI %': s['roi'],
-                'EV medio %': s['avg_ev'], 'Edge medio pp': s['avg_edge_pp'], 'Quota media': s['avg_odds'],
-            })
-    summary = pd.DataFrame(rows)
-    meta = {
-        'test_opportunities': len(test),
-        'quoted_opportunities': int(detail[['data','casa','trasferta']].drop_duplicates().shape[0] / 2),
-        'platt_applied_n': applied,
-        'platt_excluded_n': excluded,
-        'platt_applied_pct': 100.0 * applied / max(1, len(test)),
+    metriche = {
+        "Tiri casa": "HS", "Tiri trasferta": "AS",
+        "Tiri in porta casa": "HST", "Tiri in porta trasferta": "AST",
+        "Angoli casa": "HC", "Angoli trasferta": "AC",
+        "Falli casa": "HF", "Falli trasferta": "AF",
+        "Ammonizioni casa": "HY", "Ammonizioni trasferta": "AY",
+        "Espulsioni casa": "HR", "Espulsioni trasferta": "AR",
     }
-    return {'summary': summary, 'meta': meta}, detail
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def _v14_combo_leg(id_fd, rho, ewma_span, emivita, solo_corrente=False):
-    dati = carica_dati_campionato(id_fd)
-    if dati is None or dati.empty:
-        return None
-    tutte = dati[dati['FTHG'].notna() & dati['FTAG'].notna()].reset_index(drop=True)
-    rows = []
-    for i in range(15, len(tutte)):
-        partita = tutte.iloc[i]
-        if solo_corrente and str(partita.get('Stagione','')) != 'corrente':
-            continue
-        try:
-            m = calcola_modello_completo(
-                tutte.iloc[:i], partita['HomeTeam'], partita['AwayTeam'],
-                rho, ewma_span, emivita, pd.DataFrame(),
-                data_riferimento=partita.get('Date_parsed')
-            )
-            if m is None or 'griglia' not in m:
-                continue
-            probs = {}
-            for s in ['1','X','2']:
-                for g in ['Goal','NoGoal']:
-                    for t in ['Over','Under']:
-                        key = f'{s}_{g}_{t}'
-                        probs[key] = float(calcola_combo_libera(
-                            m['griglia'], segno=s, soglia_gol=2.5, tipo_soglia=t, gol_nogol=g
-                        ) / 100.0)
-            esito = '1' if float(partita['FTHG']) > float(partita['FTAG']) else ('2' if float(partita['FTHG']) < float(partita['FTAG']) else 'X')
-            gg = 'Goal' if float(partita['FTHG']) > 0 and float(partita['FTAG']) > 0 else 'NoGoal'
-            tt = 'Over' if float(partita['FTHG']) + float(partita['FTAG']) > 2.5 else 'Under'
-            true_key = f'{esito}_{gg}_{tt}'
-            if true_key not in probs:
-                continue
-            order = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
-            top1_key, top1_p = order[0]
-            top2_p = float(order[1][1]) if len(order) > 1 else np.nan
-            top4_keys = {k for k,_ in order[:4]}
-            # Le 12 classi sono mutuamente esclusive ed esaustive.
-            brier = sum((p - (1.0 if k == true_key else 0.0))**2 for k,p in probs.items())
-            logloss = -np.log(np.clip(probs[true_key], 1e-9, 1.0))
-            rows.append({
-                'data': partita.get('Date_parsed'),
-                'casa': partita['HomeTeam'], 'trasferta': partita['AwayTeam'],
-                'true_combo': true_key, 'top1_combo': top1_key,
-                'top1_prob': top1_p, 'top2_prob': top2_p,
-                'top1_hit': top1_key == true_key,
-                'top4_hit': true_key in top4_keys,
-                'brier': brier, 'logloss': logloss,
-                'true_combo_prob': float(probs[true_key]),
-                **{f'prob_{k}': float(v) for k, v in probs.items()},
-            })
-        except Exception:
-            continue
-    if not rows:
-        return None, pd.DataFrame()
-    d = pd.DataFrame(rows)
-    summary = {
-        'test_n': len(d),
-        'top1_accuracy_pct': 100.0 * d['top1_hit'].mean(),
-        'top4_hit_rate_pct': 100.0 * d['top4_hit'].mean(),
-        'mean_top1_prob_pct': 100.0 * d['top1_prob'].mean(),
-        'brier_12class': float(d['brier'].mean()),
-        'logloss_12class': float(d['logloss'].mean()),
+    # Quote storiche effettivamente presenti nei CSV gratuiti.
+    # Non vengono create quote sintetiche né sostituite celle mancanti.
+    colonne_quote = {
+        "Avg_1": "AVGH", "Avg_X": "AVGD", "Avg_2": "AVGA",
+        "B365_1": "B365H", "B365_X": "B365D", "B365_2": "B365A",
+        "Avg_Over25": "AVG>2.5", "Avg_Under25": "AVG<2.5",
+        "B365_Over25": "B365>2.5", "B365_Under25": "B365<2.5",
     }
-    return summary, d
+    anno_corrente = datetime.now().year
+    anno_inizio = anno_corrente if datetime.now().month >= 8 else anno_corrente - 1
+    stagioni = [f"{str(y)[-2:]}{str(y + 1)[-2:]}" for y in range(anno_inizio, anno_inizio - 3, -1)]
+    risultati, diagnostica, copertura = [], [], []
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; COMBO-Audit/20.0)"}
 
+    for nome_lega, codice in leghe_csv.items():
+        righe_lega, errori = 0, []
+        for stagione in stagioni:
+            url = f"https://football-data.co.uk/mmz4281/{stagione}/{codice}.csv"
+            try:
+                response = requests.get(url, headers=headers, timeout=20)
+                if response.status_code != 200 or not response.content:
+                    errori.append(f"{stagione}: HTTP {response.status_code}")
+                    continue
+                from io import BytesIO
+                df = pd.read_csv(BytesIO(response.content), encoding="latin1", on_bad_lines="skip")
+                colonne = {str(c).strip().upper(): c for c in df.columns}
+                richieste = ["DATE", "HOMETEAM", "AWAYTEAM", "FTHG", "FTAG"]
+                if not all(c in colonne for c in richieste):
+                    errori.append(f"{stagione}: colonne risultati mancanti")
+                    continue
 
-def mostra_v14_value_combo_audit():
-    st.divider()
-    st.markdown('## 🧪 V14 — AUDIT VALUE + COMBO')
-    st.caption('Diagnostica separata dall’operativa. Il Value usa probabilità RAW/PLATT e prezzi medi bookmaker; le Combo usano direttamente la griglia congiunta delle 12 classi, senza calibrazione per-combo salvata.')
-    with st.expander('Apri V14 — Value + Combo Audit', expanded=False):
-        c1,c2,c3 = st.columns(3)
-        with c1:
-            periodo = st.selectbox('Periodo V14', ['Tutto lo storico','Stagione corrente OOS'], key='v14_periodo')
-        with c2:
-            ntrain = st.number_input('Training PLATT V14', 50, 200, 100, 10, key='v14_train')
-        with c3:
-            solo_corrente = periodo == 'Stagione corrente OOS'
-            st.write('')
-            st.caption('Soglie Value: 0%, 5%, 10%')
-
-        if st.button('🔬 ESEGUI V14 — VALUE + COMBO', key='v14_run'):
-            value_tables=[]; combo_tables=[]; value_details=[]; combo_details=[]; errors=[]
-            with st.spinner('V14 in esecuzione sulle 5 leghe...'):
-                for camp,info in CAMPIONATI_DOMESTICI.items():
+                valide_stagione = []
+                for _, r in df.iterrows():
+                    if pd.isna(r[colonne["FTHG"]]) or pd.isna(r[colonne["FTAG"]]) or pd.isna(r[colonne["DATE"]]):
+                        continue
                     try:
-                        v,dv = _v14_value_leg(info['id_fd'],rho_val,ewma_span_val,emivita_val,int(ntrain),solo_corrente)
-                        if v is not None:
-                            value_tables.append(v['summary'])
-                            if dv is not None and not dv.empty:
-                                value_details.append(dv)
-                        c,dc = _v14_combo_leg(info['id_fd'],rho_val,ewma_span_val,emivita_val,solo_corrente)
-                        if c is not None:
-                            combo_tables.append({'Campionato':camp,**c})
-                            if dc is not None and not dc.empty:
-                                combo_details.append(dc.assign(Campionato=camp))
-                    except Exception as e:
-                        errors.append((camp,f'{type(e).__name__}: {e}'))
-
-            if value_tables:
-                st.markdown('### 1. VALUE O/U 2.5 — risultati per lega')
-                vdf = pd.concat(value_tables, ignore_index=True)
-                st.dataframe(vdf.round(4), use_container_width=True, hide_index=True)
-                st.caption('EV usa la quota media grezza dei bookmaker presenti nel CSV. Edge medio = probabilità modello − probabilità di mercato fair normalizzata bookmaker-per-bookmaker.')
-                if value_details:
-                    vd = pd.concat(value_details, ignore_index=True)
-                    st.download_button('⬇️ Scarica V14 Value dettaglio CSV',data=vd.to_csv(index=False).encode('utf-8'),file_name='V14_value_ou25_dettaglio.csv',mime='text/csv',key='v14_value_dl')
-                    agg=[]
-                    for thr in [0,5,10]:
-                        d=vd[vd['ev'] >= thr/100.0].copy()
-                        # stesso universo comune per confronto RAW vs PLATT
-                        keys=['Campionato','data','casa','trasferta']
-                        cnt=d.groupby(keys)['strategy'].nunique()
-                        common_keys=cnt[cnt==2].index
-                        common=d.set_index(keys).loc[common_keys].reset_index() if len(common_keys) else pd.DataFrame()
-                        if not common.empty:
-                            w=common.pivot_table(index=keys,columns='strategy',values=['profit','win','ev','prob','scelta'],aggfunc='first')
-                            w.columns=[f'{a}_{b}' for a,b in w.columns]
-                            w=w.reset_index()
-                            delta=float((w['profit_PLATT']-w['profit_RAW']).mean())
-                            agg.append({'EV minimo %':thr,'Common bets':len(w),'RAW ROI %':100*w['profit_RAW'].mean(),'PLATT ROI %':100*w['profit_PLATT'].mean(),'Δ ROI pp':100*delta,'RAW strike %':100*w['win_RAW'].mean(),'PLATT strike %':100*w['win_PLATT'].mean()})
-                    if agg:
-                        st.markdown('### 2. VALUE — confronto paired sulle stesse occasioni')
-                        st.dataframe(pd.DataFrame(agg).round(4),use_container_width=True,hide_index=True)
-
-            if combo_tables:
-                st.markdown('### 3. COMBO — qualità OOS delle 12 probabilità congiunte')
-                cdf=pd.DataFrame(combo_tables)
-                st.dataframe(cdf.round(4),use_container_width=True,hide_index=True)
-                st.caption('Top 1 = combo con probabilità più alta. Top 4 = vera combo presente nelle prime quattro. Brier e Log Loss sono calcolati sulle 12 classi congiunte, che sono mutuamente esclusive.')
-                if combo_details:
-                    cd=pd.concat(combo_details,ignore_index=True)
-                    st.download_button('⬇️ Scarica V14 Combo dettaglio CSV',data=cd.to_csv(index=False).encode('utf-8'),file_name='V14_combo_12classi_dettaglio.csv',mime='text/csv',key='v14_combo_dl')
-
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome,msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-# =====================================================================
-# 🧪 V14.1 — AUDIT CALIBRAZIONE COMBO (SOLO DIAGNOSTICO)
-# Misura la calibrazione della probabilità assegnata alla Top 1 combo:
-# probabilità media prevista vs frequenza reale di Top 1 corretta.
-# NON modifica il motore operativo e NON ricalibra le combo.
-# =====================================================================
-
-def _v14_1_calibration_top1(df):
-    if df is None or df.empty or 'top1_prob' not in df.columns or 'top1_hit' not in df.columns:
-        return pd.DataFrame(), {'ece_pp': np.nan, 'n': 0}
-
-    x = df.copy()
-    bins = [0.0, .10, .20, .30, .40, .50, .60, .70, .80, .90, 1.000001]
-    labels = ['0-10%', '10-20%', '20-30%', '30-40%', '40-50%',
-              '50-60%', '60-70%', '70-80%', '80-90%', '90-100%']
-    x['fascia_top1'] = pd.cut(
-        x['top1_prob'].astype(float), bins=bins, labels=labels,
-        right=False, include_lowest=True
-    )
-    rows = []
-    for lab, g in x.groupby('fascia_top1', observed=False):
-        if g.empty:
-            continue
-        prob = float(g['top1_prob'].mean())
-        freq = float(g['top1_hit'].mean())
-        rows.append({
-            'Fascia Top 1': str(lab),
-            'N': int(len(g)),
-            'Prob. media prevista %': 100.0 * prob,
-            'Frequenza reale %': 100.0 * freq,
-            'Errore calibrazione pp': 100.0 * (freq - prob),
-        })
-
-    tab = pd.DataFrame(rows)
-    if tab.empty:
-        return tab, {'ece_pp': np.nan, 'n': len(x)}
-
-    # ECE: errore assoluto medio pesato per numerosità.
-    n = len(x)
-    tab['peso'] = tab['N'] / n
-    ece = float((tab['peso'] * tab['Errore calibrazione pp'].abs()).sum())
-    tab = tab.drop(columns=['peso'])
-    return tab, {'ece_pp': ece, 'n': n}
-
-
-def mostra_v14_1_combo_calibrazione(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.1 — CALIBRAZIONE COMBO')
-    st.caption('Audit della Top 1: confronta la probabilità media prevista con la frequenza reale della Top 1. Solo diagnostico: non modifica le probabilità operative.')
-    with st.expander('Apri V14.1 — Audit calibrazione Combo', expanded=False):
-        periodo = st.selectbox(
-            'Periodo V14.1',
-            ['Tutto lo storico', 'Stagione corrente OOS'],
-            key='v14_1_periodo'
-        )
-        solo_corrente = periodo == 'Stagione corrente OOS'
-
-        if st.button('🔬 ESEGUI V14.1 — CALIBRAZIONE COMBO', key='v14_1_run'):
-            tutti = []
-            errori = []
-            with st.spinner('Calcolo calibrazione Top 1 sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        res, det = _v14_combo_leg(
-                            info['id_fd'], rho, ewma_span, emivita, solo_corrente
-                        )
-                        if det is not None and not det.empty:
-                            tutti.append(det.assign(Campionato=camp))
-                    except Exception as e:
-                        errori.append((camp, f'{type(e).__name__}: {e}'))
-
-            if tutti:
-                all_df = pd.concat(tutti, ignore_index=True)
-                tab, met = _v14_1_calibration_top1(all_df)
-
-                st.markdown('### 1. Calibrazione aggregata — Top 1')
-                st.write(
-                    f"**Partite:** {met['n']} · **ECE:** {met['ece_pp']:.2f} pp "
-                    f"(errore assoluto medio pesato sulle fasce)"
-                )
-                st.dataframe(tab.round(4), use_container_width=True, hide_index=True)
-                st.caption('Errore calibrazione pp = frequenza reale − probabilità media prevista. Valori negativi indicano sovrastima della probabilità.')
-
-                st.markdown('### 2. Calibrazione per campionato')
-                rows = []
-                for camp, g in all_df.groupby('Campionato'):
-                    t, m = _v14_1_calibration_top1(g)
-                    for _, r in t.iterrows():
-                        rows.append({
-                            'Campionato': camp,
-                            'Fascia Top 1': r['Fascia Top 1'],
-                            'N': r['N'],
-                            'Prob. media prevista %': r['Prob. media prevista %'],
-                            'Frequenza reale %': r['Frequenza reale %'],
-                            'Errore calibrazione pp': r['Errore calibrazione pp'],
-                        })
-                if rows:
-                    st.dataframe(pd.DataFrame(rows).round(4), use_container_width=True, hide_index=True)
-
-                st.markdown('### 3. Dettaglio OOS')
-                st.dataframe(
-                    all_df[['Campionato','data','casa','trasferta','true_combo','top1_combo','top1_prob','top1_hit','top4_hit']]
-                    .round(6),
-                    use_container_width=True,
-                    hide_index=True
-                )
-                st.download_button(
-                    '⬇️ Scarica V14.1 calibrazione Combo CSV',
-                    data=all_df.to_csv(index=False).encode('utf-8'),
-                    file_name='V14_1_combo_calibrazione_top1.csv',
-                    mime='text/csv',
-                    key='v14_1_combo_dl'
-                )
-
-            if errori:
-                st.warning('Campionati non completati:')
-                for nome, msg in errori:
-                    st.write(f'- **{nome}**: {msg}')
-
-mostra_v14_value_combo_audit()
-
-mostra_v14_1_combo_calibrazione(rho_val, ewma_span_val, emivita_val)
-
-# =====================================================================
-# 🧪 V14.2 — AUDIT DELLE 12 COMBO PER CLASSE (SOLO DIAGNOSTICO)
-# Per ogni classe misura la calibrazione one-vs-rest:
-#   - frequenza reale della classe;
-#   - probabilità media prevista dal modello;
-#   - errore = reale - previsto.
-# Inoltre mostra supporto reale e quante volte la classe è stata scelta come Top 1.
-# NON modifica il motore operativo e NON ricalibra le Combo.
-# =====================================================================
-
-def _v14_2_combo_per_class(df):
-    if df is None or df.empty:
-        return pd.DataFrame(), {'n': 0, 'mae_pp': np.nan, 'max_abs_error_pp': np.nan}
-
-    combo_keys = [f'{s}_{g}_{t}'
-                  for s in ['1','X','2']
-                  for g in ['Goal','NoGoal']
-                  for t in ['Over','Under']]
-    rows = []
-    n = len(df)
-    for key in combo_keys:
-        pcol = f'prob_{key}'
-        if pcol not in df.columns:
-            continue
-        y = (df['true_combo'].astype(str) == key).astype(float)
-        p = pd.to_numeric(df[pcol], errors='coerce')
-        ok = p.notna()
-        if not ok.any():
-            continue
-        p = p[ok]
-        y = y[ok]
-        pred_rate = float(p.mean())
-        real_rate = float(y.mean())
-        err_pp = 100.0 * (real_rate - pred_rate)
-        top1_sel = int((df.loc[ok, 'top1_combo'].astype(str) == key).sum())
-        top1_hit = int(((df.loc[ok, 'top1_combo'].astype(str) == key) & (df.loc[ok, 'true_combo'].astype(str) == key)).sum())
-        true_n = int(y.sum())
-        rows.append({
-            'Combo': key,
-            'N totale': int(len(p)),
-            'N esiti reali': true_n,
-            'Frequenza reale %': 100.0 * real_rate,
-            'Prob. media prevista %': 100.0 * pred_rate,
-            'Errore calibrazione pp': err_pp,
-            'Prob. media quando reale %': 100.0 * float(p[y > 0.5].mean()) if true_n else np.nan,
-            'Top 1 selezionata N': top1_sel,
-            'Top 1 corretta %': 100.0 * top1_hit / true_n if true_n else np.nan,
-        })
-
-    tab = pd.DataFrame(rows)
-    if tab.empty:
-        return tab, {'n': n, 'mae_pp': np.nan, 'max_abs_error_pp': np.nan}
-    mae = float(tab['Errore calibrazione pp'].abs().mean())
-    max_abs = float(tab['Errore calibrazione pp'].abs().max())
-    return tab, {'n': n, 'mae_pp': mae, 'max_abs_error_pp': max_abs}
-
-
-def mostra_v14_2_combo_per_class(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.2 — AUDIT DELLE 12 COMBO')
-    st.caption('Calibrazione one-vs-rest per ciascuna delle 12 classi. Solo diagnostico: non modifica le probabilità operative.')
-    with st.expander('Apri V14.2 — Audit 12 Combo per classe', expanded=False):
-        periodo = st.selectbox(
-            'Periodo V14.2',
-            ['Tutto lo storico', 'Stagione corrente OOS'],
-            key='v14_2_periodo'
-        )
-        solo_corrente = periodo == 'Stagione corrente OOS'
-
-        if st.button('🔬 ESEGUI V14.2 — AUDIT 12 COMBO', key='v14_2_run'):
-            tutti = []
-            errori = []
-            with st.spinner('Calcolo calibrazione delle 12 Combo sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        res, det = _v14_combo_leg(
-                            info['id_fd'], rho, ewma_span, emivita, solo_corrente
-                        )
-                        if det is not None and not det.empty:
-                            tutti.append(det.assign(Campionato=camp))
-                    except Exception as e:
-                        errori.append((camp, f'{type(e).__name__}: {e}'))
-
-            if tutti:
-                all_df = pd.concat(tutti, ignore_index=True)
-                tabs = []
-                for camp, g in all_df.groupby('Campionato'):
-                    t, m = _v14_2_combo_per_class(g)
-                    if not t.empty:
-                        t.insert(0, 'Campionato', camp)
-                        tabs.append(t)
-
-                if tabs:
-                    out = pd.concat(tabs, ignore_index=True)
-                    agg, met = _v14_2_combo_per_class(all_df)
-
-                    st.markdown('### 1. Aggregato — tutte le 12 Combo')
-                    st.write(
-                        f"**Partite:** {met['n']} · **MAE calibrazione:** {met['mae_pp']:.2f} pp · "
-                        f"**Errore massimo assoluto:** {met['max_abs_error_pp']:.2f} pp"
-                    )
-                    st.dataframe(agg.round(4), use_container_width=True, hide_index=True)
-                    st.caption('Errore calibrazione pp = frequenza reale − probabilità media prevista. Negativo = sovrastima; positivo = sottostima.')
-
-                    st.markdown('### 2. Per campionato')
-                    st.dataframe(out.round(4), use_container_width=True, hide_index=True)
-
-                    st.markdown('### 3. Dettaglio OOS')
-                    cols = ['Campionato','data','casa','trasferta','true_combo','top1_combo','top1_prob','true_combo_prob','top1_hit','top4_hit']
-                    extra = [c for c in all_df.columns if c.startswith('prob_')]
-                    st.dataframe(
-                        all_df[cols + extra].round(6),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                    st.download_button(
-                        '⬇️ Scarica V14.2 audit 12 Combo CSV',
-                        data=out.to_csv(index=False).encode('utf-8'),
-                        file_name='V14_2_combo_per_class.csv',
-                        mime='text/csv',
-                        key='v14_2_combo_dl'
-                    )
-
-            if errori:
-                st.warning('Campionati non completati:')
-                for nome, msg in errori:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-mostra_v14_2_combo_per_class(rho_val, ewma_span_val, emivita_val)
-
-
-
-# =====================================================================
-# 🧪 V14.3 — AUDIT DEL RANKING DELLE 12 COMBO (SOLO DIAGNOSTICO)
-# Verifica se il ranking delle 12 combo contiene informazione oltre la Top 1.
-# Per ogni partita ordina le 12 probabilita' dalla piu' alta alla piu' bassa
-# e misura: hit@1..hit@5, probabilita' media assegnata alla combo nella
-# posizione, rank medio della combo realmente verificata e margine Top1-Top2.
-# NON modifica il motore operativo e NON calibra le combo.
-# =====================================================================
-
-def _v14_3_ranking_leg(id_fd, rho, ewma_span, emivita, solo_corrente=False):
-    dati = carica_dati_campionato(id_fd)
-    if dati is None or dati.empty:
-        return pd.DataFrame()
-    tutte = dati[dati['FTHG'].notna() & dati['FTAG'].notna()].reset_index(drop=True)
-    rows = []
-    for i in range(15, len(tutte)):
-        partita = tutte.iloc[i]
-        if solo_corrente and str(partita.get('Stagione','')) != 'corrente':
-            continue
-        try:
-            m = calcola_modello_completo(
-                tutte.iloc[:i], partita['HomeTeam'], partita['AwayTeam'],
-                rho, ewma_span, emivita, pd.DataFrame(),
-                data_riferimento=partita.get('Date_parsed')
-            )
-            if m is None or 'griglia' not in m:
-                continue
-
-            probs = {}
-            for s in ['1','X','2']:
-                for g in ['Goal','NoGoal']:
-                    for t in ['Over','Under']:
-                        key = f'{s}_{g}_{t}'
-                        probs[key] = float(np.clip(
-                            calcola_combo_libera(
-                                m['griglia'], segno=s, soglia_gol=2.5,
-                                tipo_soglia=t, gol_nogol=g
-                            ) / 100.0,
-                            0.0, 1.0
-                        ))
-
-            esito = '1' if float(partita['FTHG']) > float(partita['FTAG']) else (
-                '2' if float(partita['FTHG']) < float(partita['FTAG']) else 'X'
-            )
-            gg = 'Goal' if float(partita['FTHG']) > 0 and float(partita['FTAG']) > 0 else 'NoGoal'
-            tt = 'Over' if float(partita['FTHG']) + float(partita['FTAG']) > 2.5 else 'Under'
-            true_key = f'{esito}_{gg}_{tt}'
-            if true_key not in probs:
-                continue
-
-            order = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
-            rank_map = {k: r for r, (k, _) in enumerate(order, start=1)}
-            prob_map = dict(order)
-            true_rank = int(rank_map[true_key])
-            top1_p = float(order[0][1])
-            top2_p = float(order[1][1])
-
-            row = {
-                'data': partita.get('Date_parsed'),
-                'casa': partita['HomeTeam'],
-                'trasferta': partita['AwayTeam'],
-                'true_combo': true_key,
-                'true_rank': true_rank,
-                'true_combo_prob': float(prob_map[true_key]),
-                'top1_prob': top1_p,
-                'top2_prob': top2_p,
-                'margin_top1_top2': top1_p - top2_p,
-                'hit_at_1': true_rank <= 1,
-                'hit_at_2': true_rank <= 2,
-                'hit_at_3': true_rank <= 3,
-                'hit_at_4': true_rank <= 4,
-                'hit_at_5': true_rank <= 5,
-                'ranked_keys': '|'.join(k for k, _ in order),
-            }
-            for rr, (_, pp) in enumerate(order[:5], start=1):
-                row[f'rank{rr}_prob'] = float(pp)
-                row[f'rank{rr}_combo'] = order[rr-1][0]
-            rows.append(row)
-        except Exception:
-            continue
-    return pd.DataFrame(rows)
-
-
-def _v14_3_ranking_summary(df):
-    if df is None or df.empty:
-        return pd.DataFrame(), {}
-    rows = []
-    n = len(df)
-    for k in range(1, 6):
-        pcol = f'rank{k}_prob'
-        rows.append({
-            'Posizione': f'Top {k}',
-            'N': int(n),
-            'Hit rate cumulativo %': 100.0 * float(df[f'hit_at_{k}'].mean()),
-            'Prob. media posizione %': 100.0 * float(df[pcol].mean()) if pcol in df.columns else np.nan,
-        })
-    mean_rank=float(df['true_rank'].mean())
-    mrr=float(np.mean(1.0/df['true_rank'].astype(float)))
-    return pd.DataFrame(rows), {
-        'n': n,
-        'mean_true_rank': mean_rank,
-        'mrr': mrr,
-        'top1_top2_margin_pp': 100.0 * float(df['margin_top1_top2'].mean()),
-        'top1_prob_pp': 100.0 * float(df['top1_prob'].mean()),
-    }
-
-
-def mostra_v14_3_combo_ranking(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.3 — AUDIT RANKING DELLE 12 COMBO')
-    st.caption('Misura quanto il ranking delle 12 combo informa oltre la sola Top 1. Solo diagnostico: nessuna modifica alle probabilita operative.')
-    with st.expander('Apri V14.3 — Ranking Combo', expanded=False):
-        periodo = st.selectbox(
-            'Periodo V14.3',
-            ['Tutto lo storico', 'Stagione corrente OOS'],
-            key='v14_3_periodo'
-        )
-        solo_corrente = periodo == 'Stagione corrente OOS'
-
-        if st.button('🔬 ESEGUI V14.3 — RANKING COMBO', key='v14_3_run'):
-            ranking_all=[]
-            errors=[]
-            full_all=[]
-            with st.spinner('Calcolo ranking Top 1 → Top 5 sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        d = _v14_3_ranking_leg(
-                            info['id_fd'], rho, ewma_span, emivita, solo_corrente
-                        )
-                        if d is not None and not d.empty:
-                            d=d.copy(); d.insert(0,'Campionato',camp)
-                            ranking_all.append(d)
-                    except Exception as e:
-                        errors.append((camp, f'{type(e).__name__}: {e}'))
-
-            if ranking_all:
-                all_rank=pd.concat(ranking_all, ignore_index=True)
-                summary_rows=[]
-                for camp,g in all_rank.groupby('Campionato'):
-                    s,met=_v14_3_ranking_summary(g)
-                    for _,r in s.iterrows():
-                        summary_rows.append({
-                            'Campionato':camp,
-                            'Posizione':r['Posizione'],
-                            'N':int(r['N']),
-                            'Hit rate cumulativo %':r['Hit rate cumulativo %'],
-                            'Prob. media posizione %':r['Prob. media posizione %'],
-                        })
-                agg_s,agg_m=_v14_3_ranking_summary(all_rank)
-
-                st.markdown('### 1. Ranking aggregato')
-                st.write(
-                    f"**Partite:** {agg_m['n']} · **Rank medio combo reale:** {agg_m['mean_true_rank']:.2f} · "
-                    f"**MRR:** {agg_m['mrr']:.4f} · **Margine medio Top1−Top2:** {agg_m['top1_top2_margin_pp']:.2f} pp"
-                )
-                st.dataframe(agg_s.round(4), use_container_width=True, hide_index=True)
-
-                st.markdown('### 2. Per campionato')
-                st.dataframe(pd.DataFrame(summary_rows).round(4), use_container_width=True, hide_index=True)
-
-                st.markdown('### 3. Distribuzione del rank reale')
-                dist=[]
-                for camp,g in all_rank.groupby('Campionato'):
-                    vc=g['true_rank'].value_counts().reindex(range(1,13),fill_value=0)
-                    for rank,count in vc.items():
-                        dist.append({'Campionato':camp,'Rank combo reale':int(rank),'N':int(count),'%':100.0*count/len(g)})
-                dist_df=pd.DataFrame(dist)
-                st.dataframe(dist_df.round(4),use_container_width=True,hide_index=True)
-
-                st.markdown('### 4. Margine Top 1 − Top 2')
-                margin=[]
-                for camp,g in all_rank.groupby('Campionato'):
-                    margin.append({
-                        'Campionato':camp,
-                        'N':len(g),
-                        'Margine medio pp':100.0*float(g['margin_top1_top2'].mean()),
-                        'Mediana pp':100.0*float(g['margin_top1_top2'].median()),
-                    })
-                st.dataframe(pd.DataFrame(margin).round(4),use_container_width=True,hide_index=True)
-
-                st.markdown('### 5. Dettaglio OOS')
-                st.dataframe(
-                    all_rank[['Campionato','data','casa','trasferta','true_combo','true_rank','true_combo_prob','top1_prob','top2_prob','rank3_prob','rank4_prob','rank5_prob','margin_top1_top2','hit_at_1','hit_at_2','hit_at_3','hit_at_4','hit_at_5']].round(6),
-                    use_container_width=True,
-                    hide_index=True
-                )
-                st.download_button(
-                    '⬇️ Scarica V14.3 audit ranking CSV',
-                    data=all_rank.to_csv(index=False).encode('utf-8'),
-                    file_name='V14_3_combo_ranking.csv',
-                    mime='text/csv',
-                    key='v14_3_dl'
-                )
-
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome,msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-mostra_v14_3_combo_ranking(rho_val, ewma_span_val, emivita_val)
-
-
-# =====================================================================
-# 🧪 V14.4 — AUDIT CONFIDENCE / MARGINE TOP 1 (SOLO DIAGNOSTICO)
-# Divide le partite per il margine Top1−Top2 e misura:
-#   - frequenza di Top1 corretta;
-#   - frequenza della combo reale dentro Top4;
-#   - probabilità media Top1;
-#   - numero di osservazioni.
-# NON modifica il motore operativo e NON cambia le probabilità.
-# =====================================================================
-
-def _v14_4_margin_audit(df):
-    if df is None or df.empty or 'margin_top1_top2' not in df.columns:
-        return pd.DataFrame()
-
-    x = df.copy()
-    x['margin_pp'] = 100.0 * pd.to_numeric(x['margin_top1_top2'], errors='coerce')
-    x = x.dropna(subset=['margin_pp'])
-
-    bins = [-np.inf, 2.0, 5.0, 10.0, np.inf]
-    labels = ['< 2 pp', '2–5 pp', '5–10 pp', '> 10 pp']
-    x['fascia_margine'] = pd.cut(
-        x['margin_pp'], bins=bins, labels=labels,
-        right=False, include_lowest=True
-    )
-
-    rows = []
-    for lab, g in x.groupby('fascia_margine', observed=False):
-        if g.empty:
-            continue
-        rows.append({
-            'Margine Top1−Top2': str(lab),
-            'N': int(len(g)),
-            'Top 1 hit rate %': 100.0 * float(g['hit_at_1'].mean()),
-            'Top 4 hit rate %': 100.0 * float(g['hit_at_4'].mean()),
-            'Prob. media Top 1 %': 100.0 * float(g['top1_prob'].mean()),
-            'Rank medio combo reale': float(g['true_rank'].mean()),
-            'Margine medio pp': float(g['margin_pp'].mean()),
-        })
-    return pd.DataFrame(rows)
-
-
-def mostra_v14_4_confidence_margin(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.4 — AUDIT CONFIDENCE / MARGINE COMBO')
-    st.caption('Verifica quanto la qualità della Top 1 cambia quando il margine tra prima e seconda combo è piccolo o grande. Solo diagnostico: nessuna modifica alle probabilità operative.')
-    with st.expander('Apri V14.4 — Confidence / Margin Audit', expanded=False):
-        periodo = st.selectbox(
-            'Periodo V14.4',
-            ['Tutto lo storico', 'Stagione corrente OOS'],
-            key='v14_4_periodo'
-        )
-        solo_corrente = periodo == 'Stagione corrente OOS'
-
-        if st.button('🔬 ESEGUI V14.4 — CONFIDENCE / MARGINE', key='v14_4_run'):
-            tutti = []
-            errori = []
-            with st.spinner('Calcolo confidence/margine sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        d = _v14_3_ranking_leg(
-                            info['id_fd'], rho, ewma_span, emivita, solo_corrente
-                        )
-                        if d is not None and not d.empty:
-                            tutti.append(d.assign(Campionato=camp))
-                    except Exception as e:
-                        errori.append((camp, f'{type(e).__name__}: {e}'))
-
-            if tutti:
-                all_df = pd.concat(tutti, ignore_index=True)
-
-                st.markdown('### 1. Aggregato — qualità per margine')
-                agg = _v14_4_margin_audit(all_df)
-                st.dataframe(agg.round(4), use_container_width=True, hide_index=True)
-
-                st.markdown('### 2. Per campionato')
-                rows = []
-                for camp, g in all_df.groupby('Campionato'):
-                    t = _v14_4_margin_audit(g)
-                    if not t.empty:
-                        t.insert(0, 'Campionato', camp)
-                        rows.append(t)
-                if rows:
-                    st.dataframe(pd.concat(rows, ignore_index=True).round(4), use_container_width=True, hide_index=True)
-
-                st.markdown('### 3. Densità delle fasce')
-                dens = all_df.copy()
-                dens['Margine pp'] = 100.0 * dens['margin_top1_top2']
-                dens['Fascia'] = pd.cut(
-                    dens['Margine pp'], bins=[-np.inf, 2, 5, 10, np.inf],
-                    labels=['< 2 pp', '2–5 pp', '5–10 pp', '> 10 pp'],
-                    right=False, include_lowest=True
-                )
-                dens_tab = (
-                    dens.groupby('Fascia', observed=False)
-                    .size().rename('N').reset_index()
-                )
-                dens_tab['% partite'] = 100.0 * dens_tab['N'] / max(1, len(dens))
-                st.dataframe(dens_tab.round(4), use_container_width=True, hide_index=True)
-
-                st.markdown('### 4. Dettaglio OOS')
-                cols = [
-                    'Campionato','data','casa','trasferta','true_combo','true_rank',
-                    'top1_prob','top2_prob','margin_top1_top2',
-                    'hit_at_1','hit_at_4'
-                ]
-                st.dataframe(all_df[cols].round(6), use_container_width=True, hide_index=True)
-
-                st.download_button(
-                    '⬇️ Scarica V14.4 confidence / margin CSV',
-                    data=agg.to_csv(index=False).encode('utf-8'),
-                    file_name='V14_4_combo_confidence_margin.csv',
-                    mime='text/csv',
-                    key='v14_4_dl'
-                )
-
-            if errori:
-                st.warning('Campionati non completati:')
-                for nome, msg in errori:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-mostra_v14_4_confidence_margin(rho_val, ewma_span_val, emivita_val)
-
-
-# =====================================================================
-# 🧪 V14.5 — AUDIT SELEZIONE TOP K COMBO (NO QUOTE INVENTATE)
-# Misura l'efficienza della selezione Top 1/2/3/4:
-#   - copertura reale cumulativa;
-#   - massa di probabilità cumulativa delle prime K;
-#   - rapporto copertura reale / probabilità cumulativa;
-#   - rank medio della combo reale;
-#   - frequenza della combo reale esattamente al rank K.
-# Non calcola ROI combo perché il dataset storico non contiene quote eseguibili
-# per le combo libere 1X2 + Goal/NoGoal + O/U 2.5. Nessuna quota sintetica viene
-# usata per evitare di confondere un proxy con un prezzo bookmaker reale.
-# =====================================================================
-
-def _v14_5_selection_audit(df):
-    if df is None or df.empty:
-        return pd.DataFrame()
-    x = df.copy()
-    req = ['true_rank','top1_prob','top2_prob','rank3_prob','rank4_prob']
-    if not all(c in x.columns for c in req):
-        return pd.DataFrame()
-    prob_cols = {1:'top1_prob',2:'top2_prob',3:'rank3_prob',4:'rank4_prob'}
-    rows=[]
-    for k in range(1,5):
-        mass = sum(pd.to_numeric(x[prob_cols[j]], errors='coerce').fillna(0.0) for j in range(1,k+1))
-        coverage = (pd.to_numeric(x['true_rank'], errors='coerce') <= k)
-        n = int(coverage.notna().sum())
-        cov_rate = float(coverage.mean())
-        mass_mean = float(mass.mean())
-        rows.append({
-            'Selezione': f'Top {k}',
-            'N': len(x),
-            'Copertura reale %': 100.0 * cov_rate,
-            'Prob. cumulativa media %': 100.0 * mass_mean,
-            'Rapporto copertura/probabilità %': 100.0 * cov_rate / mass_mean if mass_mean > 0 else np.nan,
-            'Rank medio combo reale': float(pd.to_numeric(x['true_rank'], errors='coerce').mean()),
-        })
-    return pd.DataFrame(rows)
-
-
-def _v14_5_exact_rank(df):
-    if df is None or df.empty or 'true_rank' not in df.columns:
-        return pd.DataFrame()
-    ranks=[]
-    for k in range(1,10):
-        n=int((df['true_rank']==k).sum())
-        ranks.append({'Rank reale':k,'N':n,'% partite':100.0*n/len(df)})
-    return pd.DataFrame(ranks)
-
-
-def mostra_v14_5_combo_selection(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.5 — AUDIT SELEZIONE COMBO')
-    st.caption('Confronta Top 1/2/3/4 senza inventare quote combo: misura quanta copertura reale otteniamo per quanta probabilità il modello concentra nelle prime K combinazioni.')
-    with st.expander('Apri V14.5 — Selection Audit', expanded=False):
-        periodo = st.selectbox(
-            'Periodo V14.5',
-            ['Tutto lo storico', 'Stagione corrente OOS'],
-            key='v14_5_periodo'
-        )
-        solo_corrente = periodo == 'Stagione corrente OOS'
-
-        if st.button('🔬 ESEGUI V14.5 — SELECTION AUDIT', key='v14_5_run'):
-            tutti=[]; errori=[]
-            with st.spinner('Calcolo efficienza Top K sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        d = _v14_3_ranking_leg(info['id_fd'], rho, ewma_span, emivita, solo_corrente)
-                        if d is not None and not d.empty:
-                            tutti.append(d.assign(Campionato=camp))
-                    except Exception as e:
-                        errori.append((camp, f'{type(e).__name__}: {e}'))
-
-            if tutti:
-                all_df=pd.concat(tutti,ignore_index=True)
-                st.markdown('### 1. Aggregato — Top K')
-                sel=_v14_5_selection_audit(all_df)
-                st.dataframe(sel.round(4),use_container_width=True,hide_index=True)
-                st.caption('Il rapporto copertura/probabilità è un indicatore descrittivo: >100% significa che la frequenza osservata supera la massa probabilistica media indicata per quella selezione.')
-
-                st.markdown('### 2. Per campionato')
-                rows=[]
-                for camp,g in all_df.groupby('Campionato'):
-                    t=_v14_5_selection_audit(g)
-                    if not t.empty:
-                        t.insert(0,'Campionato',camp)
-                        rows.append(t)
-                if rows:
-                    st.dataframe(pd.concat(rows,ignore_index=True).round(4),use_container_width=True,hide_index=True)
-
-                st.markdown('### 3. Rank esatto della combo reale')
-                rank_rows=[]
-                for camp,g in all_df.groupby('Campionato'):
-                    t=_v14_5_exact_rank(g)
-                    if not t.empty:
-                        t.insert(0,'Campionato',camp)
-                        rank_rows.append(t)
-                if rank_rows:
-                    st.dataframe(pd.concat(rank_rows,ignore_index=True).round(4),use_container_width=True,hide_index=True)
-
-                st.markdown('### 4. Nota economica')
-                st.info('Il dataset storico contiene quote pre-partita per 1X2 e O/U 2.5, ma non una quota eseguibile per ciascuna combo libera 1X2 + Goal/NoGoal + O/U. Per questo V14.5 non pubblica ROI combo sintetico: farlo richiederebbe introdurre un prezzo ipotetico.')
-
-                st.download_button(
-                    '⬇️ Scarica V14.5 selection audit CSV',
-                    data=all_df.to_csv(index=False).encode('utf-8'),
-                    file_name='V14_5_combo_selection_audit_dettaglio.csv',
-                    mime='text/csv', key='v14_5_dl'
-                )
-            if errori:
-                st.warning('Campionati non completati:')
-                for nome,msg in errori:
-                    st.write(f'- **{nome}**: {msg}')
-
-mostra_v14_5_combo_selection(rho_val, ewma_span_val, emivita_val)
-
-
-# =====================================================================
-# 🧪 V14.6 — AUDIT SOGLIE CONFIDENZA COMBO (SOLO DIAGNOSTICO)
-# Verifica descrittiva della qualità Top 1 quando imponiamo soglie
-# predefinite su probabilità Top 1 e margine Top1-Top2.
-# NON modifica le probabilità operative e NON propone automaticamente
-# una soglia da usare in produzione.
-# =====================================================================
-
-def _v14_6_threshold_audit(df, prob_thresholds=(0.20,0.25,0.30,0.35), margin_thresholds=(0.0,0.02,0.05,0.10)):
-    if df is None or df.empty:
-        return pd.DataFrame()
-    req = ['top1_prob','margin_top1_top2','hit_at_1','hit_at_4']
-    if any(c not in df.columns for c in req):
-        return pd.DataFrame()
-    rows=[]
-    for pt in prob_thresholds:
-        for mt in margin_thresholds:
-            d=df[(pd.to_numeric(df['top1_prob'],errors='coerce') >= pt) &
-                 (pd.to_numeric(df['margin_top1_top2'],errors='coerce') >= mt)].copy()
-            if d.empty:
-                rows.append({
-                    'Soglia prob. Top1 %':100*pt,
-                    'Soglia margine pp':100*mt,
-                    'N':0,
-                    'Top1 hit %':np.nan,
-                    'Top4 hit %':np.nan,
-                    'Prob. media Top1 %':np.nan,
-                    'Margine medio pp':np.nan,
-                    'Copertura/Prob. cumulativa %':np.nan,
-                })
-                continue
-            rows.append({
-                'Soglia prob. Top1 %':100*pt,
-                'Soglia margine pp':100*mt,
-                'N':int(len(d)),
-                'Top1 hit %':100*pd.to_numeric(d['hit_at_1'],errors='coerce').mean(),
-                'Top4 hit %':100*pd.to_numeric(d['hit_at_4'],errors='coerce').mean(),
-                'Prob. media Top1 %':100*pd.to_numeric(d['top1_prob'],errors='coerce').mean(),
-                'Margine medio pp':100*pd.to_numeric(d['margin_top1_top2'],errors='coerce').mean(),
-                'Copertura/Prob. cumulativa %':100*pd.to_numeric(d['hit_at_1'],errors='coerce').mean()/max(1e-9,pd.to_numeric(d['top1_prob'],errors='coerce').mean()),
-            })
-    return pd.DataFrame(rows)
-
-
-def mostra_v14_6_confidence_threshold_audit(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.6 — AUDIT SOGLIE CONFIDENZA COMBO')
-    st.caption('Test descrittivo di soglie predefinite su probabilità Top 1 e margine Top1−Top2. Solo diagnostico: nessuna soglia viene trasferita all’operativa.')
-    with st.expander('Apri V14.6 — Confidence Threshold Audit', expanded=False):
-        periodo = st.selectbox('Periodo V14.6',['Tutto lo storico','Stagione corrente OOS'],key='v14_6_periodo')
-        solo_corrente = periodo == 'Stagione corrente OOS'
-        if st.button('🔬 ESEGUI V14.6 — SOGLIE CONFIDENZA',key='v14_6_run'):
-            tutti=[]; errori=[]
-            with st.spinner('Calcolo soglie di confidenza sulle 5 leghe...'):
-                for camp,info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        _,det=_v14_combo_leg(info['id_fd'],rho,ewma_span,emivita,solo_corrente)
-                        if det is not None and not det.empty:
-                            # V14.3 usa già top1_prob/top2_prob e il margine.
-                            if 'margin_top1_top2' in det.columns and 'hit_at_1' in det.columns:
-                                tutti.append(det.assign(Campionato=camp))
-                            else:
-                                x=det.copy()
-                                if 'top2_prob' not in x.columns:
-                                    # Compatibilità con dettagli legacy: ricava Top 2
-                                    # dalle colonne prob_* escludendo la Top 1.
-                                    prob_cols=[c for c in x.columns if c.startswith('prob_')]
-                                    def _legacy_top2(row):
-                                        vals=[]
-                                        for c in prob_cols:
-                                            try: vals.append(float(row[c]))
-                                            except Exception: pass
-                                        vals=sorted(vals, reverse=True)
-                                        return vals[1] if len(vals)>1 else np.nan
-                                    x['top2_prob']=x.apply(_legacy_top2,axis=1)
-                                x['margin_top1_top2']=pd.to_numeric(x['top1_prob'],errors='coerce')-pd.to_numeric(x['top2_prob'],errors='coerce')
-                                x['hit_at_1']=x['top1_hit']
-                                x['hit_at_4']=x['top4_hit']
-                                tutti.append(x.assign(Campionato=camp))
-                    except Exception as e:
-                        errori.append((camp,f'{type(e).__name__}: {e}'))
-            if tutti:
-                all_df=pd.concat(tutti,ignore_index=True)
-                st.markdown('### 1. Aggregato — matrice probabilità × margine')
-                tab=_v14_6_threshold_audit(all_df)
-                st.dataframe(tab.round(4),use_container_width=True,hide_index=True)
-                st.caption('Le soglie sono fissate ex ante nel codice e servono a descrivere la stabilità della selezione; non sono ottimizzate sui risultati.')
-                st.markdown('### 2. Per campionato')
-                rows=[]
-                for camp,g in all_df.groupby('Campionato'):
-                    t=_v14_6_threshold_audit(g)
-                    t.insert(0,'Campionato',camp)
-                    rows.append(t)
-                if rows:
-                    st.dataframe(pd.concat(rows,ignore_index=True).round(4),use_container_width=True,hide_index=True)
-                st.markdown('### 3. Dettaglio OOS')
-                st.dataframe(all_df[['Campionato','data','casa','trasferta','true_combo','top1_combo','top1_prob','top2_prob','margin_top1_top2','hit_at_1','hit_at_4']].round(6),use_container_width=True,hide_index=True)
-                st.download_button('⬇️ Scarica V14.6 soglie confidenza CSV',data=tab.to_csv(index=False).encode('utf-8'),file_name='V14_6_confidence_threshold_audit.csv',mime='text/csv',key='v14_6_dl')
-            if errori:
-                st.warning('Campionati non completati:')
-                for nome,msg in errori:
-                    st.write(f'- **{nome}**: {msg}')
-
-mostra_v14_6_confidence_threshold_audit(rho_val, ewma_span_val, emivita_val)
-
-
-# =====================================================================
-# 🧪 V14.7 — STABILITÀ SOGLIA TOP 1 >= 35% (SOLO DIAGNOSTICO)
-# Verifica se una soglia fissata ex ante resta coerente tra:
-#   1) tutto lo storico OOS;
-#   2) stagione corrente OOS.
-# Nessuna soglia viene trasferita all'operativa.
-# =====================================================================
-
-def _v14_7_wilson_interval(wins, n, z=1.959963984540054):
-    if n <= 0:
-        return (np.nan, np.nan)
-    p = wins / n
-    den = 1.0 + (z*z)/n
-    center = (p + (z*z)/(2.0*n)) / den
-    half = z * np.sqrt((p*(1.0-p)/n) + (z*z)/(4.0*n*n)) / den
-    return center-half, center+half
-
-
-def _v14_7_stability_summary(df, prob_threshold=0.35):
-    if df is None or df.empty:
-        return {
-            'N': 0, 'Top1 hit %': np.nan, 'IC95% Top1 low %': np.nan,
-            'IC95% Top1 high %': np.nan, 'Top4 hit %': np.nan,
-            'Prob. media Top1 %': np.nan, 'Margine medio pp': np.nan,
-            'Copertura/Prob. %': np.nan,
-        }
-    x = df.copy()
-    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
-    # Compatibilità con _v14_combo_leg(), che restituisce top1_hit/top4_hit.
-    if 'hit_at_1' not in x.columns and 'top1_hit' in x.columns:
-        x['hit_at_1'] = x['top1_hit']
-    if 'hit_at_4' not in x.columns and 'top4_hit' in x.columns:
-        x['hit_at_4'] = x['top4_hit']
-    if 'margin_top1_top2' not in x.columns and {'top1_prob','top2_prob'}.issubset(x.columns):
-        x['margin_top1_top2'] = (
-            pd.to_numeric(x['top1_prob'], errors='coerce')
-            - pd.to_numeric(x['top2_prob'], errors='coerce')
-        )
-    x['hit_at_1'] = pd.to_numeric(x['hit_at_1'], errors='coerce')
-    x['hit_at_4'] = pd.to_numeric(x['hit_at_4'], errors='coerce')
-    x['margin_top1_top2'] = pd.to_numeric(x.get('margin_top1_top2'), errors='coerce')
-    x = x[x['top1_prob'] >= prob_threshold].copy()
-    x = x.dropna(subset=['hit_at_1','hit_at_4','top1_prob'])
-    if x.empty:
-        return {
-            'N': 0, 'Top1 hit %': np.nan, 'IC95% Top1 low %': np.nan,
-            'IC95% Top1 high %': np.nan, 'Top4 hit %': np.nan,
-            'Prob. media Top1 %': np.nan, 'Margine medio pp': np.nan,
-            'Copertura/Prob. %': np.nan,
-        }
-    n = len(x)
-    wins = int(x['hit_at_1'].sum())
-    lo, hi = _v14_7_wilson_interval(wins, n)
-    mean_p = float(x['top1_prob'].mean())
-    return {
-        'N': int(n),
-        'Top1 hit %': 100.0 * wins / n,
-        'IC95% Top1 low %': 100.0 * lo,
-        'IC95% Top1 high %': 100.0 * hi,
-        'Top4 hit %': 100.0 * float(x['hit_at_4'].mean()),
-        'Prob. media Top1 %': 100.0 * mean_p,
-        'Margine medio pp': 100.0 * float(x['margin_top1_top2'].mean()) if 'margin_top1_top2' in x.columns else np.nan,
-        'Copertura/Prob. %': 100.0 * float(x['hit_at_1'].mean()) / max(1e-9, mean_p),
-    }
-
-
-def mostra_v14_7_threshold_stability(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.7 — STABILITÀ SOGLIA TOP 1 ≥ 35%')
-    st.caption('La soglia del 35% è fissata ex ante. Il test confronta tutto lo storico OOS con la sola stagione corrente OOS, senza modificare l’operativa.')
-    with st.expander('Apri V14.7 — Threshold Stability', expanded=False):
-        if st.button('🔬 ESEGUI V14.7 — STABILITÀ SOGLIA 35%', key='v14_7_run'):
-            all_hist=[]; all_current=[]; errors=[]
-            with st.spinner('Verifica stabilità della soglia ≥35% sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        # Tutto lo storico OOS
-                        _, d_all = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
-                        if d_all is not None and not d_all.empty:
-                            all_hist.append(d_all.assign(Campionato=camp, Periodo='Tutto lo storico OOS'))
-                        # Stagione corrente OOS
-                        _, d_cur = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, True)
-                        if d_cur is not None and not d_cur.empty:
-                            all_current.append(d_cur.assign(Campionato=camp, Periodo='Stagione corrente OOS'))
-                    except Exception as e:
-                        errors.append((camp, f'{type(e).__name__}: {e}'))
-
-            frames = all_hist + all_current
-            if frames:
-                all_df = pd.concat(frames, ignore_index=True)
-
-                st.markdown('### 1. Confronto aggregato')
-                rows=[]
-                for periodo, g in all_df.groupby('Periodo'):
-                    s = _v14_7_stability_summary(g, 0.35)
-                    rows.append({'Periodo':periodo, **s})
-                agg=pd.DataFrame(rows)
-                st.dataframe(agg.round(4), use_container_width=True, hide_index=True)
-                st.caption('IC95% = intervallo di confidenza binomiale di Wilson per il Top 1 hit rate. Non è una garanzia predittiva futura.')
-
-                st.markdown('### 2. Per campionato e periodo')
-                rows=[]
-                for (camp, periodo), g in all_df.groupby(['Campionato','Periodo']):
-                    s=_v14_7_stability_summary(g,0.35)
-                    rows.append({'Campionato':camp, 'Periodo':periodo, **s})
-                per=pd.DataFrame(rows)
-                st.dataframe(per.round(4), use_container_width=True, hide_index=True)
-
-                st.markdown('### 3. Stabilità del campione')
-                hist_n = int((all_df[all_df['Periodo']=='Tutto lo storico OOS']['top1_prob'] >= 0.35).sum()) if 'Tutto lo storico OOS' in set(all_df['Periodo']) else 0
-                cur_n = int((all_df[all_df['Periodo']=='Stagione corrente OOS']['top1_prob'] >= 0.35).sum()) if 'Stagione corrente OOS' in set(all_df['Periodo']) else 0
-                st.write(f'**Selezioni ≥35%:** storico {hist_n} · stagione corrente {cur_n}.')
-                if hist_n > 0 and cur_n > 0:
-                    h = _v14_7_stability_summary(all_df[all_df['Periodo']=='Tutto lo storico OOS'],0.35)
-                    c = _v14_7_stability_summary(all_df[all_df['Periodo']=='Stagione corrente OOS'],0.35)
-                    delta = c['Top1 hit %'] - h['Top1 hit %']
-                    st.info(f"Differenza hit rate stagione corrente − storico: **{delta:+.2f} pp**. Il confronto serve a verificare stabilità, non a scegliere automaticamente una nuova soglia.")
-
-                # Normalizza le colonne richieste dall'export. Alcune versioni V14
-                # producono top1_hit/top4_hit, mentre l'audit usa hit_at_1/hit_at_4.
-                export_df = all_df.copy()
-                if 'hit_at_1' not in export_df.columns and 'top1_hit' in export_df.columns:
-                    export_df['hit_at_1'] = export_df['top1_hit']
-                if 'hit_at_4' not in export_df.columns and 'top4_hit' in export_df.columns:
-                    export_df['hit_at_4'] = export_df['top4_hit']
-                if 'margin_top1_top2' not in export_df.columns and {'top1_prob','top2_prob'}.issubset(export_df.columns):
-                    export_df['margin_top1_top2'] = (
-                        pd.to_numeric(export_df['top1_prob'], errors='coerce')
-                        - pd.to_numeric(export_df['top2_prob'], errors='coerce')
-                    )
-                export_cols = ['Campionato','Periodo','data','casa','trasferta','true_combo',
-                               'top1_combo','top1_prob','top2_prob','hit_at_1','hit_at_4',
-                               'margin_top1_top2']
-                missing_export = [c for c in export_cols if c not in export_df.columns]
-                if missing_export:
-                    st.warning(f'Export V14.7 non disponibile: colonne mancanti {missing_export}')
-                else:
-                    out = export_df[export_cols].copy()
-                    st.download_button(
-                        '⬇️ Scarica V14.7 threshold stability CSV',
-                        data=out.to_csv(index=False).encode('utf-8'),
-                        file_name='V14_7_threshold_stability_35pct.csv',
-                        mime='text/csv', key='v14_7_dl'
-                    )
-
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome,msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-mostra_v14_7_threshold_stability(rho_val, ewma_span_val, emivita_val)
-
-
-# =====================================================================
-# 🧪 V14.8 — SENSIBILITÀ DELLA SOGLIA TOP 1 (SOLO DIAGNOSTICO)
-# Confronta più soglie intorno al 35% su:
-#   1) tutto lo storico OOS;
-#   2) stagione corrente OOS.
-# Nessuna soglia viene trasferita all'operativa.
-# =====================================================================
-
-def _v14_8_threshold_sensitivity_summary(df, prob_threshold):
-    if df is None or df.empty:
-        return {
-            'Soglia %': 100.0 * prob_threshold, 'N': 0,
-            'Top1 hit %': np.nan, 'IC95% Top1 low %': np.nan,
-            'IC95% Top1 high %': np.nan, 'Top4 hit %': np.nan,
-            'Prob. media Top1 %': np.nan, 'Margine medio pp': np.nan,
-            'Copertura/Prob. %': np.nan,
-        }
-    x = df.copy()
-    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
-    if 'hit_at_1' not in x.columns and 'top1_hit' in x.columns:
-        x['hit_at_1'] = x['top1_hit']
-    if 'hit_at_4' not in x.columns and 'top4_hit' in x.columns:
-        x['hit_at_4'] = x['top4_hit']
-    if 'margin_top1_top2' not in x.columns and {'top1_prob','top2_prob'}.issubset(x.columns):
-        x['margin_top1_top2'] = (
-            pd.to_numeric(x['top1_prob'], errors='coerce')
-            - pd.to_numeric(x['top2_prob'], errors='coerce')
-        )
-    x['hit_at_1'] = pd.to_numeric(x.get('hit_at_1'), errors='coerce')
-    x['hit_at_4'] = pd.to_numeric(x.get('hit_at_4'), errors='coerce')
-    x['margin_top1_top2'] = pd.to_numeric(x.get('margin_top1_top2'), errors='coerce')
-    x = x[x['top1_prob'] >= prob_threshold].dropna(subset=['hit_at_1','hit_at_4','top1_prob'])
-    if x.empty:
-        return {
-            'Soglia %': 100.0 * prob_threshold, 'N': 0,
-            'Top1 hit %': np.nan, 'IC95% Top1 low %': np.nan,
-            'IC95% Top1 high %': np.nan, 'Top4 hit %': np.nan,
-            'Prob. media Top1 %': np.nan, 'Margine medio pp': np.nan,
-            'Copertura/Prob. %': np.nan,
-        }
-    n = len(x)
-    wins = int(x['hit_at_1'].sum())
-    lo, hi = _v14_7_wilson_interval(wins, n)
-    mean_p = float(x['top1_prob'].mean())
-    return {
-        'Soglia %': 100.0 * prob_threshold,
-        'N': int(n),
-        'Top1 hit %': 100.0 * wins / n,
-        'IC95% Top1 low %': 100.0 * lo,
-        'IC95% Top1 high %': 100.0 * hi,
-        'Top4 hit %': 100.0 * float(x['hit_at_4'].mean()),
-        'Prob. media Top1 %': 100.0 * mean_p,
-        'Margine medio pp': 100.0 * float(x['margin_top1_top2'].mean()),
-        'Copertura/Prob. %': 100.0 * float(x['hit_at_1'].mean()) / max(1e-9, mean_p),
-    }
-
-
-def mostra_v14_8_threshold_sensitivity(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.8 — SENSIBILITÀ DELLA SOGLIA TOP 1')
-    st.caption('Test diagnostico ex post su soglie 30%, 32.5%, 35%, 37.5% e 40%. Confronta storico OOS e stagione corrente OOS senza modificare l’operativa.')
-    with st.expander('Apri V14.8 — Threshold Sensitivity', expanded=False):
-        if st.button('🔬 ESEGUI V14.8 — SENSIBILITÀ SOGLIA', key='v14_8_run'):
-            all_hist=[]; all_current=[]; errors=[]
-            with st.spinner('Calcolo sensibilità soglia sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        _, d_all = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
-                        if d_all is not None and not d_all.empty:
-                            all_hist.append(d_all.assign(Campionato=camp, Periodo='Tutto lo storico OOS'))
-                        _, d_cur = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, True)
-                        if d_cur is not None and not d_cur.empty:
-                            all_current.append(d_cur.assign(Campionato=camp, Periodo='Stagione corrente OOS'))
-                    except Exception as e:
-                        errors.append((camp, f'{type(e).__name__}: {e}'))
-
-            frames = all_hist + all_current
-            if frames:
-                all_df = pd.concat(frames, ignore_index=True)
-                thresholds = (0.30, 0.325, 0.35, 0.375, 0.40)
-
-                st.markdown('### 1. Sensibilità aggregata')
-                rows=[]
-                for periodo, g in all_df.groupby('Periodo'):
-                    for thr in thresholds:
-                        rows.append({'Periodo': periodo, **_v14_8_threshold_sensitivity_summary(g, thr)})
-                sens=pd.DataFrame(rows)
-                st.dataframe(sens.round(4), use_container_width=True, hide_index=True)
-
-                st.markdown('### 2. Differenza stagione corrente − storico')
-                hist = {float(r['Soglia %']): r for _, r in sens[sens['Periodo']=='Tutto lo storico OOS'].iterrows()}
-                cur = {float(r['Soglia %']): r for _, r in sens[sens['Periodo']=='Stagione corrente OOS'].iterrows()}
-                delta_rows=[]
-                for thr in sorted(set(hist) & set(cur)):
-                    delta_rows.append({
-                        'Soglia %': thr,
-                        'N storico': hist[thr]['N'],
-                        'N corrente': cur[thr]['N'],
-                        'Δ Top1 hit pp': cur[thr]['Top1 hit %'] - hist[thr]['Top1 hit %'],
-                        'Δ Top4 pp': cur[thr]['Top4 hit %'] - hist[thr]['Top4 hit %'],
-                        'Δ Prob. media Top1 pp': cur[thr]['Prob. media Top1 %'] - hist[thr]['Prob. media Top1 %'],
-                        'Δ Margine medio pp': cur[thr]['Margine medio pp'] - hist[thr]['Margine medio pp'],
-                        'Δ Copertura/Prob. pp': cur[thr]['Copertura/Prob. %'] - hist[thr]['Copertura/Prob. %'],
-                    })
-                delta_df=pd.DataFrame(delta_rows)
-                st.dataframe(delta_df.round(4), use_container_width=True, hide_index=True)
-                st.caption('Le differenze descrivono la stabilità della metrica al variare della soglia; non costituiscono una selezione automatica della soglia.')
-
-                st.markdown('### 3. Focus intorno al 35%')
-                focus = sens[sens['Soglia %'].isin([32.5,35.0,37.5])].copy()
-                st.dataframe(focus.round(4), use_container_width=True, hide_index=True)
-
-                export_cols=['Periodo','Soglia %','N','Top1 hit %','IC95% Top1 low %','IC95% Top1 high %','Top4 hit %','Prob. media Top1 %','Margine medio pp','Copertura/Prob. %']
-                st.download_button(
-                    '⬇️ Scarica V14.8 sensitivity CSV',
-                    data=sens[export_cols].to_csv(index=False).encode('utf-8'),
-                    file_name='V14_8_threshold_sensitivity.csv',
-                    mime='text/csv', key='v14_8_dl'
-                )
-
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome,msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-mostra_v14_8_threshold_sensitivity(rho_val, ewma_span_val, emivita_val)
-
-# =====================================================================
-# 🧪 V14.9 — STABILITÀ TEMPORALE DELLA SOGLIA 35% (SOLO DIAGNOSTICO)
-# Divide lo storico OOS in 4 finestre cronologiche di numerosità simile e
-# verifica se la selezione Top1 >=35% mantiene comportamento coerente nel tempo.
-# Nessuna modifica all'operativa e nessuna ottimizzazione della soglia.
-# =====================================================================
-
-def _v14_9_window_summary(df, prob_threshold=0.35):
-    if df is None or df.empty:
-        return {
-            'N OOS': 0, 'N selezioni >= soglia': 0,
-            'Quota selezionata %': np.nan, 'Top1 hit %': np.nan,
-            'IC95% Top1 low %': np.nan, 'IC95% Top1 high %': np.nan,
-            'Top4 hit %': np.nan, 'Prob. media Top1 %': np.nan,
-            'Margine medio pp': np.nan, 'Copertura/Prob. %': np.nan,
-        }
-    x = df.copy()
-    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
-    if 'hit_at_1' not in x.columns and 'top1_hit' in x.columns:
-        x['hit_at_1'] = x['top1_hit']
-    if 'hit_at_4' not in x.columns and 'top4_hit' in x.columns:
-        x['hit_at_4'] = x['top4_hit']
-    if 'margin_top1_top2' not in x.columns and {'top1_prob','top2_prob'}.issubset(x.columns):
-        x['margin_top1_top2'] = (
-            pd.to_numeric(x['top1_prob'], errors='coerce')
-            - pd.to_numeric(x['top2_prob'], errors='coerce')
-        )
-    x['hit_at_1'] = pd.to_numeric(x.get('hit_at_1'), errors='coerce')
-    x['hit_at_4'] = pd.to_numeric(x.get('hit_at_4'), errors='coerce')
-    x['margin_top1_top2'] = pd.to_numeric(x.get('margin_top1_top2'), errors='coerce')
-    x = x.dropna(subset=['top1_prob','hit_at_1','hit_at_4'])
-    n_oos = len(x)
-    s = x[x['top1_prob'] >= prob_threshold].copy()
-    n = len(s)
-    if n == 0:
-        return {
-            'N OOS': int(n_oos), 'N selezioni >= soglia': 0,
-            'Quota selezionata %': 0.0, 'Top1 hit %': np.nan,
-            'IC95% Top1 low %': np.nan, 'IC95% Top1 high %': np.nan,
-            'Top4 hit %': np.nan, 'Prob. media Top1 %': np.nan,
-            'Margine medio pp': np.nan, 'Copertura/Prob. %': np.nan,
-        }
-    wins = int(s['hit_at_1'].sum())
-    lo, hi = _v14_7_wilson_interval(wins, n)
-    mean_p = float(s['top1_prob'].mean())
-    return {
-        'N OOS': int(n_oos),
-        'N selezioni >= soglia': int(n),
-        'Quota selezionata %': 100.0 * n / max(1, n_oos),
-        'Top1 hit %': 100.0 * wins / n,
-        'IC95% Top1 low %': 100.0 * lo,
-        'IC95% Top1 high %': 100.0 * hi,
-        'Top4 hit %': 100.0 * float(s['hit_at_4'].mean()),
-        'Prob. media Top1 %': 100.0 * mean_p,
-        'Margine medio pp': 100.0 * float(s['margin_top1_top2'].mean()) if 'margin_top1_top2' in s.columns else np.nan,
-        'Copertura/Prob. %': 100.0 * float(s['hit_at_1'].mean()) / max(1e-9, mean_p),
-    }
-
-
-def mostra_v14_9_temporal_stability(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.9 — STABILITÀ TEMPORALE SOGLIA 35%')
-    st.caption('Test diagnostico: tutto lo storico OOS viene ordinato per data e diviso in 4 finestre cronologiche. La soglia 35% resta fissa ex ante e non viene ottimizzata.')
-    with st.expander('Apri V14.9 — Temporal Stability', expanded=False):
-        if st.button('🔬 ESEGUI V14.9 — STABILITÀ TEMPORALE 35%', key='v14_9_run'):
-            frames=[]; errors=[]
-            with st.spinner('Calcolo stabilità temporale sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        _, d = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
-                        if d is not None and not d.empty:
-                            frames.append(d.assign(Campionato=camp))
-                    except Exception as e:
-                        errors.append((camp, f'{type(e).__name__}: {e}'))
-
-            if frames:
-                all_df = pd.concat(frames, ignore_index=True)
-                all_df['data'] = pd.to_datetime(all_df['data'], errors='coerce')
-                all_df = all_df.dropna(subset=['data']).sort_values('data').reset_index(drop=True)
-
-                st.markdown('### 1. Stabilità aggregata per finestra cronologica')
-                n = len(all_df)
-                if n >= 20:
-                    labels = ['Finestra 1 (più vecchia)', 'Finestra 2', 'Finestra 3', 'Finestra 4 (più recente)']
-                    all_df['_window'] = pd.qcut(all_df.index, q=4, labels=labels, duplicates='drop')
-                    rows=[]
-                    for window, g in all_df.groupby('_window', observed=True):
-                        s = _v14_9_window_summary(g, 0.35)
-                        rows.append({'Finestra':str(window), **s})
-                    win_df = pd.DataFrame(rows)
-                    st.dataframe(win_df.round(4), use_container_width=True, hide_index=True)
-                    st.caption('Le finestre sono cronologiche e hanno numerosità OOS simile. Le metriche Top1/Top4 sono calcolate solo sulle selezioni con probabilità Top1 >=35%.')
-
-                    st.markdown('### 2. Dettaglio per campionato e finestra')
-                    rows=[]
-                    for camp, gc in all_df.groupby('Campionato'):
-                        if len(gc) < 20:
-                            continue
-                        gc = gc.sort_values('data').reset_index(drop=True)
-                        gc['_window'] = pd.qcut(gc.index, q=4, labels=labels, duplicates='drop')
-                        for window, g in gc.groupby('_window', observed=True):
-                            s = _v14_9_window_summary(g, 0.35)
-                            rows.append({'Campionato':camp, 'Finestra':str(window), **s})
-                    by_league = pd.DataFrame(rows)
-                    if not by_league.empty:
-                        st.dataframe(by_league.round(4), use_container_width=True, hide_index=True)
-                    else:
-                        st.info('Campioni per campionato insufficienti per creare 4 finestre affidabili.')
-
-                    st.markdown('### 3. Confronto prima vs ultima finestra')
-                    first = _v14_9_window_summary(all_df[all_df['_window'] == labels[0]], 0.35)
-                    last = _v14_9_window_summary(all_df[all_df['_window'] == labels[-1]], 0.35)
-                    cmp = pd.DataFrame([{
-                        'Metrica':'Top1 hit %', 'Prima finestra':first['Top1 hit %'], 'Ultima finestra':last['Top1 hit %'],
-                        'Delta ultima-prima pp':last['Top1 hit %'] - first['Top1 hit %']
-                    },{
-                        'Metrica':'Top4 hit %', 'Prima finestra':first['Top4 hit %'], 'Ultima finestra':last['Top4 hit %'],
-                        'Delta ultima-prima pp':last['Top4 hit %'] - first['Top4 hit %']
-                    },{
-                        'Metrica':'Prob. media Top1 %', 'Prima finestra':first['Prob. media Top1 %'], 'Ultima finestra':last['Prob. media Top1 %'],
-                        'Delta ultima-prima pp':last['Prob. media Top1 %'] - first['Prob. media Top1 %']
-                    },{
-                        'Metrica':'Margine medio pp', 'Prima finestra':first['Margine medio pp'], 'Ultima finestra':last['Margine medio pp'],
-                        'Delta ultima-prima pp':last['Margine medio pp'] - first['Margine medio pp']
-                    },{
-                        'Metrica':'Copertura/Prob. %', 'Prima finestra':first['Copertura/Prob. %'], 'Ultima finestra':last['Copertura/Prob. %'],
-                        'Delta ultima-prima pp':last['Copertura/Prob. %'] - first['Copertura/Prob. %']
-                    }])
-                    st.dataframe(cmp.round(4), use_container_width=True, hide_index=True)
-                    st.info('Questo confronto descrive l’eventuale drift temporale. Non trasferisce automaticamente alcuna modifica alla soglia o all’operativa.')
-
-                    st.markdown('### 4. Export')
-                    export_cols=['Campionato','data','casa','trasferta','true_combo','top1_combo','top1_prob','top2_prob','top1_hit','top4_hit']
-                    export_cols=[c for c in export_cols if c in all_df.columns]
-                    st.download_button(
-                        '⬇️ Scarica V14.9 temporal stability CSV',
-                        data=all_df[export_cols].to_csv(index=False).encode('utf-8'),
-                        file_name='V14_9_temporal_stability_35pct.csv',
-                        mime='text/csv', key='v14_9_dl'
-                    )
-                else:
-                    st.warning('Numero di osservazioni OOS insufficiente per una divisione in 4 finestre.')
-
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome,msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-
-# 🧪 V14.10 — DRIFT DI CALIBRAZIONE TEMPORALE DELLE SELEZIONI >=35% (SOLO DIAGNOSTICO)
-
-def _v14_10_calibration_window_summary(g, prob_threshold=0.35):
-    x = g.copy()
-    if 'hit_at_1' not in x.columns and 'top1_hit' in x.columns:
-        x['hit_at_1'] = x['top1_hit']
-    if 'top1_prob' not in x.columns:
-        return None
-    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
-    x['hit_at_1'] = pd.to_numeric(x.get('hit_at_1'), errors='coerce')
-    x = x.dropna(subset=['top1_prob', 'hit_at_1'])
-    s = x[x['top1_prob'] >= prob_threshold].copy()
-    n = len(s)
-    if n == 0:
-        return {
-            'N selezioni': 0,
-            'Top1 hit %': np.nan,
-            'Prob. media Top1 %': np.nan,
-            'Gap calibrazione pp': np.nan,
-            'Brier Top1': np.nan,
-            'Log Loss Top1': np.nan,
-        }
-    y = s['hit_at_1'].astype(float).to_numpy()
-    p = np.clip(s['top1_prob'].astype(float).to_numpy(), 1e-6, 1-1e-6)
-    hit = float(y.mean())
-    mean_p = float(p.mean())
-    brier = float(np.mean((p-y)**2))
-    logloss = float(-np.mean(y*np.log(p) + (1-y)*np.log(1-p)))
-    return {
-        'N selezioni': int(n),
-        'Top1 hit %': 100.0 * hit,
-        'Prob. media Top1 %': 100.0 * mean_p,
-        'Gap calibrazione pp': 100.0 * (hit - mean_p),
-        'Brier Top1': brier,
-        'Log Loss Top1': logloss,
-    }
-
-
-def mostra_v14_10_temporal_calibration_drift(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.10 — DRIFT DI CALIBRAZIONE TEMPORALE SOGLIA 35%')
-    st.caption('Test diagnostico: misura se il rapporto tra probabilità Top1 prevista e hit Top1 realizzata cambia nel tempo sulle sole selezioni >=35%. Nessuna modifica all’operativa.')
-    with st.expander('Apri V14.10 — Temporal Calibration Drift', expanded=False):
-        if st.button('🔬 ESEGUI V14.10 — DRIFT CALIBRAZIONE 35%', key='v14_10_run'):
-            frames=[]; errors=[]
-            with st.spinner('Calcolo drift di calibrazione sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        _, d = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
-                        if d is not None and not d.empty:
-                            frames.append(d.assign(Campionato=camp))
-                    except Exception as e:
-                        errors.append((camp, f'{type(e).__name__}: {e}'))
-
-            if frames:
-                all_df = pd.concat(frames, ignore_index=True)
-                all_df['data'] = pd.to_datetime(all_df['data'], errors='coerce')
-                all_df = all_df.dropna(subset=['data']).sort_values('data').reset_index(drop=True)
-
-                if len(all_df) >= 20:
-                    labels = ['Finestra 1 (più vecchia)', 'Finestra 2', 'Finestra 3', 'Finestra 4 (più recente)']
-                    all_df['_window'] = pd.qcut(all_df.index, q=4, labels=labels, duplicates='drop')
-
-                    st.markdown('### 1. Calibrazione Top1 nelle selezioni >=35%')
-                    rows=[]
-                    for window, g in all_df.groupby('_window', observed=True):
-                        s = _v14_10_calibration_window_summary(g, 0.35)
-                        if s is not None:
-                            s['Finestra'] = str(window)
-                            rows.append(s)
-                    cal_df = pd.DataFrame(rows)
-                    if not cal_df.empty:
-                        cols=['Finestra','N selezioni','Top1 hit %','Prob. media Top1 %','Gap calibrazione pp','Brier Top1','Log Loss Top1']
-                        st.dataframe(cal_df[cols].round(4), use_container_width=True, hide_index=True)
-                        st.caption('Gap calibrazione = Top1 hit % − probabilità media Top1 %. Un valore negativo indica probabilità media superiore agli hit osservati.')
-
-                    st.markdown('### 2. Prima vs ultima finestra')
-                    first = _v14_10_calibration_window_summary(all_df[all_df['_window'] == labels[0]], 0.35)
-                    last = _v14_10_calibration_window_summary(all_df[all_df['_window'] == labels[-1]], 0.35)
-                    if first and last and first['N selezioni'] > 0 and last['N selezioni'] > 0:
-                        cmp = pd.DataFrame([
-                            {'Metrica':'Top1 hit %','Prima finestra':first['Top1 hit %'],'Ultima finestra':last['Top1 hit %'],'Delta ultima-prima pp':last['Top1 hit %']-first['Top1 hit %']},
-                            {'Metrica':'Prob. media Top1 %','Prima finestra':first['Prob. media Top1 %'],'Ultima finestra':last['Prob. media Top1 %'],'Delta ultima-prima pp':last['Prob. media Top1 %']-first['Prob. media Top1 %']},
-                            {'Metrica':'Gap calibrazione pp','Prima finestra':first['Gap calibrazione pp'],'Ultima finestra':last['Gap calibrazione pp'],'Delta ultima-prima pp':last['Gap calibrazione pp']-first['Gap calibrazione pp']},
-                            {'Metrica':'Brier Top1','Prima finestra':first['Brier Top1'],'Ultima finestra':last['Brier Top1'],'Delta ultima-prima pp':last['Brier Top1']-first['Brier Top1']},
-                            {'Metrica':'Log Loss Top1','Prima finestra':first['Log Loss Top1'],'Ultima finestra':last['Log Loss Top1'],'Delta ultima-prima pp':last['Log Loss Top1']-first['Log Loss Top1']},
-                        ])
-                        st.dataframe(cmp.round(4), use_container_width=True, hide_index=True)
-
-                    st.markdown('### 3. Dettaglio per campionato')
-                    rows=[]
-                    for camp, gc in all_df.groupby('Campionato'):
-                        if len(gc) < 20:
-                            continue
-                        gc=gc.sort_values('data').reset_index(drop=True)
-                        gc['_window']=pd.qcut(gc.index, q=4, labels=labels, duplicates='drop')
-                        for window, g in gc.groupby('_window', observed=True):
-                            s=_v14_10_calibration_window_summary(g,0.35)
-                            if s is not None:
-                                rows.append({'Campionato':camp,'Finestra':str(window),**s})
-                    by_league=pd.DataFrame(rows)
-                    if not by_league.empty:
-                        st.dataframe(by_league.round(4),use_container_width=True,hide_index=True)
-
-                    st.markdown('### 4. Export')
-                    export_cols=['Campionato','data','casa','trasferta','true_combo','top1_combo','top1_prob','top2_prob','top1_hit','top4_hit','margin_top1_top2']
-                    export_cols=[c for c in export_cols if c in all_df.columns]
-                    st.download_button(
-                        '⬇️ Scarica V14.10 temporal calibration CSV',
-                        data=all_df[export_cols].to_csv(index=False).encode('utf-8'),
-                        file_name='V14_10_temporal_calibration_35pct.csv',
-                        mime='text/csv', key='v14_10_dl'
-                    )
-                else:
-                    st.warning('Numero di osservazioni OOS insufficiente per una divisione in 4 finestre.')
-
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome,msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-# 🧪 V14.11 — CALIBRAZIONE PER FASCE DI CONFIDENZA ≥35% (SOLO DIAGNOSTICO)
-
-def _v14_11_band_summary(g, prob_threshold=0.35):
-    x = g.copy()
-    if 'hit_at_1' not in x.columns and 'top1_hit' in x.columns:
-        x['hit_at_1'] = x['top1_hit']
-    if 'top1_prob' not in x.columns:
-        return pd.DataFrame()
-    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
-    x['hit_at_1'] = pd.to_numeric(x.get('hit_at_1'), errors='coerce')
-    x = x.dropna(subset=['top1_prob', 'hit_at_1'])
-    x = x[x['top1_prob'] >= prob_threshold].copy()
-    if x.empty:
-        return pd.DataFrame()
-
-    bands = [0.35, 0.40, 0.45, 0.50, 0.60, 1.0000001]
-    labels = ['35–40%', '40–45%', '45–50%', '50–60%', '≥60%']
-    x['_band'] = pd.cut(x['top1_prob'], bins=bands, labels=labels, right=False, include_lowest=True)
-
-    rows = []
-    for band, gband in x.groupby('_band', observed=True):
-        n = len(gband)
-        y = gband['hit_at_1'].astype(float).to_numpy()
-        p = np.clip(gband['top1_prob'].astype(float).to_numpy(), 1e-6, 1-1e-6)
-        hit = float(y.mean())
-        mean_p = float(p.mean())
-        rows.append({
-            'Fascia probabilità': str(band),
-            'N': int(n),
-            'Top1 hit %': 100.0 * hit,
-            'Prob. media %': 100.0 * mean_p,
-            'Gap calibrazione pp': 100.0 * (hit - mean_p),
-            'Brier': float(np.mean((p-y)**2)),
-            'Log Loss': float(-np.mean(y*np.log(p) + (1-y)*np.log(1-p))),
-        })
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out['_abs_gap_weight'] = out['N'] * out['Gap calibrazione pp'].abs()
-        total_n = out['N'].sum()
-        ece = float(out['_abs_gap_weight'].sum() / total_n) if total_n else np.nan
-        out.attrs['ECE_pp'] = ece
-    return out
-
-
-def mostra_v14_11_confidence_bands(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.11 — CALIBRAZIONE PER FASCE DI CONFIDENZA ≥35%')
-    st.caption('Test diagnostico: verifica dove si concentra l’errore di calibrazione tra le selezioni Top1 con probabilità ≥35%. Nessuna modifica all’operativa e nessuna nuova soglia proposta automaticamente.')
-    with st.expander('Apri V14.11 — Confidence Bands', expanded=False):
-        if st.button('🔬 ESEGUI V14.11 — FASCE CONFIDENZA 35%+', key='v14_11_run'):
-            frames=[]; errors=[]
-            with st.spinner('Calcolo calibrazione per fasce sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        _, d = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
-                        if d is not None and not d.empty:
-                            frames.append(d.assign(Campionato=camp))
-                    except Exception as e:
-                        errors.append((camp, f'{type(e).__name__}: {e}'))
-
-            if frames:
-                all_df = pd.concat(frames, ignore_index=True)
-                all_df['data'] = pd.to_datetime(all_df['data'], errors='coerce')
-                all_df = all_df.dropna(subset=['data']).sort_values('data').reset_index(drop=True)
-
-                st.markdown('### 1. Storico OOS — fasce di probabilità')
-                hist = _v14_11_band_summary(all_df, 0.35)
-                if not hist.empty:
-                    st.dataframe(hist.drop(columns=['_abs_gap_weight']).round(4), use_container_width=True, hide_index=True)
-                    st.caption(f"ECE pesato sulle sole selezioni ≥35%: {hist.attrs.get('ECE_pp', np.nan):.2f} pp")
-                else:
-                    st.info('Nessuna selezione ≥35% disponibile.')
-
-                st.markdown('### 2. Stagione corrente OOS — fasce di probabilità')
-                if 'data' in all_df.columns:
-                    latest_year = int(all_df['data'].dt.year.max())
-                    current_cut = pd.Timestamp(year=latest_year, month=8, day=1)
-                    curr = all_df[all_df['data'] >= current_cut].copy()
-                else:
-                    curr = pd.DataFrame()
-                curr = _v14_11_band_summary(curr, 0.35)
-                if not curr.empty:
-                    st.dataframe(curr.drop(columns=['_abs_gap_weight']).round(4), use_container_width=True, hide_index=True)
-                    st.caption(f"ECE pesato stagione corrente OOS (dal 1° agosto dell'anno più recente presente nei dati): {curr.attrs.get('ECE_pp', np.nan):.2f} pp")
-                else:
-                    st.info('Nessuna selezione ≥35% nella finestra corrente disponibile.')
-
-                st.markdown('### 3. Confronto aggregato storico vs stagione corrente')
-                def _overall_band(g, period):
-                    h = _v14_11_band_summary(g, 0.35)
-                    if h.empty:
-                        return pd.DataFrame()
-                    h = h.drop(columns=['_abs_gap_weight']).copy()
-                    h.insert(0, 'Periodo', period)
-                    return h
-                cmp_frames=[]
-                h1=_overall_band(all_df,'Tutto lo storico OOS')
-                h2=_overall_band(all_df[all_df['data'] >= current_cut],'Stagione corrente OOS')
-                if not h1.empty: cmp_frames.append(h1)
-                if not h2.empty: cmp_frames.append(h2)
-                if cmp_frames:
-                    st.dataframe(pd.concat(cmp_frames, ignore_index=True).round(4), use_container_width=True, hide_index=True)
-
-                st.markdown('### 4. Dettaglio per campionato — storico OOS')
-                rows=[]
-                for camp, gc in all_df.groupby('Campionato'):
-                    h=_v14_11_band_summary(gc,0.35)
-                    if not h.empty:
-                        for _,r in h.iterrows():
-                            rows.append({'Campionato':camp,**r.to_dict()})
-                by_league=pd.DataFrame(rows)
-                if not by_league.empty:
-                    st.dataframe(by_league.drop(columns=['_abs_gap_weight'], errors='ignore').round(4),use_container_width=True,hide_index=True)
-
-                st.markdown('### 5. Export')
-                export_cols=['Campionato','data','casa','trasferta','true_combo','top1_combo','top1_prob','top2_prob','top1_hit','top4_hit','margin_top1_top2']
-                export_cols=[c for c in export_cols if c in all_df.columns]
-                st.download_button(
-                    '⬇️ Scarica V14.11 confidence bands CSV',
-                    data=all_df[export_cols].to_csv(index=False).encode('utf-8'),
-                    file_name='V14_11_confidence_bands_35pct.csv',
-                    mime='text/csv', key='v14_11_dl'
-                )
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome,msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-mostra_v14_10_temporal_calibration_drift(rho_val, ewma_span_val, emivita_val)
-mostra_v14_11_confidence_bands(rho_val, ewma_span_val, emivita_val)
-
-# =====================================================================
-# 🧪 V14.12-FIX — PLATT TOP1 WALK-FORWARD (SOLO DIAGNOSTICO)
-# Fix robusto del blocco V14.12.
-# Principi:
-#   1) valutazione SOLO sulle selezioni Top1 >= 35%;
-#   2) fit per singolo campionato usando esclusivamente osservazioni precedenti;
-#   3) training massimo 100 osservazioni precedenti; minimo 50 per applicare PLATT;
-#   4) training su tutte le Top1 storiche precedenti del campionato, mentre
-#      l'universo di valutazione resta limitato alle selezioni >=35%, così
-#      ogni campionato dispone di un campione di training sufficiente;
-#   5) nessuna informazione della partita da predire entra nel fit;
-#   6) niente np.array_split su DataFrame e indexing NumPy fragile nel ramo
-#      diagnostico, per evitare il KeyError/IndexError dell'ambiente Streamlit.
-# =====================================================================
-
-V14_12_PROB_THRESHOLD = 0.35
-V14_12_MIN_TRAIN = 50
-V14_12_MAX_TRAIN = 100
-
-
-def _v14_12_fit_platt_top1(hist_df, n_train=100):
-    """Fit Platt sulla logit della Top1 usando solo osservazioni precedenti."""
-    if hist_df is None or hist_df.empty:
-        return None, np.nan, 'nessun training', 0
-
-    x = hist_df.copy()
-    required = ['top1_prob', 'top1_hit']
-    if any(c not in x.columns for c in required):
-        return None, np.nan, 'colonne mancanti', 0
-
-    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
-    x['top1_hit'] = pd.to_numeric(x['top1_hit'], errors='coerce')
-    x = x.dropna(subset=required).copy()
-    x = x[x['top1_prob'].between(1e-6, 1.0 - 1e-6)]
-    x['top1_hit'] = x['top1_hit'].astype(int)
-    x = x.tail(int(min(max(n_train, V14_12_MIN_TRAIN), V14_12_MAX_TRAIN)))
-
-    n = len(x)
-    if n < V14_12_MIN_TRAIN:
-        return None, np.nan, 'campione insufficiente', n
-
-    y = np.asarray(x['top1_hit'].to_numpy(dtype=int)).reshape(-1)
-    if np.unique(y).size < 2:
-        return None, np.nan, 'un solo esito presente nel training', n
-
-    p = np.asarray(x['top1_prob'].to_numpy(dtype=float)).reshape(-1)
-    z = np.log(p / (1.0 - p)).reshape(-1, 1)
-
-    model = LogisticRegression(solver='lbfgs', C=1e6, max_iter=1000)
-    model.fit(z, y)
-
-    coef_arr = np.asarray(model.coef_, dtype=float).reshape(-1)
-    coef = float(coef_arr[0]) if coef_arr.size else np.nan
-    if not np.isfinite(coef) or coef <= 0.0:
-        return None, coef, 'fit non monotono: pendenza non positiva', n
-
-    return model, coef, 'applicabile', n
-
-
-def _v14_12_predict_platt_top1(p_raw, model):
-    p_raw = float(np.clip(float(p_raw), 1e-6, 1.0 - 1e-6))
-    if model is None:
-        return p_raw
-
-    z = np.asarray([[np.log(p_raw / (1.0 - p_raw))]], dtype=float)
-    proba = np.asarray(model.predict_proba(z), dtype=float).reshape(-1)
-    if proba.size < 2:
-        return p_raw
-    return float(np.clip(proba[1], 1e-6, 1.0 - 1e-6))
-
-
-def _v14_12_metrics(g, period_label):
-    """Metriche su un gruppo di selezioni >=35%."""
-    if g is None or g.empty:
-        return None
-
-    y = np.asarray(g['top1_hit'].to_numpy(dtype=float)).reshape(-1)
-    p0 = np.clip(np.asarray(g['top1_prob_raw'].to_numpy(dtype=float)).reshape(-1), 1e-6, 1.0 - 1e-6)
-    p1 = np.clip(np.asarray(g['top1_prob_platt'].to_numpy(dtype=float)).reshape(-1), 1e-6, 1.0 - 1e-6)
-
-    return {
-        'Periodo': period_label,
-        'N selezioni >=35%': int(len(g)),
-        'N PLATT applicato': int(g['platt_applied'].sum()) if 'platt_applied' in g.columns else int(len(g)),
-        'Top1 hit %': 100.0 * float(y.mean()),
-        'RAW Prob. media %': 100.0 * float(p0.mean()),
-        'PLATT Prob. media %': 100.0 * float(p1.mean()),
-        'RAW Gap calibrazione pp': 100.0 * float(y.mean() - p0.mean()),
-        'PLATT Gap calibrazione pp': 100.0 * float(y.mean() - p1.mean()),
-        'RAW Brier': float(np.mean((p0 - y) ** 2)),
-        'PLATT Brier': float(np.mean((p1 - y) ** 2)),
-        'RAW Log Loss': float(-np.mean(y * np.log(p0) + (1.0 - y) * np.log(1.0 - p0))),
-        'PLATT Log Loss': float(-np.mean(y * np.log(p1) + (1.0 - y) * np.log(1.0 - p1))),
-        'Delta Brier pp': 100.0 * float(np.mean((p1 - y) ** 2) - np.mean((p0 - y) ** 2)),
-        'Delta Log Loss': float(
-            -np.mean(y * np.log(p1) + (1.0 - y) * np.log(1.0 - p1))
-            + np.mean(y * np.log(p0) + (1.0 - y) * np.log(1.0 - p0))
-        ),
-    }
-
-
-def _v14_12_walkforward_top1(df, n_train=100, prob_threshold=V14_12_PROB_THRESHOLD):
-    """Walk-forward robusto: fit sul passato, valutazione solo Top1 >=35%."""
-    if df is None or df.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    x = df.copy()
-    if 'data' in x.columns:
-        x['data'] = pd.to_datetime(x['data'], errors='coerce')
-        x = x.sort_values(['data'], kind='mergesort').reset_index(drop=True)
-
-    required = ['top1_prob', 'top1_hit']
-    if any(c not in x.columns for c in required):
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    x['top1_prob'] = pd.to_numeric(x['top1_prob'], errors='coerce')
-    x['top1_hit'] = pd.to_numeric(x['top1_hit'], errors='coerce')
-    x = x.dropna(subset=required).copy().reset_index(drop=True)
-    x['top1_hit'] = x['top1_hit'].astype(int)
-
-    rows = []
-    train_limit = int(min(max(n_train, V14_12_MIN_TRAIN), V14_12_MAX_TRAIN))
-
-    for i in range(len(x)):
-        p_raw = float(x.iloc[i]['top1_prob'])
-        if not np.isfinite(p_raw):
-            continue
-        y = int(x.iloc[i]['top1_hit'])
-
-        # La partita entra nella valutazione solo se supera la soglia 35%.
-        selected = p_raw >= float(prob_threshold)
-
-        prior = x.iloc[:i][['top1_prob', 'top1_hit']].copy()
-        model = None
-        coef = np.nan
-        reason = 'non selezionata < soglia'
-        n_eff = min(len(prior), train_limit)
-
-        if selected:
-            model, coef, reason, n_eff = _v14_12_fit_platt_top1(prior, n_train=train_limit)
-
-        p_platt = _v14_12_predict_platt_top1(p_raw, model) if selected else p_raw
-
-        # Dettaglio solo per l'universo selezionato >=35%, così il CSV è coerente
-        # con V14.11 e con il test di calibrazione che stiamo approfondendo.
-        if selected:
-            row = {
-                **{k: x.iloc[i][k] for k in ['data', 'casa', 'trasferta'] if k in x.columns},
-                'top1_hit': y,
-                'top1_prob_raw': p_raw,
-                'top1_prob_platt': p_platt,
-                'platt_applied': bool(model is not None),
-                'platt_coef': coef,
-                'platt_train_n': int(n_eff),
-                'platt_reason': reason,
-            }
-            rows.append(row)
-
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out, pd.DataFrame(), pd.DataFrame()
-
-    # Le righe precedenti alla disponibilità di almeno 50 osservazioni restano
-    # nell'universo ma RAW=PLATT e sono marcate platt_applied=False.
-    summary_rows = []
-    all_metrics = _v14_12_metrics(out, 'Tutto lo storico OOS')
-    if all_metrics is not None:
-        summary_rows.append(all_metrics)
-
-    if 'data' in out.columns and out['data'].notna().any():
-        latest_year = int(pd.to_datetime(out['data'], errors='coerce').dt.year.max())
-        cut = pd.Timestamp(year=latest_year, month=8, day=1)
-        curr = out[pd.to_datetime(out['data'], errors='coerce') >= cut].copy()
-        if not curr.empty:
-            current_metrics = _v14_12_metrics(curr, 'Stagione corrente OOS')
-            if current_metrics is not None:
-                summary_rows.append(current_metrics)
-
-    summary = pd.DataFrame(summary_rows)
-
-    # Stabilità temporale: quattro finestre con split sugli INDICI, non np.array_split.
-    temporal_rows = []
-    n = len(out)
-    if n >= 20:
-        edges = np.linspace(0, n, 5, dtype=int)
-        labels = ['Finestra 1 (più vecchia)', 'Finestra 2', 'Finestra 3', 'Finestra 4 (più recente)']
-        for j, lab in enumerate(labels):
-            a, b = int(edges[j]), int(edges[j + 1])
-            ch = out.iloc[a:b].copy()
-            if not ch.empty:
-                met = _v14_12_metrics(ch, lab)
-                if met is not None:
-                    temporal_rows.append(met)
-
-    temporal_df = pd.DataFrame(temporal_rows)
-    return out, summary, temporal_df
-
-
-def mostra_v14_12_top1_platt_walkforward(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.12-FIX — PLATT TOP1 WALK-FORWARD ≥35%')
-    st.caption(
-        'Solo diagnostico. La valutazione usa esclusivamente selezioni Top1 ≥35%. '
-        'Il fit è walk-forward per singolo campionato e usa solo osservazioni precedenti; '
-        'training massimo 100, minimo 50. Nessuna modifica alle probabilità operative.'
-    )
-
-    with st.expander('Apri V14.12-FIX — PLATT Top1 Walk-Forward ≥35%', expanded=False):
-        ntrain = st.number_input(
-            'Training PLATT Top1 (massimo)',
-            V14_12_MIN_TRAIN,
-            V14_12_MAX_TRAIN,
-            100,
-            10,
-            key='v14_12_fix_train'
-        )
-
-        if st.button('🔬 ESEGUI V14.12-FIX — PLATT TOP1 ≥35%', key='v14_12_fix_run'):
-            summary_frames = []
-            temporal_frames = []
-            detail_frames = []
-            errors = []
-
-            with st.spinner('Calcolo PLATT walk-forward Top1 ≥35% sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        res = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
-                        if res is None:
-                            continue
-                        _, det = res
-                        if det is None or det.empty:
+                        data = pd.to_datetime(str(r[colonne["DATE"]]).strip(), dayfirst=True, errors="coerce")
+                        gc, gt = int(r[colonne["FTHG"]]), int(r[colonne["FTAG"]])
+                        casa, trasf = str(r[colonne["HOMETEAM"]]).strip(), str(r[colonne["AWAYTEAM"]]).strip()
+                        if pd.isna(data) or not casa or not trasf or gc < 0 or gt < 0:
                             continue
 
-                        wf, sm, tm = _v14_12_walkforward_top1(
-                            det,
-                            int(ntrain),
-                            V14_12_PROB_THRESHOLD
-                        )
+                        stats = {}
+                        for nome_stat, colonna in metriche.items():
+                            valore = None
+                            if colonna in colonne and pd.notna(r[colonne[colonna]]):
+                                try:
+                                    numero = float(r[colonne[colonna]])
+                                    if np.isfinite(numero) and numero >= 0:
+                                        valore = numero
+                                except (TypeError, ValueError, OverflowError):
+                                    pass
+                            stats[nome_stat] = valore
 
-                        if not sm.empty:
-                            summary_frames.append(sm.assign(Campionato=camp))
-                        if not tm.empty:
-                            temporal_frames.append(tm.assign(Campionato=camp))
-                        if not wf.empty:
-                            detail_frames.append(wf.assign(Campionato=camp))
+                        quote = {}
+                        for nome_quota, colonna_quota in colonne_quote.items():
+                            valore_quota = None
+                            if colonna_quota in colonne and pd.notna(r[colonne[colonna_quota]]):
+                                try:
+                                    q = float(r[colonne[colonna_quota]])
+                                    if np.isfinite(q) and q > 1.0:
+                                        valore_quota = q
+                                except (TypeError, ValueError, OverflowError):
+                                    pass
+                            quote[nome_quota] = valore_quota
 
-                    except Exception as e:
-                        # Mostra il tipo e il messaggio; non nasconde il punto
-                        # del nuovo blocco diagnostico dietro un errore generico.
-                        errors.append((camp, f'{type(e).__name__}: {e}'))
-
-            if summary_frames:
-                sdf = pd.concat(summary_frames, ignore_index=True)
-                sdf = sdf[
-                    [
-                        'Campionato', 'Periodo', 'N selezioni >=35%', 'N PLATT applicato',
-                        'Top1 hit %', 'RAW Prob. media %', 'PLATT Prob. media %',
-                        'RAW Gap calibrazione pp', 'PLATT Gap calibrazione pp',
-                        'RAW Brier', 'PLATT Brier', 'RAW Log Loss', 'PLATT Log Loss',
-                        'Delta Brier pp', 'Delta Log Loss'
-                    ]
-                ]
-
-                st.markdown('### 1. RAW vs PLATT — per campionato')
-                st.dataframe(sdf.round(4), use_container_width=True, hide_index=True)
-                st.caption('Delta Brier pp e Delta Log Loss = PLATT − RAW. Valori negativi indicano miglioramento di PLATT.')
-
-                agg_rows = []
-                for periodo, g in sdf.groupby('Periodo', sort=False):
-                    weights = g['N selezioni >=35%'].astype(float)
-                    total_w = float(weights.sum())
-                    if total_w <= 0:
+                        record = {
+                            "status": "FINISHED",
+                            "quoteStoriche": quote,
+                            "utcDate": data.strftime("%Y-%m-%dT12:00:00Z"),
+                            "Competizione": nome_lega,
+                            "homeTeam": {"name": casa},
+                            "awayTeam": {"name": trasf},
+                            "score": {"fullTime": {"home": gc, "away": gt}},
+                            "Stagione audit": stagione,
+                            "statistichePartita": stats,
+                        }
+                        risultati.append(record)
+                        valide_stagione.append(record)
+                        righe_lega += 1
+                    except (TypeError, ValueError, OverflowError):
                         continue
 
-                    def wavg(col):
-                        return float(np.average(g[col].astype(float), weights=weights))
+                n = len(valide_stagione)
+                for nome_stat in metriche:
+                    presenti = sum(x["statistichePartita"][nome_stat] is not None for x in valide_stagione)
+                    copertura.append({
+                        "Competizione": nome_lega, "Stagione": stagione,
+                        "Statistica": nome_stat, "Partite": n,
+                        "Valori disponibili": presenti,
+                        "Valori mancanti": n - presenti,
+                        "Copertura (%)": round(100 * presenti / n, 1) if n else 0.0,
+                    })
+            except Exception as exc:
+                errori.append(f"{stagione}: {type(exc).__name__}")
 
-                    agg_rows.append({
-                        'Periodo': periodo,
-                        'N selezioni >=35%': int(weights.sum()),
-                        'N PLATT applicato': int(g['N PLATT applicato'].sum()),
-                        'Top1 hit %': wavg('Top1 hit %'),
-                        'RAW Prob. media %': wavg('RAW Prob. media %'),
-                        'PLATT Prob. media %': wavg('PLATT Prob. media %'),
-                        'RAW Gap calibrazione pp': wavg('RAW Gap calibrazione pp'),
-                        'PLATT Gap calibrazione pp': wavg('PLATT Gap calibrazione pp'),
-                        'RAW Brier': wavg('RAW Brier'),
-                        'PLATT Brier': wavg('PLATT Brier'),
-                        'RAW Log Loss': wavg('RAW Log Loss'),
-                        'PLATT Log Loss': wavg('PLATT Log Loss'),
-                        'Delta Brier pp': wavg('Delta Brier pp'),
-                        'Delta Log Loss': wavg('Delta Log Loss'),
+        diagnostica.append({
+            "Competizione": nome_lega,
+            "Partite storiche caricate": righe_lega,
+            "Stagioni richieste": ", ".join(stagioni),
+            "Note caricamento": "; ".join(errori) if errori else "OK",
+        })
+
+    return risultati, pd.DataFrame(diagnostica), pd.DataFrame(copertura)
+
+
+
+# --- V20.1: TEST WALK-FORWARD COMPLETO DELLE STATISTICHE DI SQUADRA ---
+STATISTICHE_V201 = {
+    "Angoli": ("Angoli casa", "Angoli trasferta"),
+    "Tiri totali": ("Tiri casa", "Tiri trasferta"),
+    "Tiri in porta": ("Tiri in porta casa", "Tiri in porta trasferta"),
+    "Falli": ("Falli casa", "Falli trasferta"),
+    "Ammonizioni": ("Ammonizioni casa", "Ammonizioni trasferta"),
+    "Espulsioni": ("Espulsioni casa", "Espulsioni trasferta"),
+}
+
+def _media_recenti_v201(valori, finestra=10, minimo=3):
+    """Media degli ultimi valori già osservati; None se lo storico è insufficiente."""
+    if len(valori) < minimo:
+        return None
+    campione = valori[-finestra:]
+    return float(np.mean(campione)) if campione else None
+
+
+def crea_test_statistiche_v201(matches_list, finestra=10, minimo_storico=3):
+    """
+    Testa tutte le statistiche in un unico walk-forward cronologico.
+    Le partite della stessa data sono tutte previste prima di aggiornare lo storico:
+    nessuna partita può quindi usare dati di un'altra partita dello stesso giorno.
+    Per ciascuna squadra/stadio la stima combina:
+      - media recente della squadra nel proprio ruolo (casa/trasferta);
+      - media recente concessa dall'avversaria nel ruolo opposto.
+    Il test è diagnostico: non modifica il modello operativo.
+    """
+    if not matches_list:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    righe = []
+    for m in matches_list:
+        try:
+            data = pd.to_datetime(m.get("utcDate"), utc=True, errors="coerce")
+            comp = m.get("Competizione", "N/D")
+            casa = m.get("homeTeam", {}).get("name", "")
+            trasf = m.get("awayTeam", {}).get("name", "")
+            stats = m.get("statistichePartita", {}) or {}
+            if pd.isna(data) or not casa or not trasf:
+                continue
+            valori = dict(stats)
+            # Totale cartellini = gialli + rossi; resta mancante se manca uno dei componenti.
+            for lato, giallo, rosso in (
+                ("casa", "Ammonizioni casa", "Espulsioni casa"),
+                ("trasferta", "Ammonizioni trasferta", "Espulsioni trasferta"),
+            ):
+                a, r = valori.get(giallo), valori.get(rosso)
+                valori[f"Cartellini totali {lato}"] = (
+                    float(a) + float(r) if a is not None and r is not None else None
+                )
+            righe.append({
+                "data": data.normalize(), "competizione": comp,
+                "stagione": m.get("Stagione audit", "N/D"),
+                "casa": casa, "trasferta": trasf, "valori": valori,
+            })
+        except Exception:
+            continue
+
+    if not righe:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    righe.sort(key=lambda x: (x["data"], x["competizione"], x["casa"], x["trasferta"]))
+    # Storico per competizione, squadra e ruolo: fatti e concessi.
+    storico = {}
+    metriche = dict(STATISTICHE_V201)
+    metriche["Cartellini totali"] = ("Cartellini totali casa", "Cartellini totali trasferta")
+    predizioni = []
+
+    def chiave(comp, team, ruolo):
+        return (comp, team, ruolo)
+
+    i = 0
+    while i < len(righe):
+        giorno = righe[i]["data"]
+        gruppo = []
+        while i < len(righe) and righe[i]["data"] == giorno:
+            gruppo.append(righe[i])
+            i += 1
+
+        # Prima si producono tutte le previsioni del giorno.
+        for m in gruppo:
+            comp, casa, trasf = m["competizione"], m["casa"], m["trasferta"]
+            out = {"Data": giorno, "Competizione": comp,
+                   "Stagione": m.get("stagione", "N/D"),
+                   "Casa": casa, "Trasferta": trasf}
+            for nome, (col_casa, col_trasf) in metriche.items():
+                hc = storico.get(chiave(comp, casa, "casa"), {}).get(nome, {"fatti": [], "concessi": []})
+                at = storico.get(chiave(comp, trasf, "trasferta"), {}).get(nome, {"fatti": [], "concessi": []})
+                ht = storico.get(chiave(comp, casa, "casa"), {}).get(nome, {"fatti": [], "concessi": []})
+                ac = storico.get(chiave(comp, trasf, "trasferta"), {}).get(nome, {"fatti": [], "concessi": []})
+                # Stima casa: attacco casa + concessi dell'avversaria in trasferta.
+                media_att_c = _media_recenti_v201(hc["fatti"], finestra, minimo_storico)
+                media_conc_t = _media_recenti_v201(at["concessi"], finestra, minimo_storico)
+                # Stima trasferta: attacco trasferta + concessi della squadra di casa.
+                media_att_t = _media_recenti_v201(at["fatti"], finestra, minimo_storico)
+                media_conc_c = _media_recenti_v201(hc["concessi"], finestra, minimo_storico)
+                stima_c = np.mean([media_att_c, media_conc_t]) if media_att_c is not None and media_conc_t is not None else None
+                stima_t = np.mean([media_att_t, media_conc_c]) if media_att_t is not None and media_conc_c is not None else None
+                reale_c, reale_t = m["valori"].get(col_casa), m["valori"].get(col_trasf)
+                out[f"{nome} casa prevista"] = float(stima_c) if stima_c is not None else np.nan
+                out[f"{nome} trasferta prevista"] = float(stima_t) if stima_t is not None else np.nan
+                # Baseline semplice e causale: media recente della sola squadra nel proprio ruolo.
+                base_c = _media_recenti_v201(hc["fatti"], finestra, minimo_storico)
+                base_t = _media_recenti_v201(at["fatti"], finestra, minimo_storico)
+                out[f"{nome} casa baseline"] = float(base_c) if base_c is not None else np.nan
+                out[f"{nome} trasferta baseline"] = float(base_t) if base_t is not None else np.nan
+                out[f"{nome} casa reale"] = reale_c if reale_c is not None else np.nan
+                out[f"{nome} trasferta reale"] = reale_t if reale_t is not None else np.nan
+                out[f"{nome} storico casa"] = min(len(hc["fatti"]), finestra)
+                out[f"{nome} storico trasferta"] = min(len(at["fatti"]), finestra)
+            predizioni.append(out)
+
+        # Solo dopo aver previsto l'intera giornata, si aggiornano gli storici.
+        for m in gruppo:
+            comp, casa, trasf = m["competizione"], m["casa"], m["trasferta"]
+            for nome, (col_casa, col_trasf) in metriche.items():
+                vc, vt = m["valori"].get(col_casa), m["valori"].get(col_trasf)
+                if vc is not None:
+                    k = chiave(comp, casa, "casa")
+                    storico.setdefault(k, {}).setdefault(nome, {"fatti": [], "concessi": []})
+                    storico[k][nome]["fatti"].append(float(vc))
+                if vt is not None:
+                    k = chiave(comp, trasf, "trasferta")
+                    storico.setdefault(k, {}).setdefault(nome, {"fatti": [], "concessi": []})
+                    storico[k][nome]["fatti"].append(float(vt))
+                # Valori concessi aggiornati nello storico dell'altra squadra/ruolo.
+                if vt is not None:
+                    k = chiave(comp, casa, "casa")
+                    storico.setdefault(k, {}).setdefault(nome, {"fatti": [], "concessi": []})
+                    storico[k][nome]["concessi"].append(float(vt))
+                if vc is not None:
+                    k = chiave(comp, trasf, "trasferta")
+                    storico.setdefault(k, {}).setdefault(nome, {"fatti": [], "concessi": []})
+                    storico[k][nome]["concessi"].append(float(vc))
+
+    df_pred = pd.DataFrame(predizioni)
+    metriche_rows = []
+    dettaglio_rows = []
+    for nome in metriche:
+        pc, rc = f"{nome} casa prevista", f"{nome} casa reale"
+        pt, rt = f"{nome} trasferta prevista", f"{nome} trasferta reale"
+        coppie = []
+        for lato, cp, cr in (("Casa", pc, rc), ("Trasferta", pt, rt)):
+            sub = df_pred[[cp, cr]].dropna()
+            if not sub.empty:
+                err = sub[cp] - sub[cr]
+                metriche_rows.append({
+                    "Statistica": nome, "Lato": lato, "Previsioni valutate": len(sub),
+                    "MAE": float(np.mean(np.abs(err))),
+                    "RMSE": float(np.sqrt(np.mean(err ** 2))),
+                    "Bias previsto-reale": float(np.mean(err)),
+                    "Media prevista": float(sub[cp].mean()),
+                    "Media reale": float(sub[cr].mean()),
+                })
+        # Accuracy del confronto tra le due squadre solo sulle partite con entrambi i lati completi.
+        valid = df_pred[[pc, pt, rc, rt]].dropna()
+        if not valid.empty:
+            pred_segno = np.sign(valid[pc] - valid[pt])
+            reale_segno = np.sign(valid[rc] - valid[rt])
+            non_pari = reale_segno != 0
+            valutabili = int(non_pari.sum())
+            accuracy = float((pred_segno[non_pari] == reale_segno[non_pari]).mean() * 100) if valutabili else np.nan
+            metriche_rows.append({
+                "Statistica": nome, "Lato": "Confronto squadre",
+                "Previsioni valutate": len(valid),
+                "MAE": np.nan, "RMSE": np.nan, "Bias previsto-reale": np.nan,
+                "Media prevista": np.nan, "Media reale": np.nan,
+                "Accuratezza squadra con valore maggiore (%)": accuracy,
+                "Partite senza parità reale": valutabili,
+                "Parità reale escluse": int((~non_pari).sum()),
+            })
+    df_metriche = pd.DataFrame(metriche_rows)
+    # Dettaglio compatto: una riga per partita/statistica, utile per controlli ed export.
+    for nome in metriche:
+        for lato, cp, cr in (
+            ("Casa", f"{nome} casa prevista", f"{nome} casa reale"),
+            ("Trasferta", f"{nome} trasferta prevista", f"{nome} trasferta reale"),
+        ):
+            tmp = df_pred[["Data", "Competizione", "Casa", "Trasferta", cp, cr]].copy()
+            tmp["Statistica"] = nome
+            tmp["Lato"] = lato
+            tmp.rename(columns={cp: "Previsto", cr: "Reale"}, inplace=True)
+            tmp["Errore previsto-reale"] = tmp["Previsto"] - tmp["Reale"]
+            dettaglio_rows.append(tmp)
+    df_dettaglio = pd.concat(dettaglio_rows, ignore_index=True) if dettaglio_rows else pd.DataFrame()
+
+    # Metriche disaggregate per campionato e stagione, oltre al totale generale.
+    righe_gruppi = []
+    for (comp, stagione), grp in df_pred.groupby(["Competizione", "Stagione"], dropna=False):
+        for nome in metriche:
+            pc, rc = f"{nome} casa prevista", f"{nome} casa reale"
+            pt, rt = f"{nome} trasferta prevista", f"{nome} trasferta reale"
+            for lato, cp, cr in (("Casa", pc, rc), ("Trasferta", pt, rt)):
+                sub = grp[[cp, cr]].dropna()
+                if len(sub):
+                    err = sub[cp] - sub[cr]
+                    righe_gruppi.append({
+                        "Competizione": comp, "Stagione": stagione,
+                        "Statistica": nome, "Lato": lato,
+                        "Previsioni valutate": len(sub),
+                        "MAE": float(np.mean(np.abs(err))),
+                        "RMSE": float(np.sqrt(np.mean(err ** 2))),
+                        "Bias previsto-reale": float(np.mean(err)),
+                    })
+            valid = grp[[pc, pt, rc, rt]].dropna()
+            if len(valid):
+                ps = np.sign(valid[pc] - valid[pt])
+                rs = np.sign(valid[rc] - valid[rt])
+                mask = rs != 0
+                righe_gruppi.append({
+                    "Competizione": comp, "Stagione": stagione,
+                    "Statistica": nome, "Lato": "Confronto squadre",
+                    "Previsioni valutate": len(valid),
+                    "Accuratezza squadra con valore maggiore (%)":
+                        float((ps[mask] == rs[mask]).mean() * 100) if mask.any() else np.nan,
+                    "Partite senza parità reale": int(mask.sum()),
+                    "Parità reale escluse": int((~mask).sum()),
+                })
+    df_gruppi = pd.DataFrame(righe_gruppi)
+    return df_pred, df_metriche, df_dettaglio, df_gruppi
+
+
+
+def crea_audit_statistiche_v203(df_pred):
+    """Audit V20.3: baseline soglie con baseline maggioritaria e stabilita' per date.
+    Solo diagnostica: non modifica previsioni operative o calibrazioni.
+    """
+    if df_pred is None or df_pred.empty:
+        return (pd.DataFrame(),) * 5
+    pooled, baseline, soglie, tempo, sintesi = [], [], [], [], []
+    specs = {
+        "Tiri totali": ("Tiri totali casa prevista", "Tiri totali trasferta prevista", "Tiri totali casa reale", "Tiri totali trasferta reale", [19.5,21.5,23.5]),
+        "Tiri in porta": ("Tiri in porta casa prevista", "Tiri in porta trasferta prevista", "Tiri in porta casa reale", "Tiri in porta trasferta reale", [7.5,8.5,9.5]),
+        "Angoli": ("Angoli casa prevista", "Angoli trasferta prevista", "Angoli casa reale", "Angoli trasferta reale", [8.5,9.5,10.5]),
+    }
+    for nome,(pc,pt,rc,rt,levels) in specs.items():
+        parts=[]
+        for pred,real in ((pc,rc),(pt,rt)):
+            if pred in df_pred and real in df_pred:
+                z=df_pred[[pred,real]].dropna().copy(); z.columns=["prev","reale"]; parts.append(z)
+        if parts:
+            z=pd.concat(parts,ignore_index=True); e=z.prev-z.reale
+            pooled.append({"Statistica":nome,"N osservazioni":len(z),"MAE pooled":float(np.mean(np.abs(e))),"RMSE pooled":float(np.sqrt(np.mean(e**2))),"Bias pooled":float(e.mean())})
+        model_vals=[]; base_vals=[]
+        for pred,base,real in ((pc,pc.replace("prevista","baseline"),rc),(pt,pt.replace("prevista","baseline"),rt)):
+            if all(c in df_pred for c in (pred,base,real)):
+                q=df_pred[[pred,base,real]].dropna(); model_vals.extend((q[pred]-q[real]).tolist()); base_vals.extend((q[base]-q[real]).tolist())
+        if model_vals:
+            mae_m=float(np.mean(np.abs(model_vals))); mae_b=float(np.mean(np.abs(base_vals)))
+            rmse_m=float(np.sqrt(np.mean(np.square(model_vals)))); rmse_b=float(np.sqrt(np.mean(np.square(base_vals))))
+            delta_pct=100*(mae_b-mae_m)/mae_b if mae_b else np.nan
+            classe="Forte" if delta_pct>=5 else ("Moderato" if delta_pct>=2 else "Debole / da rivedere")
+            baseline.append({"Statistica":nome,"N appaiato":len(model_vals),"MAE modello":mae_m,"MAE baseline":mae_b,"Delta MAE modello-baseline":mae_m-mae_b,"Miglioramento MAE (%)":delta_pct,"RMSE modello":rmse_m,"RMSE baseline":rmse_b,"Delta RMSE modello-baseline":rmse_m-rmse_b,"Valutazione":classe})
+            sintesi.append({"Statistica":nome,"Miglioramento MAE vs baseline (%)":delta_pct,"Valutazione baseline":classe,"Stabilità MAE": "Da valutare nei tre periodi"})
+        # Classificazione deterministica della soglia e confronto con baseline maggioritaria.
+        if all(c in df_pred for c in (pc,pt,rc,rt)):
+            z=pd.DataFrame({"pred":df_pred[pc]+df_pred[pt],"real":df_pred[rc]+df_pred[rt]}).dropna()
+            for th in levels:
+                y=(z.real>th).astype(int); yh=(z.pred>th).astype(int)
+                tp=int(((y==1)&(yh==1)).sum()); fp=int(((y==0)&(yh==1)).sum()); fn=int(((y==1)&(yh==0)).sum()); tn=int(((y==0)&(yh==0)).sum())
+                prevalence=float(y.mean()); acc=float((y==yh).mean())*100
+                sens=100*tp/(tp+fn) if tp+fn else np.nan
+                spec=100*tn/(tn+fp) if tn+fp else np.nan
+                bal=(sens+spec)/2 if pd.notna(sens) and pd.notna(spec) else np.nan
+                majority=100*max(prevalence,1-prevalence)
+                soglie.append({"Statistica":nome,"Soglia totale":th,"N":len(z),"Accuratezza (%)":acc,"Baseline maggioritaria (%)":majority,"Delta accuratezza vs baseline (pp)":acc-majority,"Balanced Accuracy (%)":bal,"Specificità Under (%)":spec,"Precisione Over (%)":100*tp/(tp+fp) if tp+fp else np.nan,"Recall Over (%)":sens,"Over reali (%)":100*prevalence,"TP":tp,"FP":fp,"FN":fn,"TN":tn})
+        # Dividi le DATE distinte in tre blocchi: tutte le gare dello stesso giorno restano insieme.
+        z=df_pred[["Data",pc,pt,rc,rt]].dropna().copy()
+        if len(z)>=30:
+            z["Data"]=pd.to_datetime(z["Data"],utc=True,errors="coerce"); z=z.dropna(subset=["Data"]).sort_values("Data")
+            dates=sorted(z["Data"].dt.normalize().drop_duplicates().tolist())
+            if len(dates)>=3:
+                chunks=np.array_split(dates,3)
+                for label,chunk in zip(["Primo terzo","Terzo centrale","Ultimo terzo"],chunks):
+                    if len(chunk)==0: continue
+                    g=z[z["Data"].dt.normalize().isin(list(chunk))]
+                    err=np.concatenate([(g[pc]-g[rc]).to_numpy(),(g[pt]-g[rt]).to_numpy()])
+                    tempo.append({"Statistica":nome,"Periodo":label,"Partite":len(g),"Date distinte":len(chunk),"MAE pooled":float(np.mean(np.abs(err))),"RMSE pooled":float(np.sqrt(np.mean(err**2))),"Bias pooled":float(np.mean(err)),"Data iniziale":g["Data"].min(),"Data finale":g["Data"].max()})
+    return pd.DataFrame(pooled),pd.DataFrame(baseline),pd.DataFrame(soglie),pd.DataFrame(tempo),pd.DataFrame(sintesi)
+
+
+def crea_audit_statistiche_v204(df_pred, bootstrap_reps=1000, seed=204):
+    """V20.4: analisi per competizione/stagione, CI bootstrap appaiati per match,
+    e probabilita' Over/Under esplorative da Poisson sui totali previsti.
+    Solo Audit: non modifica il modello operativo.
+    """
+    if df_pred is None or df_pred.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    specs = {
+        "Tiri totali": ("Tiri totali casa prevista", "Tiri totali trasferta prevista", "Tiri totali casa baseline", "Tiri totali trasferta baseline", "Tiri totali casa reale", "Tiri totali trasferta reale", [19.5,21.5,23.5]),
+        "Tiri in porta": ("Tiri in porta casa prevista", "Tiri in porta trasferta prevista", "Tiri in porta casa baseline", "Tiri in porta trasferta baseline", "Tiri in porta casa reale", "Tiri in porta trasferta reale", [7.5,8.5,9.5]),
+        "Angoli": ("Angoli casa prevista", "Angoli trasferta prevista", "Angoli casa baseline", "Angoli trasferta baseline", "Angoli casa reale", "Angoli trasferta reale", [8.5,9.5,10.5]),
+    }
+    gruppi=[]; ci=[]; prob=[]; rng=np.random.default_rng(seed)
+    def poisson_tail(lam, threshold):
+        # P(X > soglia), con soglie .5 e conteggi interi.
+        k=int(np.floor(threshold))
+        lam=max(0.0, float(lam))
+        term=np.exp(-lam); cdf=term
+        for j in range(1,k+1):
+            term *= lam/j; cdf += term
+        return float(np.clip(1.0-cdf, 1e-9, 1-1e-9))
+    for nome, cols in specs.items():
+        pc,pt,bc,bt,rc,rt,levels=cols
+        needed=["Competizione","Stagione",pc,pt,bc,bt,rc,rt]
+        if not all(c in df_pred.columns for c in needed):
+            continue
+        z=df_pred[needed].copy().dropna(subset=[pc,pt,bc,bt,rc,rt])
+        if z.empty: continue
+        z["err_mod"]=(np.abs(z[pc]-z[rc])+np.abs(z[pt]-z[rt]))/2
+        z["err_base"]=(np.abs(z[bc]-z[rc])+np.abs(z[bt]-z[rt]))/2
+        for (comp,stag),g in z.groupby(["Competizione","Stagione"],dropna=False):
+            if len(g)<10: continue
+            mm=float(g.err_mod.mean()); mb=float(g.err_base.mean())
+            gruppi.append({"Statistica":nome,"Competizione":comp,"Stagione":stag,"Partite appaiate":len(g),"MAE modello per match":mm,"MAE baseline per match":mb,"Miglioramento MAE (%)":100*(mb-mm)/mb if mb else np.nan,"Delta MAE modello-baseline":mm-mb})
+        # Bootstrap appaiato a livello partita, non singola squadra.
+        a=z.err_mod.to_numpy(); b=z.err_base.to_numpy(); n=len(z)
+        if n>=30:
+            ix=rng.integers(0,n,size=(bootstrap_reps,n))
+            d=(b[ix]-a[ix]).mean(axis=1)
+            ci.append({"Statistica":nome,"N partite appaiate":n,"Miglioramento MAE medio":float((b-a).mean()),"IC 95% inferiore":float(np.quantile(d,.025)),"IC 95% superiore":float(np.quantile(d,.975)),"Prob. bootstrap miglioramento (%)":float((d>0).mean()*100),"Interpretazione":"IC sopra zero: evidenza a favore modello" if np.quantile(d,.025)>0 else ("IC attraversa zero: risultato incerto" if np.quantile(d,.025)<=0<=np.quantile(d,.975) else "IC sotto zero: baseline favorita")})
+        # Probabilita' esplorative: totale ~ Poisson(lambda casa prevista + lambda trasferta prevista).
+        for th in levels:
+            lam=(z[pc]+z[pt]).clip(lower=0).to_numpy(); y=(z[rc]+z[rt]).to_numpy()>th
+            pm=np.array([poisson_tail(v,th) for v in lam])
+            lb=(z[bc]+z[bt]).clip(lower=0).to_numpy(); pb=np.array([poisson_tail(v,th) for v in lb])
+            def metrics(pv):
+                return float(np.mean((pv-y.astype(float))**2)), float(-np.mean(y*np.log(pv)+(1-y)*np.log(1-pv)))
+            bm,lm=metrics(pm); bb,lll=metrics(pb)
+            prob.append({"Statistica":nome,"Soglia Over":th,"N":len(z),"Brier Poisson modello":bm,"Brier baseline Poisson":bb,"Delta Brier modello-baseline":bm-bb,"LogLoss Poisson modello":lm,"LogLoss baseline Poisson":lll,"Delta LogLoss modello-baseline":lm-lll,"Prevalenza Over reale (%)":100*float(y.mean()),"Nota":"Probabilita' esplorative da ipotesi Poisson; non calibrate e non utilizzabili come value bet"})
+    return pd.DataFrame(gruppi),pd.DataFrame(ci),pd.DataFrame(prob)
+
+
+def crea_audit_v205_calibrazione(df_pred, bootstrap_reps=1000, seed=205, blocco_date=7):
+    """V20.5 Audit-only: affidabilita' probabilita' Poisson e bootstrap a blocchi di date."""
+    if df_pred is None or df_pred.empty or "Data" not in df_pred.columns:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    specs = {
+        "Tiri totali": ("Tiri totali casa prevista", "Tiri totali trasferta prevista", "Tiri totali casa baseline", "Tiri totali trasferta baseline", "Tiri totali casa reale", "Tiri totali trasferta reale", [19.5,21.5,23.5]),
+        "Tiri in porta": ("Tiri in porta casa prevista", "Tiri in porta trasferta prevista", "Tiri in porta casa baseline", "Tiri in porta trasferta baseline", "Tiri in porta casa reale", "Tiri in porta trasferta reale", [7.5,8.5,9.5]),
+        "Angoli": ("Angoli casa prevista", "Angoli trasferta prevista", "Angoli casa baseline", "Angoli trasferta baseline", "Angoli casa reale", "Angoli trasferta reale", [8.5,9.5,10.5]),
+    }
+    def tail(lam, th):
+        lam=max(0.0,float(lam)); k=int(np.floor(th)); term=np.exp(-lam); cdf=term
+        for j in range(1,k+1): term*=lam/j; cdf+=term
+        return float(np.clip(1-cdf,1e-9,1-1e-9))
+    def losses(prob, y):
+        prob=np.clip(np.asarray(prob,dtype=float),1e-9,1-1e-9); y=np.asarray(y,dtype=float)
+        return (prob-y)**2, -(y*np.log(prob)+(1-y)*np.log(1-prob))
+    calib=[]; gruppi=[]; boot=[]; rng=np.random.default_rng(seed)
+    for nome, cols in specs.items():
+        pc,pt,bc,bt,rc,rt,levels=cols
+        required=["Data","Competizione","Stagione",pc,pt,bc,bt,rc,rt]
+        if not all(c in df_pred.columns for c in required): continue
+        base=df_pred[required].copy().dropna(subset=[pc,pt,bc,bt,rc,rt])
+        base["Data"]=pd.to_datetime(base["Data"],errors="coerce")
+        base=base.dropna(subset=["Data"])
+        for th in levels:
+            z=base.copy(); z["y"]=(z[rc]+z[rt]>th).astype(int)
+            z["p_model"]=[tail(v,th) for v in (z[pc]+z[pt])]
+            z["p_base"]=[tail(v,th) for v in (z[bc]+z[bt])]
+            z["Fascia probabilita"] = pd.cut(z.p_model, bins=[0,.2,.4,.6,.8,1.000001], labels=["0-20%","20-40%","40-60%","60-80%","80-100%"], include_lowest=True)
+            for (comp,stag,fascia),g in z.groupby(["Competizione","Stagione","Fascia probabilita"],observed=False,dropna=False):
+                if len(g)==0: continue
+                calib.append({"Statistica":nome,"Soglia Over":th,"Competizione":comp,"Stagione":stag,"Fascia probabilita":str(fascia),"N":len(g),"Probabilita media prevista (%)":100*g.p_model.mean(),"Over reali (%)":100*g.y.mean(),"Scarto calibrazione (pp)":100*(g.p_model.mean()-g.y.mean()),"Brier":np.mean((g.p_model-g.y)**2),"Affidabilita campione":"Adeguato (N≥30)" if len(g)>=30 else "Limitato (N<30)"})
+            for (comp,stag),g in z.groupby(["Competizione","Stagione"],dropna=False):
+                if len(g)<10: continue
+                bm,lm=losses(g.p_model,g.y); bb,lb=losses(g.p_base,g.y)
+                gruppi.append({"Statistica":nome,"Soglia Over":th,"Competizione":comp,"Stagione":stag,"N":len(g),"Brier modello":bm.mean(),"Brier baseline":bb.mean(),"Delta Brier":(bm-bb).mean(),"LogLoss modello":lm.mean(),"LogLoss baseline":lb.mean(),"Delta LogLoss":(lm-lb).mean(),"Scarto calibrazione assoluto (pp)":abs(100*(g.p_model.mean()-g.y.mean()))})
+            # Bootstrap temporale ottimizzato: prima aggrega le differenze di loss per data,
+            # poi ricampiona blocchi contigui di date senza ricostruire DataFrame ad ogni replica.
+            z=z.sort_values("Data").copy()
+            dates=np.array(sorted(z["Data"].dropna().unique()))
+            if len(dates)<20:
+                continue
+            date_values=z["Data"].to_numpy()
+            model_brier, model_ll=losses(z.p_model.to_numpy(),z.y.to_numpy())
+            base_brier, base_ll=losses(z.p_base.to_numpy(),z.y.to_numpy())
+            tmp=pd.DataFrame({"Data":date_values,"d_brier":model_brier-base_brier,"d_logloss":model_ll-base_ll,"n":1})
+            per_date=tmp.groupby("Data",sort=True).agg(sum_brier=("d_brier","sum"),sum_logloss=("d_logloss","sum"),n=("n","sum")).reset_index()
+            blocks=[]
+            for start in range(0,len(per_date),blocco_date):
+                bg=per_date.iloc[start:start+blocco_date]
+                if not bg.empty:
+                    blocks.append((float(bg.sum_brier.sum()),float(bg.sum_logloss.sum()),int(bg.n.sum())))
+            if len(blocks)<3:
+                continue
+            block_b=np.asarray([v[0] for v in blocks],dtype=float)
+            block_l=np.asarray([v[1] for v in blocks],dtype=float)
+            block_n=np.asarray([v[2] for v in blocks],dtype=float)
+            chosen=rng.integers(0,len(blocks),size=(bootstrap_reps,len(blocks)))
+            den=block_n[chosen].sum(axis=1)
+            dif_b=block_b[chosen].sum(axis=1)/den
+            dif_l=block_l[chosen].sum(axis=1)/den
+            boot.append({"Statistica":nome,"Soglia Over":th,"N partite":len(z),"N blocchi date":len(blocks),"Date per blocco":blocco_date,"Delta Brier medio modello-baseline":float(np.mean(dif_b)),"IC95 Delta Brier inf":float(np.quantile(dif_b,.025)),"IC95 Delta Brier sup":float(np.quantile(dif_b,.975)),"Bootstrap Brier modello migliore (%)":100*float(np.mean(dif_b<0)),"Delta LogLoss medio modello-baseline":float(np.mean(dif_l)),"IC95 Delta LogLoss inf":float(np.quantile(dif_l,.025)),"IC95 Delta LogLoss sup":float(np.quantile(dif_l,.975)),"Bootstrap LogLoss modello migliore (%)":100*float(np.mean(dif_l<0))})
+    return pd.DataFrame(calib),pd.DataFrame(gruppi),pd.DataFrame(boot)
+
+def poisson_prob(lmbda, k):
+    return (math.exp(-lmbda) * (lmbda**k)) / math.factorial(k)
+
+def calcola_statistiche_avanzate_match(sq_casa, sq_trasf, statistiche_squadre):
+    dati_c = statistiche_squadre.get(sq_casa, {"media_gf": 1.4, "media_gs": 1.1})
+    dati_t = statistiche_squadre.get(sq_trasf, {"media_gf": 1.1, "media_gs": 1.3})
+    
+    xg_c = round(dati_c["media_gf"] * 0.95 + dati_t["media_gs"] * 0.05, 2)
+    xg_t = round(dati_t["media_gf"] * 0.95 + dati_c["media_gs"] * 0.05, 2)
+    
+    tiri_c = round(xg_c * 9.2 + 1.5, 1)
+    tiri_t = round(xg_t * 9.0 + 1.4, 1)
+    
+    porta_c = round(tiri_c * 0.35, 1)
+    porta_t = round(tiri_t * 0.33, 1)
+    
+    falli_c = round(12.0 + (dati_c["media_gs"] * 0.5), 1)
+    falli_t = round(12.5 + (dati_t["media_gs"] * 0.5), 1)
+    
+    offside_c = round(1.4 + (xg_c * 0.2), 1)
+    offside_t = round(1.3 + (xg_t * 0.2), 1)
+    
+    return {
+        "Gol Attesi (xG)": (xg_c, xg_t),
+        "Tiri Attesi": (tiri_c, tiri_t),
+        "Tiri in Porta Attesi": (porta_c, porta_t),
+        "Falli Attesi": (falli_c, falli_t),
+        "Fuorigioco Attesi": (offside_c, offside_t)
+    }
+
+# --- AUDIT WALK-FORWARD: PAREGGI (X) E GOAL / NO GOAL ---
+def crea_audit_walk_forward(matches_list, min_storico=30, max_gol=10):
+    """Audit walk-forward usando la stessa logica Poisson del pronostico operativo.
+
+    Per ogni partita usa solo risultati precedenti della stessa competizione.
+    Le lambda sono le medie gol fatti per squadra, coerenti con il modello live
+    (media_gf della classifica); la matrice 0..10 viene normalizzata prima di
+    calcolare 1X2 e Goal/No Goal. max_gol resta configurabile per i test.
+    """
+    partite = []
+    for m in matches_list:
+        status = str(m.get("status", "")).upper()
+        score = (m.get("score") or {}).get("fullTime") or {}
+        gc, gt = score.get("home"), score.get("away")
+        data = m.get("utcDate")
+        if status != "FINISHED" or gc is None or gt is None or not data:
+            continue
+        try:
+            partite.append({
+                "data": pd.to_datetime(data, utc=True),
+                "competizione": m.get("Competizione", "Torneo"),
+                "casa": m.get("homeTeam", {}).get("name", "Casa"),
+                "trasferta": m.get("awayTeam", {}).get("name", "Trasferta"),
+                "gol_casa": int(gc), "gol_trasferta": int(gt),
+                "quote": m.get("quoteStoriche", {}) or {},
+            })
+        except (TypeError, ValueError):
+            continue
+
+    partite.sort(key=lambda x: x["data"])
+    storico = []
+    righe = []
+
+    def poisson_vector(lam):
+        # Stessa estensione della matrice dei pronostici live: risultati da 0 a 10 gol.
+        lam = max(0.01, float(lam))
+        vals = np.array([
+            math.exp(-lam) * (lam ** k) / math.factorial(k)
+            for k in range(max_gol + 1)
+        ], dtype=float)
+        return vals
+
+    for partita in partite:
+        # Escludiamo tutte le partite della stessa data: scelta conservativa anti-leakage.
+        precedenti = [x for x in storico
+                      if x["competizione"] == partita["competizione"]
+                      and x["data"].date() < partita["data"].date()]
+        if len(precedenti) >= min_storico:
+            casa, trasf = partita["casa"], partita["trasferta"]
+            # Media gol fatti per squadra in tutte le precedenti partite,
+            # corrispondente a goalsFor / playedGames usato dal modello live.
+            gf_c = [x["gol_casa"] for x in precedenti if x["casa"] == casa]
+            gf_c += [x["gol_trasferta"] for x in precedenti if x["trasferta"] == casa]
+            gf_t = [x["gol_casa"] for x in precedenti if x["casa"] == trasf]
+            gf_t += [x["gol_trasferta"] for x in precedenti if x["trasferta"] == trasf]
+            lam_c = float(np.mean(gf_c)) if gf_c else 1.4
+            lam_t = float(np.mean(gf_t)) if gf_t else 1.1
+
+            ph = poisson_vector(lam_c)
+            pa = poisson_vector(lam_t)
+            matrice = np.outer(ph, pa)
+            totale = float(matrice.sum())
+            if totale <= 0:
+                storico.append(partita)
+                continue
+            matrice /= totale  # normalizzazione unica per tutti i mercati
+
+            p1 = float(np.tril(matrice, -1).sum())
+            px = float(np.trace(matrice))
+            p2 = float(np.triu(matrice, 1).sum())
+            p_goal = float(matrice[1:, 1:].sum())
+            p_nogoal = 1.0 - p_goal
+            p_over25 = float(sum(matrice[i, j] for i in range(max_gol + 1) for j in range(max_gol + 1) if i + j >= 3))
+            p_under25 = 1.0 - p_over25
+            # Controllo indipendente: con Poisson indipendenti, P(No Goal) =
+            # 1 - P(casa segna almeno un gol) * P(trasferta segna almeno un gol).
+            p_nogoal_formula = 1.0 - (1.0 - math.exp(-lam_c)) * (1.0 - math.exp(-lam_t))
+            esito = "1" if partita["gol_casa"] > partita["gol_trasferta"] else ("X" if partita["gol_casa"] == partita["gol_trasferta"] else "2")
+            reale_nogoal = int(partita["gol_casa"] == 0 or partita["gol_trasferta"] == 0)
+            # Verifica semantica indipendente dall'etichetta: No Goal se almeno una squadra segna zero.
+            reale_nogoal_check = int(min(partita["gol_casa"], partita["gol_trasferta"]) == 0)
+            probs = {"1": p1, "X": px, "2": p2}
+            previsto = max(probs, key=probs.get)
+            posizione_x = 1 + sum(probs[k] > px for k in ("1", "2"))
+            migliore_vittoria = max(p1, p2)
+            # Scarto positivo: X supera entrambe le vittorie; negativo: almeno una vittoria la supera.
+            scarto_x_vs_vittoria = 100.0 * (px - migliore_vittoria)
+            # Risultato esatto più probabile della matrice normalizzata (solo diagnostica).
+            score_c, score_t = np.unravel_index(int(np.argmax(matrice)), matrice.shape)
+            prob_score_top = float(matrice[score_c, score_t])
+            brier_1x2 = sum((probs[k] - (1.0 if esito == k else 0.0)) ** 2 for k in ("1", "X", "2"))
+            p_esito = max(1e-12, probs[esito])
+            p_ng_real = p_nogoal if reale_nogoal else p_goal
+
+            # V12: baseline empirica walk-forward, stimata SOLO dalle partite precedenti
+            # della stessa competizione. Laplace smoothing evita probabilità pari a zero.
+            n_pre = len(precedenti)
+            conteggi_esiti = {
+                "1": sum(x["gol_casa"] > x["gol_trasferta"] for x in precedenti),
+                "X": sum(x["gol_casa"] == x["gol_trasferta"] for x in precedenti),
+                "2": sum(x["gol_casa"] < x["gol_trasferta"] for x in precedenti),
+            }
+            p_base = {k: (conteggi_esiti[k] + 1.0) / (n_pre + 3.0) for k in ("1", "X", "2")}
+            brier_base_1x2 = sum((p_base[k] - (1.0 if esito == k else 0.0)) ** 2 for k in ("1", "X", "2"))
+            logloss_base_1x2 = -math.log(max(1e-12, p_base[esito]))
+            ng_pre = sum(x["gol_casa"] == 0 or x["gol_trasferta"] == 0 for x in precedenti)
+            p_base_ng = (ng_pre + 1.0) / (n_pre + 2.0)
+            p_base_ng_esito = p_base_ng if reale_nogoal else (1.0 - p_base_ng)
+            brier_base_ng = (p_base_ng - reale_nogoal) ** 2
+            logloss_base_ng = -math.log(max(1e-12, p_base_ng_esito))
+
+            righe.append({
+                "Data": partita["data"].strftime("%Y-%m-%d"),
+                "Anno": int(partita["data"].year),
+                "Competizione": partita["competizione"],
+                "Casa": casa, "Trasferta": trasf,
+                "P(1) %": 100*p1, "P(X) %": 100*px, "P(2) %": 100*p2,
+                "P(Over 2.5) %": 100*p_over25, "P(Under 2.5) %": 100*p_under25,
+                **{f"Quota {k}": v for k, v in (partita.get("quote", {}) or {}).items()},
+                "Segno previsto": previsto, "Esito reale": esito,
+                "X prevista come segno": int(previsto == "X"),
+                "Posizione X": posizione_x,
+                "Migliore tra P(1) e P(2) (%)": 100 * migliore_vittoria,
+                "Scarto P(X) - migliore vittoria (pp)": scarto_x_vs_vittoria,
+                "Risultato esatto più probabile": f"{score_c}-{score_t}",
+                "Probabilità risultato esatto top (%)": 100 * prob_score_top,
+                "Punteggio esatto top è pareggio": int(score_c == score_t),
+                # V19.7.5: probabilità dello 0-0 su TUTTE le partite, non solo score top.
+                "P(0-0) %": 100 * float(matrice[0, 0]),
+                "0-0 reale": int(partita["gol_casa"] == 0 and partita["gol_trasferta"] == 0),
+                "Brier 0-0": (float(matrice[0, 0]) - int(partita["gol_casa"] == 0 and partita["gol_trasferta"] == 0)) ** 2,
+                "Log Loss 0-0": -math.log(max(1e-12, float(matrice[0, 0]) if (partita["gol_casa"] == 0 and partita["gol_trasferta"] == 0) else 1.0 - float(matrice[0, 0]))),
+                "P(No Goal) %": 100*p_nogoal, "No Goal favorito": int(p_nogoal > p_goal),
+                "No Goal reale": reale_nogoal,
+                "Gol casa reali": partita["gol_casa"], "Gol trasferta reali": partita["gol_trasferta"],
+                "P(No Goal) formula esatta (%)": 100 * p_nogoal_formula,
+                "Delta controllo No Goal (pp)": 100 * (p_nogoal - p_nogoal_formula),
+                "Controllo etichetta No Goal": int(reale_nogoal == reale_nogoal_check),
+                "Somma P(1X2) (%)": 100 * (p1 + px + p2),
+                "Brier 1X2": brier_1x2, "Log Loss 1X2": -math.log(p_esito),
+                "Brier Goal/No Goal": (p_nogoal - reale_nogoal) ** 2,
+                "Log Loss Goal/No Goal": -math.log(max(1e-12, p_ng_real)),
+                "Baseline P(1) %": 100 * p_base["1"],
+                "Baseline P(X) %": 100 * p_base["X"],
+                "Baseline P(2) %": 100 * p_base["2"],
+                "Brier 1X2 baseline": brier_base_1x2,
+                "Log Loss 1X2 baseline": logloss_base_1x2,
+                "Baseline P(No Goal) %": 100 * p_base_ng,
+                "Brier Goal/No Goal baseline": brier_base_ng,
+                "Log Loss Goal/No Goal baseline": logloss_base_ng,
+                "Storico pre-partita": len(precedenti),
+                "Baseline storico pre-partita": len(precedenti),
+                "Controllo causalità baseline": int(all(x["data"].date() < partita["data"].date() for x in precedenti)),
+                "Lambda casa": lam_c, "Lambda trasferta": lam_t,
+            })
+        storico.append(partita)
+
+    return pd.DataFrame(righe)
+
+
+
+
+def crea_audit_economico_v210(df_audit, soglie_edge=(0.00, 0.02, 0.05)):
+    """Audit economico walk-forward su quote storiche reali. Stake fisso 1 unita.
+
+    Le probabilita' sono quelle walk-forward gia' calcolate prima della partita.
+    Per ogni match/mercato/bookmaker seleziona al massimo un esito: il maggiore EV.
+    Le quote mancanti restano escluse. Nessun mercato statistico viene simulato.
+    """
+    if df_audit is None or df_audit.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    mercati = {
+        "1X2": {
+            "outcomes": [("1", "P(1) %", "Esito reale"), ("X", "P(X) %", "Esito reale"), ("2", "P(2) %", "Esito reale")],
+            "odds": {"Avg": ["Quota Avg_1", "Quota Avg_X", "Quota Avg_2"],
+                     "B365": ["Quota B365_1", "Quota B365_X", "Quota B365_2"]},
+        },
+        "Over/Under 2.5 gol": {
+            "outcomes": [("Over 2.5", "P(Over 2.5) %", "Gol casa reali"), ("Under 2.5", "P(Under 2.5) %", "Gol casa reali")],
+            "odds": {"Avg": ["Quota Avg_Over25", "Quota Avg_Under25"],
+                     "B365": ["Quota B365_Over25", "Quota B365_Under25"]},
+        },
+    }
+    d = df_audit.copy()
+    # Compatibilita' robusta con timestamp e valori numerici.
+    for c in ["P(1) %", "P(X) %", "P(2) %", "P(Over 2.5) %", "P(Under 2.5) %"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce") / 100.0
+    for c in ["Gol casa reali", "Gol trasferta reali"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    riepiloghi, dettagli, copertura = [], [], []
+
+    for mercato, cfg in mercati.items():
+        for book, odds_cols in cfg["odds"].items():
+            disponibili = all(c in d.columns for c in odds_cols)
+            if not disponibili:
+                copertura.append({"Mercato": mercato, "Fonte quote": book, "Partite Audit": len(d), "Partite con quote complete": 0, "Copertura quote (%)": 0.0})
+                continue
+            odds_matrix = d[odds_cols].apply(pd.to_numeric, errors="coerce")
+            valid_quotes = odds_matrix.notna().all(axis=1) & (odds_matrix > 1.0).all(axis=1)
+            copertura.append({"Mercato": mercato, "Fonte quote": book, "Partite Audit": len(d), "Partite con quote complete": int(valid_quotes.sum()), "Copertura quote (%)": round(100*float(valid_quotes.mean()), 2) if len(d) else 0.0})
+            for idx, row in d.loc[valid_quotes].iterrows():
+                odds = [float(row[c]) for c in odds_cols]
+                if mercato == "1X2":
+                    probs = [row.get("P(1) %"), row.get("P(X) %"), row.get("P(2) %")]
+                    labels = ["1", "X", "2"]
+                    actual = str(row.get("Esito reale", ""))
+                    margin = sum(1.0/o for o in odds) - 1.0
+                    candidates = [(float(p)*o-1.0, labels[j], o, float(p), int(actual == labels[j])) for j,(p,o) in enumerate(zip(probs,odds)) if pd.notna(p)]
+                else:
+                    probs = [row.get("P(Over 2.5) %"), row.get("P(Under 2.5) %")]
+                    labels = ["Over 2.5", "Under 2.5"]
+                    gh, ga = row.get("Gol casa reali"), row.get("Gol trasferta reali")
+                    if pd.isna(gh) or pd.isna(ga):
+                        continue
+                    actual = "Over 2.5" if float(gh)+float(ga) > 2.5 else "Under 2.5"
+                    margin = sum(1.0/o for o in odds) - 1.0
+                    candidates = [(float(p)*o-1.0, labels[j], o, float(p), int(actual == labels[j])) for j,(p,o) in enumerate(zip(probs,odds)) if pd.notna(p)]
+                if not candidates:
+                    continue
+                ev, pick, odd, prob, won = max(candidates, key=lambda x:x[0])
+                base = {"Data": row.get("Data"), "Competizione": row.get("Competizione"), "Casa": row.get("Casa"), "Trasferta": row.get("Trasferta"), "Mercato": mercato, "Fonte quote": book, "Selezione": pick, "Probabilita WF (%)": 100*prob, "Quota": odd, "EV atteso (%)": 100*ev, "Margine bookmaker (%)": 100*margin, "Esito reale": actual, "Vincente": won, "Profitto stake 1": odd-1.0 if won else -1.0}
+                for edge in soglie_edge:
+                    if ev > edge:
+                        dettagli.append({**base, "Soglia EV (%)": 100*edge})
+
+    df_det = pd.DataFrame(dettagli)
+    df_cov = pd.DataFrame(copertura)
+    if not df_det.empty:
+        for keys, g in df_det.groupby(["Mercato", "Fonte quote", "Soglia EV (%)"], dropna=False):
+            stake = float(len(g))
+            profit = float(g["Profitto stake 1"].sum())
+            riepiloghi.append({"Mercato": keys[0], "Fonte quote": keys[1], "Soglia EV (%)": keys[2], "Scommesse": len(g), "Vinte": int(g["Vincente"].sum()), "Win rate (%)": 100*float(g["Vincente"].mean()), "Quota media": float(g["Quota"].mean()), "EV medio previsto (%)": float(g["EV atteso (%)"].mean()), "Margine bookmaker medio (%)": float(g["Margine bookmaker (%)"].mean()), "Profitto netto (stake 1)": profit, "Stake totale": stake, "ROI realizzato (%)": 100*profit/stake, "Affidabilita campione": "Adeguato (N≥30)" if len(g)>=30 else "Limitato (N<30)"})
+    return pd.DataFrame(riepiloghi), df_det, df_cov
+
+
+
+
+def crea_diagnostica_calibrazione_v210(df_det):
+    """Controlli di integrita' e calibrazione delle selezioni economiche V21.0.
+
+    Usa le selezioni gia' generate dall'audit; non modifica probabilita' o modello.
+    Le righe per soglia sono valutazioni separate e non vanno sommate tra soglie.
+    """
+    if df_det is None or df_det.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    d = df_det.copy()
+    p = pd.to_numeric(d.get("Probabilita WF (%)"), errors="coerce") / 100.0
+    q = pd.to_numeric(d.get("Quota"), errors="coerce")
+    ev = pd.to_numeric(d.get("EV atteso (%)"), errors="coerce")
+    won = pd.to_numeric(d.get("Vincente"), errors="coerce")
+    profit = pd.to_numeric(d.get("Profitto stake 1"), errors="coerce")
+    expected_ev = (p * q - 1.0) * 100.0
+    expected_profit = np.where(won == 1, q - 1.0, -1.0)
+    selection_matches = (d["Selezione"].astype(str) == d["Esito reale"].astype(str)).astype(int)
+    keys = ["Data", "Competizione", "Casa", "Trasferta", "Mercato", "Fonte quote", "Soglia EV (%)"]
+
+    checks = [
+        {"Controllo": "EV = probabilità selezionata × quota − 1", "Esito": "PASS" if float((expected_ev-ev).abs().max()) < 1e-8 else "ATTENZIONE", "Valore": float((expected_ev-ev).abs().max()), "Unita": "massimo errore (pp)"},
+        {"Controllo": "Profitto coerente con quota e vincita", "Esito": "PASS" if float((expected_profit-profit).abs().max()) < 1e-8 else "ATTENZIONE", "Valore": float((expected_profit-profit).abs().max()), "Unita": "massimo errore (unita')"},
+        {"Controllo": "Vincente coerente con selezione ed esito reale", "Esito": "PASS" if int((won != selection_matches).sum()) == 0 else "ATTENZIONE", "Valore": int((won != selection_matches).sum()), "Unita": "righe discordanti"},
+        {"Controllo": "Probabilita' nel range 0–100%", "Esito": "PASS" if bool(pd.to_numeric(d["Probabilita WF (%)"], errors="coerce").between(0,100).all()) else "ATTENZIONE", "Valore": int((~pd.to_numeric(d["Probabilita WF (%)"], errors="coerce").between(0,100)).sum()), "Unita": "righe fuori range"},
+        {"Controllo": "Quote decimali maggiori di 1", "Esito": "PASS" if bool((q > 1).all()) else "ATTENZIONE", "Valore": int((q <= 1).sum()), "Unita": "quote non valide"},
+        {"Controllo": "Una selezione per partita/mercato/fonte/soglia", "Esito": "PASS" if int(d.duplicated(keys).sum()) == 0 else "ATTENZIONE", "Valore": int(d.duplicated(keys).sum()), "Unita": "duplicati"},
+    ]
+    df_checks = pd.DataFrame(checks)
+
+    def metriche(g):
+        pp = pd.to_numeric(g["Probabilita WF (%)"], errors="coerce").to_numpy(dtype=float) / 100.0
+        yy = pd.to_numeric(g["Vincente"], errors="coerce").to_numpy(dtype=float)
+        pp = np.clip(pp, 1e-12, 1-1e-12)
+        return {
+            "Scommesse": len(g),
+            "Probabilita media prevista (%)": 100*float(np.mean(pp)),
+            "Win rate reale (%)": 100*float(np.mean(yy)),
+            "Scarto previsto-reale (pp)": 100*float(np.mean(pp)-np.mean(yy)),
+            "Brier selezione": float(np.mean((pp-yy)**2)),
+            "LogLoss selezione": float(np.mean(-(yy*np.log(pp)+(1-yy)*np.log(1-pp)))),
+            "ROI realizzato (%)": 100*float(pd.to_numeric(g["Profitto stake 1"], errors="coerce").mean()),
+        }
+
+    base = d[pd.to_numeric(d["Soglia EV (%)"], errors="coerce") == 0.0].copy()
+    comp_rows=[]
+    for keys_group, g in base.groupby(["Mercato", "Fonte quote", "Competizione"], dropna=False):
+        comp_rows.append({"Mercato":keys_group[0], "Fonte quote":keys_group[1], "Competizione":keys_group[2], **metriche(g)})
+    df_comp = pd.DataFrame(comp_rows)
+
+    # V21.2: fasce separate per fonte e competizione. Nessuna ricalibrazione.
+    bin_edges=[0,10,20,30,40,50,60,70,80,90,100.000001]
+    def crea_tabella_fasce(group_cols):
+        rows=[]
+        for group_values, gm in base.groupby(group_cols, dropna=False, sort=True):
+            if not isinstance(group_values, tuple):
+                group_values=(group_values,)
+            work=gm.copy()
+            prob=pd.to_numeric(work["Probabilita WF (%)"], errors="coerce")
+            work["Fascia probabilita' (%)"]=pd.cut(prob, bins=bin_edges, right=False, include_lowest=True)
+            for band, g in work.groupby("Fascia probabilita' (%)", observed=True, dropna=False):
+                if len(g)==0:
+                    continue
+                row={col:value for col,value in zip(group_cols, group_values)}
+                row["Fascia probabilita' (%)"]=str(band)
+                row.update(metriche(g))
+                row["Affidabilita' campione"]="Adeguato (N≥30)" if len(g)>=30 else "Limitato (N<30)"
+                rows.append(row)
+        return pd.DataFrame(rows)
+
+    df_bins_source=crea_tabella_fasce(["Mercato", "Fonte quote"])
+    df_bins_comp_source=crea_tabella_fasce(["Mercato", "Fonte quote", "Competizione"])
+    return df_checks, df_comp, df_bins_source, df_bins_comp_source
+
+
+def crea_diagnostica_v213(df_audit):
+    """V21.3: confronto imparziale del modello con baseline bookmaker de-vig.
+
+    Valuta TUTTI gli esiti per ogni partita con quote complete, non soltanto
+    la selezione con EV massimo e positivo. Le probabilita' bookmaker sono
+    ricavate dalle quote reali e normalizzate per rimuovere il margine.
+    Solo Audit: nessuna probabilita' viene modificata o riutilizzata operativamente.
+    """
+    if df_audit is None or df_audit.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    d = df_audit.copy()
+    for c in ["P(1) %", "P(X) %", "P(2) %", "P(Over 2.5) %", "P(Under 2.5) %"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce") / 100.0
+    odds_cfg = {
+        "1X2": {
+            "Avg": (["Quota Avg_1", "Quota Avg_X", "Quota Avg_2"], ["1", "X", "2"], ["P(1) %", "P(X) %", "P(2) %"]),
+            "B365": (["Quota B365_1", "Quota B365_X", "Quota B365_2"], ["1", "X", "2"], ["P(1) %", "P(X) %", "P(2) %"]),
+        },
+        "Over/Under 2.5 gol": {
+            "Avg": (["Quota Avg_Over25", "Quota Avg_Under25"], ["Over 2.5", "Under 2.5"], ["P(Over 2.5) %", "P(Under 2.5) %"]),
+            "B365": (["Quota B365_Over25", "Quota B365_Under25"], ["Over 2.5", "Under 2.5"], ["P(Over 2.5) %", "P(Under 2.5) %"]),
+        },
+    }
+    rows=[]
+    bin_rows=[]
+    for market, books in odds_cfg.items():
+        for book, (odd_cols, labels, prob_cols) in books.items():
+            if not all(c in d.columns for c in odd_cols + prob_cols):
+                continue
+            odds_df=d[odd_cols].apply(pd.to_numeric, errors="coerce")
+            probs_df=d[prob_cols].apply(pd.to_numeric, errors="coerce")
+            valid=(odds_df.notna().all(axis=1) & (odds_df > 1).all(axis=1)
+                   & probs_df.notna().all(axis=1) & (probs_df >= 0).all(axis=1)
+                   & (probs_df.sum(axis=1) > 0.999) & (probs_df.sum(axis=1) < 1.001))
+            for idx in d.index[valid]:
+                row=d.loc[idx]
+                odds=odds_df.loc[idx].to_numpy(dtype=float)
+                model=probs_df.loc[idx].to_numpy(dtype=float)
+                inv=1.0/odds
+                book_probs=inv/inv.sum()
+                if market == "1X2":
+                    actual=str(row.get("Esito reale", ""))
+                else:
+                    gh=pd.to_numeric(pd.Series([row.get("Gol casa reali")]), errors="coerce").iloc[0]
+                    ga=pd.to_numeric(pd.Series([row.get("Gol trasferta reali")]), errors="coerce").iloc[0]
+                    if pd.isna(gh) or pd.isna(ga):
+                        continue
+                    actual="Over 2.5" if float(gh)+float(ga)>2.5 else "Under 2.5"
+                if actual not in labels:
+                    continue
+                y=np.array([1.0 if actual==lab else 0.0 for lab in labels])
+                brier_model=float(np.sum((model-y)**2))
+                brier_book=float(np.sum((book_probs-y)**2))
+                ll_model=float(-np.log(np.clip(model[labels.index(actual)],1e-12,1.0)))
+                ll_book=float(-np.log(np.clip(book_probs[labels.index(actual)],1e-12,1.0)))
+                evs=model*odds-1.0
+                best=int(np.argmax(evs))
+                for lab, pp in zip(labels, model):
+                    band=pd.cut(pd.Series([100*float(pp)]), bins=[0,10,20,30,40,50,60,70,80,90,100.000001], right=False, include_lowest=True).iloc[0]
+                    if pd.notna(band):
+                        bin_rows.append({"Mercato":market,"Fonte quote":book,"Competizione":row.get("Competizione"),"Esito":lab,"Fascia probabilita (%)":str(band),"Probabilita modello (%)":100*float(pp),"Esito (0/1)":int(actual==lab)})
+                rows.append({
+                    "Data":row.get("Data"), "Competizione":row.get("Competizione"),
+                    "Casa":row.get("Casa"), "Trasferta":row.get("Trasferta"),
+                    "Mercato":market, "Fonte quote":book, "Esito reale":actual,
+                    "Brier modello":brier_model, "Brier bookmaker de-vig":brier_book,
+                    "Delta Brier modello - bookmaker":brier_model-brier_book,
+                    "LogLoss modello":ll_model, "LogLoss bookmaker de-vig":ll_book,
+                    "Delta LogLoss modello - bookmaker":ll_model-ll_book,
+                    "Selezione EV massimo":labels[best],
+                    "Probabilita selezione modello (%)":100*float(model[best]),
+                    "Probabilita bookmaker de-vig selezione (%)":100*float(book_probs[best]),
+                    "Quota selezione":float(odds[best]), "EV selezione (%)":100*float(evs[best]),
+                    "EV selezione ricalcolato (%)":100*(float(model[best])*float(odds[best])-1.0),
+                    "Selezione vincente":int(labels[best]==actual),
+                    "Selezione EV positivo":int(evs[best]>0),
+                    "Somma probabilita modello (%)":100*float(model.sum()),
+                    "Somma probabilita bookmaker de-vig (%)":100*float(book_probs.sum()),
+                })
+    detail=pd.DataFrame(rows)
+    if detail.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    summary=[]
+    for keys,g in detail.groupby(["Mercato","Fonte quote"], dropna=False):
+        summary.append({"Mercato":keys[0],"Fonte quote":keys[1],"Partite comuni":len(g),
+            "Brier modello medio":g["Brier modello"].mean(),"Brier bookmaker de-vig medio":g["Brier bookmaker de-vig"].mean(),
+            "Delta Brier modello - bookmaker":g["Delta Brier modello - bookmaker"].mean(),
+            "LogLoss modello medio":g["LogLoss modello"].mean(),"LogLoss bookmaker de-vig medio":g["LogLoss bookmaker de-vig"].mean(),
+            "Delta LogLoss modello - bookmaker":g["Delta LogLoss modello - bookmaker"].mean(),
+            "EV massimo positivo (%)":100*g["Selezione EV positivo"].mean(),
+            "Numero selezioni EV positive":int(g["Selezione EV positivo"].sum())})
+    for keys,g in detail.groupby(["Mercato","Fonte quote","Competizione"], dropna=False):
+        summary.append({"Mercato":keys[0],"Fonte quote":keys[1],"Competizione":keys[2],"Partite comuni":len(g),
+            "Brier modello medio":g["Brier modello"].mean(),"Brier bookmaker de-vig medio":g["Brier bookmaker de-vig"].mean(),
+            "Delta Brier modello - bookmaker":g["Delta Brier modello - bookmaker"].mean(),
+            "LogLoss modello medio":g["LogLoss modello"].mean(),"LogLoss bookmaker de-vig medio":g["LogLoss bookmaker de-vig"].mean(),
+            "Delta LogLoss modello - bookmaker":g["Delta LogLoss modello - bookmaker"].mean(),
+            "EV massimo positivo (%)":100*g["Selezione EV positivo"].mean(),
+            "Numero selezioni EV positive":int(g["Selezione EV positivo"].sum())})
+    df_summary=pd.DataFrame(summary)
+
+    selected=detail[detail["Selezione EV positivo"]==1]
+    sel_rows=[]
+    for keys,g in selected.groupby(["Mercato","Fonte quote","Competizione","Selezione EV massimo"],dropna=False):
+        sel_rows.append({"Mercato":keys[0],"Fonte quote":keys[1],"Competizione":keys[2],"Selezione":keys[3],
+            "Partite selezionate":len(g),"Win rate (%)":100*g["Selezione vincente"].mean(),
+            "Probabilita modello media (%)":g["Probabilita selezione modello (%)"].mean(),
+            "Probabilita bookmaker de-vig media (%)":g["Probabilita bookmaker de-vig selezione (%)"].mean(),
+            "EV medio (%)":g["EV selezione (%)"].mean(),
+            "Affidabilita campione":"Adeguato (N≥30)" if len(g)>=30 else "Limitato (N<30)"})
+    df_selection=pd.DataFrame(sel_rows)
+
+    # Calibrazione su tutti gli esiti (non condizionata a EV positivo).
+    bins=pd.DataFrame(bin_rows)
+    if not bins.empty:
+        df_bins=(bins.groupby(["Mercato","Fonte quote","Competizione","Esito","Fascia probabilita (%)"],observed=True)
+            .agg({"Esito (0/1)":"size", "Probabilita modello (%)":"mean"})
+            .rename(columns={"Esito (0/1)":"Osservazioni", "Probabilita modello (%)":"Probabilita media prevista (%)"})
+            .reset_index())
+        freq=(bins.groupby(["Mercato","Fonte quote","Competizione","Esito","Fascia probabilita (%)"],observed=True)["Esito (0/1)"].mean().mul(100).rename("Frequenza reale (%)").reset_index())
+        df_bins=df_bins.merge(freq,on=["Mercato","Fonte quote","Competizione","Esito","Fascia probabilita (%)"],how="left")
+        df_bins["Scarto previsto-reale (pp)"]=df_bins["Probabilita media prevista (%)"]-df_bins["Frequenza reale (%)"]
+        df_bins["Affidabilita campione"]=np.where(df_bins["Osservazioni"]>=30,"Adeguato (N≥30)","Limitato (N<30)")
+    else:
+        df_bins=pd.DataFrame()
+
+    checks=[]
+    checks.append({"Controllo":"Probabilita modello valide e somma 100%","Esito":"PASS" if np.allclose(detail["Somma probabilita modello (%)"],100.0,atol=0.01) else "ATTENZIONE","Valore":float((detail["Somma probabilita modello (%)"]-100.0).abs().max()),"Unita":"massimo scarto (pp)","Righe":len(detail)})
+    checks.append({"Controllo":"Probabilita bookmaker de-vig sommano 100%","Esito":"PASS" if np.allclose(detail["Somma probabilita bookmaker de-vig (%)"],100.0,atol=0.01) else "ATTENZIONE","Valore":float((detail["Somma probabilita bookmaker de-vig (%)"]-100.0).abs().max()),"Unita":"massimo scarto (pp)","Righe":len(detail)})
+    match_keys=["Data","Competizione","Casa","Trasferta","Mercato","Fonte quote"]
+    dup=int(detail.duplicated(match_keys).sum())
+    checks.append({"Controllo":"Una riga per partita/mercato/fonte nel confronto completo","Esito":"PASS" if dup==0 else "ATTENZIONE","Valore":dup,"Unita":"duplicati","Righe":len(detail)})
+    ev_error=float((detail["EV selezione (%)"]-detail["EV selezione ricalcolato (%)"]).abs().max())
+    checks.append({"Controllo":"EV selezione = probabilita modello × quota − 1","Esito":"PASS" if ev_error<1e-8 else "ATTENZIONE","Valore":ev_error,"Unita":"massimo errore (pp)","Righe":len(detail)})
+    return df_summary, df_selection, df_bins, pd.DataFrame(checks)
+
+
+
+def crea_audit_stabilita_v215(df_audit, n_boot=500, giorni_blocco=7, seed=20261104):
+    """V21.5: stabilita' temporale della calibrazione, solo Audit.
+
+    Usa una sola riga per partita (nessun raddoppio Avg/B365), raggruppa per
+    competizione e stagione calcistica e calcola intervalli bootstrap a blocchi
+    temporali sulla differenza media p-y. Non modifica probabilita' operative.
+    """
+    vuoto = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+    if df_audit is None or df_audit.empty:
+        return vuoto
+    d = df_audit.copy()
+    required = ["Data", "Competizione", "P(1) %", "P(X) %", "P(2) %",
+                "P(Over 2.5) %", "Esito reale", "Gol casa reali", "Gol trasferta reali"]
+    missing = [c for c in required if c not in d.columns]
+    if missing:
+        checks = pd.DataFrame([{"Controllo": "Colonne necessarie V21.5", "Esito": "ATTENZIONE",
+                                "Dettaglio": ", ".join(missing)}])
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), checks
+
+    d["Data_dt"] = pd.to_datetime(d["Data"], errors="coerce", utc=True).dt.tz_convert(None)
+    for c in ["P(1) %", "P(X) %", "P(2) %", "P(Over 2.5) %"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce") / 100.0
+    d["Gol casa reali"] = pd.to_numeric(d["Gol casa reali"], errors="coerce")
+    d["Gol trasferta reali"] = pd.to_numeric(d["Gol trasferta reali"], errors="coerce")
+    d = d.dropna(subset=["Data_dt", "Competizione", "Esito reale", "Gol casa reali",
+                         "Gol trasferta reali", "P(1) %", "P(X) %", "P(2) %", "P(Over 2.5) %"]).copy()
+    d = d[d["Esito reale"].isin(["1", "X", "2"])].copy()
+    if d.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame([
+            {"Controllo": "Righe valide V21.5", "Esito": "ATTENZIONE", "Dettaglio": "Nessuna riga valida"}])
+
+    # Stagione calcistica: luglio-giugno; ogni partita compare una sola volta.
+    start_year = d["Data_dt"].dt.year - (d["Data_dt"].dt.month < 7).astype(int)
+    d["Stagione"] = start_year.astype(str) + "/" + (start_year + 1).astype(str)
+    d["y_over"] = ((d["Gol casa reali"] + d["Gol trasferta reali"]) >= 3).astype(int)
+    rng = np.random.default_rng(seed)
+    metric_rows, cal_rows = [], []
+    specs = {
+        "1X2": (["1", "X", "2"], ["P(1) %", "P(X) %", "P(2) %"],
+                lambda g: g["Esito reale"].astype(str).to_numpy()),
+        "Over/Under 2.5 gol": (["Over 2.5", "Under 2.5"], ["P(Over 2.5) %", None],
+                lambda g: g["y_over"].to_numpy()),
+    }
+    for (comp, season), g0 in d.groupby(["Competizione", "Stagione"], dropna=False):
+        g0 = g0.sort_values("Data_dt").copy()
+        if len(g0) < 30:
+            continue
+        # Blocchi consecutivi di 7 giorni ancorati all'inizio del gruppo.
+        g0["_block"] = ((g0["Data_dt"] - g0["Data_dt"].min()).dt.days // max(1, int(giorni_blocco))).astype(int)
+        for market, (labels, prob_cols, actual_fn) in specs.items():
+            if market == "1X2":
+                probs = g0[prob_cols].to_numpy(dtype=float)
+                actual = actual_fn(g0)
+                ymat = np.column_stack([(actual == lab).astype(float) for lab in labels])
+                valid = np.isfinite(probs).all(axis=1) & np.isclose(probs.sum(axis=1), 1.0, atol=0.01)
+            else:
+                po = g0["P(Over 2.5) %"].to_numpy(dtype=float)
+                probs = np.column_stack([po, 1.0-po])
+                yo = actual_fn(g0).astype(float)
+                ymat = np.column_stack([yo, 1.0-yo])
+                valid = np.isfinite(probs).all(axis=1) & (po >= 0) & (po <= 1)
+            if valid.sum() < 30:
+                continue
+            gg = g0.loc[valid].copy().reset_index(drop=True)
+            probs, ymat = probs[valid], ymat[valid]
+            actual_labels = labels
+            # Brier/LogLoss vettoriali per stagione.
+            brier = float(np.mean(np.sum((probs-ymat)**2, axis=1)))
+            chosen = np.argmax(ymat, axis=1)
+            ll = float(np.mean(-np.log(np.clip(probs[np.arange(len(probs)), chosen], 1e-12, 1.0))))
+            metric_rows.append({"Mercato": market, "Competizione": comp, "Stagione": season,
+                                "Partite": int(len(gg)), "Brier medio": brier, "LogLoss medio": ll,
+                                "Blocchi temporali": int(gg["_block"].nunique())})
+            block_ids = gg["_block"].unique()
+            block_indices = [np.flatnonzero(gg["_block"].to_numpy() == b) for b in block_ids]
+            for j, label in enumerate(actual_labels):
+                delta = probs[:, j] - ymat[:, j]
+                boots = []
+                if len(block_indices) >= 3:
+                    for _ in range(int(n_boot)):
+                        chosen_blocks = rng.integers(0, len(block_indices), size=len(block_indices))
+                        ix = np.concatenate([block_indices[k] for k in chosen_blocks])
+                        if len(ix):
+                            boots.append(float(np.mean(delta[ix])))
+                if boots:
+                    lo, hi = np.quantile(boots, [0.025, 0.975])
+                else:
+                    lo, hi = np.nan, np.nan
+                mean_p, observed = float(probs[:, j].mean()), float(ymat[:, j].mean())
+                gap = mean_p-observed
+                cal_rows.append({"Mercato": market, "Competizione": comp, "Stagione": season,
+                    "Esito": label, "N": int(len(gg)), "Probabilita media prevista (%)": 100*mean_p,
+                    "Frequenza reale (%)": 100*observed, "Scarto previsto-reale (pp)": 100*gap,
+                    "IC95% bootstrap blocchi low (pp)": 100*lo if np.isfinite(lo) else np.nan,
+                    "IC95% bootstrap blocchi high (pp)": 100*hi if np.isfinite(hi) else np.nan,
+                    "Blocchi temporali": int(len(block_indices)),
+                    "Esito intervallo": ("Sovrastima persistente nel gruppo" if lo > 0 else
+                                         "Sottostima persistente nel gruppo" if hi < 0 else
+                                         "Intervallo include zero" if np.isfinite(lo) else "Non stimabile (<3 blocchi)"),
+                    "Affidabilita campione": "Adeguato (N≥30)" if len(gg)>=30 else "Limitato (N<30)"})
+
+    df_metrics = pd.DataFrame(metric_rows)
+    df_cal = pd.DataFrame(cal_rows)
+    if not df_cal.empty:
+        persist = []
+        for keys, g in df_cal.groupby(["Mercato", "Competizione", "Esito"], dropna=False):
+            eligible = g[g["Esito intervallo"] != "Non stimabile (<3 blocchi)"]
+            persist.append({"Mercato": keys[0], "Competizione": keys[1], "Esito": keys[2],
+                "Stagioni valutate": int(len(g)),
+                "Stagioni con IC95% sopra zero": int((eligible["IC95% bootstrap blocchi low (pp)"] > 0).sum()),
+                "Stagioni con IC95% sotto zero": int((eligible["IC95% bootstrap blocchi high (pp)"] < 0).sum()),
+                "Stagioni con IC95% che include zero": int((eligible["Esito intervallo"] == "Intervallo include zero").sum()),
+                "Scarto medio tra stagioni (pp)": float(g["Scarto previsto-reale (pp)"].mean()),
+                "N complessivo": int(g["N"].sum())})
+        df_persist = pd.DataFrame(persist)
+    else:
+        df_persist = pd.DataFrame()
+    checks = pd.DataFrame([
+        {"Controllo": "Partite uniche (nessun doppio Avg/B365)", "Esito": "PASS" if not d.duplicated(["Data_dt", "Competizione", "Casa", "Trasferta"]).any() else "ATTENZIONE",
+         "Dettaglio": f"{len(d)} righe; una riga per partita nel df_audit"},
+        {"Controllo": "Bootstrap a blocchi temporali", "Esito": "PASS" if not df_cal.empty and (df_cal["Blocchi temporali"] >= 3).any() else "ATTENZIONE",
+         "Dettaglio": f"Blocchi da {giorni_blocco} giorni; {n_boot} repliche richieste"},
+        {"Controllo": "Modello operativo invariato", "Esito": "PASS", "Dettaglio": "V21.5 legge df_audit e non riscrive probabilita' o ranking"},
+    ])
+    return df_metrics, df_cal, df_persist, checks
+
+
+
+def crea_diagnostica_v216(df_audit, n_boot=500, giorni_blocco=7, seed=20261106):
+    """V21.6: contributo dei singoli esiti al divario modello-bookmaker. Solo Audit."""
+    empty=(pd.DataFrame(),pd.DataFrame())
+    if df_audit is None or df_audit.empty:
+        return empty
+    d=df_audit.copy()
+    for c in ["P(1) %","P(X) %","P(2) %","P(Over 2.5) %","P(Under 2.5) %"]:
+        if c in d.columns:
+            d[c]=pd.to_numeric(d[c],errors="coerce")/100.0
+    cfg={
+      "1X2":{"Avg":(["Quota Avg_1","Quota Avg_X","Quota Avg_2"],["1","X","2"],["P(1) %","P(X) %","P(2) %"]),
+            "B365":(["Quota B365_1","Quota B365_X","Quota B365_2"],["1","X","2"],["P(1) %","P(X) %","P(2) %"])},
+      "Over/Under 2.5 gol":{"Avg":(["Quota Avg_Over25","Quota Avg_Under25"],["Over 2.5","Under 2.5"],["P(Over 2.5) %","P(Under 2.5) %"]),
+            "B365":(["Quota B365_Over25","Quota B365_Under25"],["Over 2.5","Under 2.5"],["P(Over 2.5) %","P(Under 2.5) %"])}}
+    rows=[]
+    for market,books in cfg.items():
+      for source,(odd_cols,labels,pcols) in books.items():
+        if not all(c in d.columns for c in odd_cols+pcols+["Data","Competizione","Esito reale","Gol casa reali","Gol trasferta reali"]):
+          continue
+        odds=d[odd_cols].apply(pd.to_numeric,errors="coerce")
+        probs=d[pcols].apply(pd.to_numeric,errors="coerce")
+        valid=odds.notna().all(axis=1)&(odds>1).all(axis=1)&probs.notna().all(axis=1)&(probs>=0).all(axis=1)&np.isclose(probs.sum(axis=1),1.0,atol=0.001)
+        for idx in d.index[valid]:
+          r=d.loc[idx]
+          if market=="1X2": actual=str(r["Esito reale"])
+          else:
+            gh=pd.to_numeric(pd.Series([r["Gol casa reali"]]),errors="coerce").iloc[0]
+            ga=pd.to_numeric(pd.Series([r["Gol trasferta reali"]]),errors="coerce").iloc[0]
+            if pd.isna(gh) or pd.isna(ga): continue
+            actual="Over 2.5" if gh+ga>=3 else "Under 2.5"
+          if actual not in labels: continue
+          op=odds.loc[idx].to_numpy(float); mp=probs.loc[idx].to_numpy(float)
+          inv=1.0/op; bp=inv/inv.sum(); y=np.array([float(actual==lab) for lab in labels])
+          try: dt=pd.to_datetime(r["Data"],errors="coerce",utc=True,dayfirst=True).tz_convert(None)
+          except Exception: dt=pd.NaT
+          if pd.isna(dt): continue
+          sy=dt.year-(dt.month<7); season=f"{sy}/{sy+1}"
+          for j,lab in enumerate(labels):
+            rows.append({"Data_dt":dt,"Competizione":r["Competizione"],"Stagione":season,"Mercato":market,"Fonte quote":source,"Esito":lab,
+              "Brier componente modello":(mp[j]-y[j])**2,"Brier componente bookmaker":(bp[j]-y[j])**2,
+              "Delta Brier componente":(mp[j]-y[j])**2-(bp[j]-y[j])**2,
+              "LogLoss componente modello":-y[j]*np.log(np.clip(mp[j],1e-12,1.0)),
+              "LogLoss componente bookmaker":-y[j]*np.log(np.clip(bp[j],1e-12,1.0)),
+              "Delta LogLoss componente":-y[j]*np.log(np.clip(mp[j],1e-12,1.0))+y[j]*np.log(np.clip(bp[j],1e-12,1.0))})
+    x=pd.DataFrame(rows)
+    if x.empty: return empty
+    rng=np.random.default_rng(seed); out=[]
+    keys=["Mercato","Fonte quote","Competizione","Stagione","Esito"]
+    for k,g in x.groupby(keys,dropna=False):
+      g=g.sort_values("Data_dt").copy(); g["_blocco"]=(g["Data_dt"]-g["Data_dt"].min()).dt.days//max(1,int(giorni_blocco))
+      blocks=g["_blocco"].unique(); ix=[np.flatnonzero(g["_blocco"].to_numpy()==b) for b in blocks]
+      boots_b=[]; boots_l=[]
+      if len(ix)>=3:
+        for _ in range(int(n_boot)):
+          take=rng.integers(0,len(ix),size=len(ix)); sample=np.concatenate([ix[z] for z in take])
+          boots_b.append(float(g["Delta Brier componente"].to_numpy()[sample].mean()))
+          boots_l.append(float(g["Delta LogLoss componente"].to_numpy()[sample].mean()))
+      blo,bhi=np.quantile(boots_b,[.025,.975]) if boots_b else (np.nan,np.nan)
+      llo,lhi=np.quantile(boots_l,[.025,.975]) if boots_l else (np.nan,np.nan)
+      out.append({"Mercato":k[0],"Fonte quote":k[1],"Competizione":k[2],"Stagione":k[3],"Esito":k[4],"N":len(g),"Blocchi 7g":len(ix),
+        "Delta Brier componente medio":g["Delta Brier componente"].mean(),"IC95 Brier low":blo,"IC95 Brier high":bhi,
+        "Delta LogLoss componente medio":g["Delta LogLoss componente"].mean(),"IC95 LogLoss low":llo,"IC95 LogLoss high":lhi,
+        "Diagnosi Brier":("Modello peggiore" if blo>0 else "Modello migliore" if bhi<0 else "IC include zero" if np.isfinite(blo) else "Non stimabile"),
+        "Diagnosi LogLoss":("Modello peggiore" if llo>0 else "Modello migliore" if lhi<0 else "IC include zero" if np.isfinite(llo) else "Non stimabile")})
+    detail=pd.DataFrame(out)
+    summary=(detail.groupby(["Mercato","Fonte quote","Esito"],dropna=False).agg(
+      **{"Confronti comp-stagione":("N","size"),"Partite":("N","sum")},
+      Delta_Brier_medio=("Delta Brier componente medio","mean"),Delta_LogLoss_medio=("Delta LogLoss componente medio","mean"),
+      Gruppi_IC_Brier_positivi=("Diagnosi Brier",lambda z:(z=="Modello peggiore").sum()),
+      Gruppi_IC_LogLoss_positivi=("Diagnosi LogLoss",lambda z:(z=="Modello peggiore").sum())).reset_index())
+    checks=pd.DataFrame([
+      {"Controllo":"Fonti bookmaker separate","Esito":"PASS" if set(x["Fonte quote"].dropna().unique()).issubset({"Avg","B365"}) else "ATTENZIONE","Dettaglio":"Avg e B365 restano gruppi distinti"},
+      {"Controllo":"Decomposizione per esito","Esito":"PASS" if not detail.empty else "ATTENZIONE","Dettaglio":f"{len(x)} contributi per esito; nessuna probabilita' operativa modificata"},
+      {"Controllo":"Bootstrap temporale","Esito":"PASS" if (detail["Blocchi 7g"]>=3).any() else "ATTENZIONE","Dettaglio":f"Blocchi da {giorni_blocco} giorni; {n_boot} repliche"}])
+    return detail,summary,checks
+
+def _prob_clip(p):
+    return float(np.clip(float(p), 1e-6, 1.0 - 1e-6))
+
+
+def _fit_platt_prior(prob, outcome, min_train=100, max_train=300, steps=80):
+    """Fit Platt logistico regolarizzato usando esclusivamente osservazioni passate."""
+    p = np.asarray(prob, dtype=float)
+    y = np.asarray(outcome, dtype=float)
+    valid = np.isfinite(p) & np.isfinite(y)
+    p, y = p[valid], y[valid]
+    if len(y) < min_train or len(np.unique(y)) < 2:
+        return None
+    p, y = p[-max_train:], y[-max_train:]
+    x = np.log(np.clip(p, 1e-5, 1-1e-5) / np.clip(1-p, 1e-5, 1))
+    # Newton-Raphson su intercetta e coefficiente, con lieve ridge sul coefficiente.
+    X = np.column_stack([np.ones(len(x)), x])
+    beta = np.array([0.0, 1.0], dtype=float)
+    for _ in range(steps):
+        z = np.clip(X @ beta, -25, 25)
+        q = 1.0 / (1.0 + np.exp(-z))
+        w = np.clip(q * (1-q), 1e-6, None)
+        grad = X.T @ (q-y) + np.array([0.01 * beta[0], 0.02 * beta[1]])
+        hess = X.T @ (X * w[:, None]) + np.array([[0.01, 0.0], [0.0, 0.02]])
+        try:
+            step = np.linalg.solve(hess, grad)
+        except np.linalg.LinAlgError:
+            return None
+        beta -= step
+        beta[1] = float(np.clip(beta[1], -5.0, 5.0))
+        if float(np.max(np.abs(step))) < 1e-7:
+            break
+    return beta
+
+
+def _calcola_metriche_binaria(prob, y):
+    p = np.clip(np.asarray(prob, dtype=float), 1e-12, 1-1e-12)
+    y = np.asarray(y, dtype=float)
+    return float(np.mean((p-y)**2)), float(np.mean(-(y*np.log(p)+(1-y)*np.log(1-p))))
+
+
+@str_lit.cache_data(ttl=21600, show_spinner=False)
+def crea_test_v15_walk_forward(df_audit, min_train=100, max_train=300, max_gol=10):
+    """Test diagnostici out-of-sample: correzione lambda e calibrazione X/No Goal.
+    Ogni parametro per la partita target è stimato solo da righe precedenti della stessa competizione.
+    Nessun valore prodotto da questa funzione viene usato nelle previsioni operative.
+    """
+    if df_audit.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    d = df_audit.copy()
+    d['_data_dt'] = pd.to_datetime(d['Data'], errors='coerce', utc=True)
+    d = d.sort_values(['_data_dt', 'Competizione']).reset_index(drop=True)
+    d['P(X) raw'] = pd.to_numeric(d['P(X) %'], errors='coerce') / 100.0
+    d['P(NG) raw'] = pd.to_numeric(d['P(No Goal) %'], errors='coerce') / 100.0
+    d['X y'] = (d['Esito reale'] == 'X').astype(int)
+    d['NG y'] = pd.to_numeric(d['No Goal reale'], errors='coerce').fillna(0).astype(int)
+    d['y1'] = (d['Esito reale'] == '1').astype(int)
+    d['y2'] = (d['Esito reale'] == '2').astype(int)
+    for col in ['Lambda casa', 'Lambda trasferta', 'Gol casa reali', 'Gol trasferta reali', 'P(1) %', 'P(2) %']:
+        d[col] = pd.to_numeric(d[col], errors='coerce')
+    d['P(X) calibrata WF'] = np.nan
+    d['P(NG) calibrata WF'] = np.nan
+    d['Lambda casa corretta WF'] = np.nan
+    d['Lambda trasferta corretta WF'] = np.nan
+    d['P(1) lambda corretta WF'] = np.nan
+    d['P(X) lambda corretta WF'] = np.nan
+    d['P(2) lambda corretta WF'] = np.nan
+    d['P(NG) lambda corretta WF'] = np.nan
+    # V19.8: probabilità esatta 0-0 dalla matrice Poisson con lambda corrette WF.
+    d['P(0-0) lambda corretta WF'] = np.nan
+    d['Training usato V15'] = 0
+    # V19.7: audit trasparente del training effettivamente passato al fit Platt No Goal.
+    # Queste colonne sono esclusivamente diagnostiche e non cambiano il fit né le previsioni.
+    d['NG training righe valide'] = 0
+    d['NG training date uniche'] = 0
+    d['NG training prevalenza (%)'] = np.nan
+    d['Pendenza Platt NG'] = np.nan
+    d['Intercetta Platt NG'] = np.nan
+    d['Ultima data training NG'] = pd.Series(pd.NaT, index=d.index, dtype='datetime64[ns, UTC]')
+    d['Check training NG'] = ''
+    # Colonna UTC-aware: _data_dt è creato con utc=True e l'assegnazione
+    # di Timestamp timezone-aware a una colonna datetime-naive causava TypeError.
+    d['Data ultimo training V15'] = pd.Series(pd.NaT, index=d.index, dtype='datetime64[ns, UTC]')
+    d['Controllo causalità training V15'] = np.nan
+    d['Fattore casa WF'] = np.nan
+    d['Fattore trasferta WF'] = np.nan
+
+    # Elaborazione per competizione; target-day escluso dal training.
+    for comp, idxs in d.groupby('Competizione', dropna=False).groups.items():
+        idxs = list(idxs)
+        prior_idxs = []
+        for idx in idxs:
+            target_date = d.at[idx, '_data_dt']
+            # V19.7 FIX: escludi dal training le partite della data target senza
+            # eliminare permanentemente dallo storico le altre partite di quella data.
+            # prior_idxs deve conservare tutte le righe precedenti; il filtro è una vista
+            # temporanea, così le partite del giorno entrano nel training dei giorni successivi.
+            eligible_idxs = [
+                j for j in prior_idxs
+                if pd.notna(d.at[j, '_data_dt'])
+                and pd.notna(target_date)
+                and d.at[j, '_data_dt'].date() < target_date.date()
+            ]
+            train = d.loc[eligible_idxs].tail(max_train)
+            if len(train) >= min_train:
+                d.at[idx, 'Training usato V15'] = int(len(train))
+                ultima_data_train = train['_data_dt'].max()
+                d.at[idx, 'Data ultimo training V15'] = ultima_data_train
+                d.at[idx, 'Controllo causalità training V15'] = int(
+                    pd.notna(target_date) and pd.notna(ultima_data_train)
+                    and ultima_data_train.date() < target_date.date()
+                )
+                # Calibrazione binaria X e No Goal, fit solo su precedenti della stessa competizione.
+                bx = _fit_platt_prior(train['P(X) raw'], train['X y'], min_train, max_train)
+                bng = _fit_platt_prior(train['P(NG) raw'], train['NG y'], min_train, max_train)
+                # Replica soltanto il filtro iniziale del fit Platt per documentare
+                # quanti record NG validi entrano davvero nel fit, dopo il cap max_train.
+                _p_ng = pd.to_numeric(train['P(NG) raw'], errors='coerce').to_numpy(dtype=float)
+                _y_ng = pd.to_numeric(train['NG y'], errors='coerce').to_numpy(dtype=float)
+                _valid_ng = np.isfinite(_p_ng) & np.isfinite(_y_ng)
+                _ng_fit = train.loc[_valid_ng].tail(max_train).copy()
+                d.at[idx, 'NG training righe valide'] = int(len(_ng_fit))
+                d.at[idx, 'NG training date uniche'] = int(_ng_fit['_data_dt'].dt.date.nunique()) if not _ng_fit.empty else 0
+                d.at[idx, 'NG training prevalenza (%)'] = 100.0 * float(_ng_fit['NG y'].mean()) if not _ng_fit.empty else np.nan
+                if not _ng_fit.empty:
+                    d.at[idx, 'Ultima data training NG'] = _ng_fit['_data_dt'].max()
+                d.at[idx, 'Check training NG'] = (
+                    'PASS' if len(_ng_fit) == int(d.at[idx, 'Training usato V15'])
+                    and (pd.isna(target_date) or _ng_fit.empty or _ng_fit['_data_dt'].dt.date.max() < target_date.date())
+                    else 'VERIFICARE'
+                )
+                if bng is not None:
+                    d.at[idx, 'Intercetta Platt NG'] = float(bng[0])
+                    d.at[idx, 'Pendenza Platt NG'] = float(bng[1])
+                if bx is not None:
+                    p = _prob_clip(d.at[idx, 'P(X) raw'])
+                    x = np.log(p/(1-p))
+                    d.at[idx, 'P(X) calibrata WF'] = 1/(1+np.exp(-np.clip(bx[0]+bx[1]*x, -25, 25)))
+                if bng is not None:
+                    p = _prob_clip(d.at[idx, 'P(NG) raw'])
+                    x = np.log(p/(1-p))
+                    d.at[idx, 'P(NG) calibrata WF'] = 1/(1+np.exp(-np.clip(bng[0]+bng[1]*x, -25, 25)))
+
+                # Fattori di correzione lambda, stimati dal rapporto gol reali / lambda
+                # nelle sole previsioni già valutate. Shrinkage verso 1 e limiti anti-estremi.
+                lc = train['Lambda casa'].to_numpy(dtype=float)
+                la = train['Lambda trasferta'].to_numpy(dtype=float)
+                gh = train['Gol casa reali'].to_numpy(dtype=float)
+                ga = train['Gol trasferta reali'].to_numpy(dtype=float)
+                valid_h = np.isfinite(lc) & np.isfinite(gh) & (lc > 0)
+                valid_a = np.isfinite(la) & np.isfinite(ga) & (la > 0)
+                fh = float(np.clip((np.mean(gh[valid_h]) / np.mean(lc[valid_h])) if valid_h.any() else 1.0, 0.80, 1.25))
+                fa = float(np.clip((np.mean(ga[valid_a]) / np.mean(la[valid_a])) if valid_a.any() else 1.0, 0.80, 1.25))
+                # Shrinkage: con massimo 300 partite evita correzioni troppo aggressive.
+                shrink = len(train) / (len(train) + 150.0)
+                fh = 1.0 + (fh - 1.0) * shrink
+                fa = 1.0 + (fa - 1.0) * shrink
+                lc_new = max(0.01, float(d.at[idx, 'Lambda casa']) * fh)
+                la_new = max(0.01, float(d.at[idx, 'Lambda trasferta']) * fa)
+                d.at[idx, 'Lambda casa corretta WF'] = lc_new
+                d.at[idx, 'Lambda trasferta corretta WF'] = la_new
+                d.at[idx, 'Fattore casa WF'] = fh
+                d.at[idx, 'Fattore trasferta WF'] = fa
+                # Matrice Poisson 0..max_gol con la stessa normalizzazione dell'audit originale.
+                vh = np.array([math.exp(-lc_new) * lc_new**k / math.factorial(k) for k in range(max_gol+1)])
+                va = np.array([math.exp(-la_new) * la_new**k / math.factorial(k) for k in range(max_gol+1)])
+                mat = np.outer(vh, va)
+                mat /= max(float(mat.sum()), 1e-15)
+                d.at[idx, 'P(1) lambda corretta WF'] = float(np.tril(mat, -1).sum())
+                d.at[idx, 'P(X) lambda corretta WF'] = float(np.trace(mat))
+                d.at[idx, 'P(2) lambda corretta WF'] = float(np.triu(mat, 1).sum())
+                d.at[idx, 'P(NG) lambda corretta WF'] = float(1.0 - mat[1:, 1:].sum())
+                d.at[idx, 'P(0-0) lambda corretta WF'] = float(mat[0, 0])
+                d.at[idx, 'Training usato V15'] = len(train)
+            # Aggiungi la riga target allo storico solo dopo avere calcolato la previsione.
+            prior_idxs.append(idx)
+
+    # Tabella aggregata delle metriche: confronta sulle stesse righe per ciascuna coppia.
+    righe_metriche = []
+    yx = d['X y'].to_numpy(dtype=float)
+    yng = d['NG y'].to_numpy(dtype=float)
+    px_raw = d['P(X) raw'].to_numpy(dtype=float)
+    png_raw = d['P(NG) raw'].to_numpy(dtype=float)
+    for label, col, target, base in [
+        ('X — Brier', 'P(X) calibrata WF', 'X y', 'P(X) raw'),
+        ('No Goal — Brier', 'P(NG) calibrata WF', 'NG y', 'P(NG) raw'),
+    ]:
+        mask = d[col].notna() & d[base].notna()
+        if int(mask.sum()) >= 1:
+            y = d.loc[mask, target].to_numpy(dtype=float)
+            raw = d.loc[mask, base].to_numpy(dtype=float)
+            cal = d.loc[mask, col].to_numpy(dtype=float)
+            righe_metriche.append({'Test': label, 'N test out-of-sample': int(mask.sum()), 'Metrica raw': float(np.mean((raw-y)**2)), 'Metrica WF': float(np.mean((cal-y)**2)), 'Delta WF - raw': float(np.mean((cal-y)**2)-np.mean((raw-y)**2)), 'LogLoss raw': _calcola_metriche_binaria(raw,y)[1], 'LogLoss WF': _calcola_metriche_binaria(cal,y)[1]})
+    # Lambda correction: goals MAE and probability scores on identical rows.
+    mask_l = d['Lambda casa corretta WF'].notna() & d['Lambda trasferta corretta WF'].notna()
+    if int(mask_l.sum()) >= 1:
+        z = d.loc[mask_l]
+        raw_h = z['Lambda casa'].to_numpy(dtype=float); raw_a = z['Lambda trasferta'].to_numpy(dtype=float)
+        adj_h = z['Lambda casa corretta WF'].to_numpy(dtype=float); adj_a = z['Lambda trasferta corretta WF'].to_numpy(dtype=float)
+        gh = z['Gol casa reali'].to_numpy(dtype=float); ga = z['Gol trasferta reali'].to_numpy(dtype=float)
+        y1 = z['y1'].to_numpy(dtype=float); yxv = z['X y'].to_numpy(dtype=float); y2 = z['y2'].to_numpy(dtype=float)
+        raw_probs = z[['P(1) %','P(X) %','P(2) %']].to_numpy(dtype=float)/100
+        adj_probs = z[['P(1) lambda corretta WF','P(X) lambda corretta WF','P(2) lambda corretta WF']].to_numpy(dtype=float)
+        raw_brier_1x2 = float(np.mean(np.sum((raw_probs - np.column_stack([y1,yxv,y2]))**2, axis=1)))
+        adj_brier_1x2 = float(np.mean(np.sum((adj_probs - np.column_stack([y1,yxv,y2]))**2, axis=1)))
+        yng_l = z['NG y'].to_numpy(dtype=float)
+        raw_ng = z['P(NG) raw'].to_numpy(dtype=float)
+        adj_ng = z['P(NG) lambda corretta WF'].to_numpy(dtype=float)
+        righe_metriche.extend([
+            {'Test':'Lambda — MAE gol casa', 'N test out-of-sample':int(mask_l.sum()), 'Metrica raw':float(np.mean(np.abs(raw_h-gh))), 'Metrica WF':float(np.mean(np.abs(adj_h-gh))), 'Delta WF - raw':float(np.mean(np.abs(adj_h-gh))-np.mean(np.abs(raw_h-gh))), 'LogLoss raw':np.nan, 'LogLoss WF':np.nan},
+            {'Test':'Lambda — MAE gol trasferta', 'N test out-of-sample':int(mask_l.sum()), 'Metrica raw':float(np.mean(np.abs(raw_a-ga))), 'Metrica WF':float(np.mean(np.abs(adj_a-ga))), 'Delta WF - raw':float(np.mean(np.abs(adj_a-ga))-np.mean(np.abs(raw_a-ga))), 'LogLoss raw':np.nan, 'LogLoss WF':np.nan},
+            {'Test':'Lambda — Brier 1X2', 'N test out-of-sample':int(mask_l.sum()), 'Metrica raw':raw_brier_1x2, 'Metrica WF':adj_brier_1x2, 'Delta WF - raw':adj_brier_1x2-raw_brier_1x2, 'LogLoss raw':np.nan, 'LogLoss WF':np.nan},
+            {'Test':'Lambda — Brier No Goal', 'N test out-of-sample':int(mask_l.sum()), 'Metrica raw':float(np.mean((raw_ng-yng_l)**2)), 'Metrica WF':float(np.mean((adj_ng-yng_l)**2)), 'Delta WF - raw':float(np.mean((adj_ng-yng_l)**2)-np.mean((raw_ng-yng_l)**2)), 'LogLoss raw':_calcola_metriche_binaria(raw_ng,yng_l)[1], 'LogLoss WF':_calcola_metriche_binaria(adj_ng,yng_l)[1]},
+        ])
+    # Riepilogo per competizione: raw vs correzioni sulle stesse righe out-of-sample.
+    righe_comp = []
+    for comp, z in d.groupby('Competizione', dropna=False):
+        row = {
+            'Competizione': comp,
+            'Partite valutate': int(len(z)),
+            'Prima data': z['_data_dt'].min(),
+            'Ultima data': z['_data_dt'].max(),
+            'Training minimo usato': int(z['Training usato V15'].min()),
+            'Training massimo usato': int(z['Training usato V15'].max()),
+        }
+        for raw_col, cal_col, target_col, label_raw, label_cal in [
+            ('P(X) raw', 'P(X) calibrata WF', 'X y', 'Brier X raw', 'Brier X calibrato WF'),
+            ('P(NG) raw', 'P(NG) calibrata WF', 'NG y', 'Brier No Goal raw', 'Brier No Goal calibrato WF'),
+        ]:
+            zcal = z[z[cal_col].notna()]
+            row[label_raw] = float(np.mean((zcal[raw_col].to_numpy(dtype=float) - zcal[target_col].to_numpy(dtype=float))**2)) if not zcal.empty else np.nan
+            row[label_cal] = float(np.mean((zcal[cal_col].to_numpy(dtype=float) - zcal[target_col].to_numpy(dtype=float))**2)) if not zcal.empty else np.nan
+        zz = z[z['Lambda casa corretta WF'].notna() & z['Lambda trasferta corretta WF'].notna()]
+        if not zz.empty:
+            targets = np.column_stack([(zz['Esito reale'] == '1').astype(int), (zz['Esito reale'] == 'X').astype(int), (zz['Esito reale'] == '2').astype(int)])
+            probs_raw = zz[['P(1) %','P(X) %','P(2) %']].to_numpy(dtype=float)/100.0
+            probs_adj = zz[['P(1) lambda corretta WF','P(X) lambda corretta WF','P(2) lambda corretta WF']].to_numpy(dtype=float)
+            row['Brier 1X2 raw'] = float(np.mean(np.sum((probs_raw-targets)**2, axis=1)))
+            row['Brier 1X2 lambda WF'] = float(np.mean(np.sum((probs_adj-targets)**2, axis=1)))
+            row['MAE lambda casa raw'] = float(np.mean(np.abs(zz['Lambda casa']-zz['Gol casa reali'])))
+            row['MAE lambda casa WF'] = float(np.mean(np.abs(zz['Lambda casa corretta WF']-zz['Gol casa reali'])))
+            row['MAE lambda trasferta raw'] = float(np.mean(np.abs(zz['Lambda trasferta']-zz['Gol trasferta reali'])))
+            row['MAE lambda trasferta WF'] = float(np.mean(np.abs(zz['Lambda trasferta corretta WF']-zz['Gol trasferta reali'])))
+        else:
+            for col in ['Brier 1X2 raw','Brier 1X2 lambda WF','MAE lambda casa raw','MAE lambda casa WF','MAE lambda trasferta raw','MAE lambda trasferta WF']:
+                row[col] = np.nan
+        righe_comp.append(row)
+    return d, pd.DataFrame(righe_metriche), pd.DataFrame(righe_comp)
+
+
+# --- ACQUISIZIONE DATI ---
+statistiche_squadre = {}
+matches_raw = []
+
+for c_nome, (codice_lega, tipo_fonte) in selezionati_dict.items():
+    if api_key:
+        dati = scarica_dati_club(api_key, codice_lega)
+        dati_classifica = scarica_classifica_club(api_key, codice_lega)
+        if dati and "matches" in dati: 
+            for m in dati["matches"]:
+                m["Competizione"] = c_nome
+                matches_raw.append(m)
+        if dati_classifica and "standings" in dati_classifica:
+            for s in dati_classifica["standings"]:
+                for riga in s.get("table", []):
+                    nome_sq = riga["team"]["name"]
+                    giocate = max(riga["playedGames"], 1)
+                    statistiche_squadre[nome_sq] = {
+                        "media_gf": riga["goalsFor"] / giocate,
+                        "media_gs": riga["goalsAgainst"] / giocate,
+                        "punti": riga["points"],
+                        "forma": "N/D",
+                        "Competizione": c_nome
+                    }
+
+# --- TAB 1: CALENDARIO & STUDIO ---
+with tab_calendario:
+    if matches_raw:
+        lista = []
+        for m in matches_raw:
+            g_c = m["score"]["fullTime"].get("home") if m.get("score") and m["score"].get("fullTime") else None
+            g_t = m["score"]["fullTime"].get("away") if m.get("score") and m["score"].get("fullTime") else None
+            lista.append({
+                "Competizione": m.get("Competizione", "Torneo"),
+                "giornata": m.get("matchday", 0), "casa": m["homeTeam"]["name"],
+                "trasferta": m["awayTeam"]["name"], "data": m["utcDate"][:10],
+                "ora": m["utcDate"][11:16], "gol_casa": g_c if g_c is not None else "-",
+                "gol_trasf": g_t if g_t is not None else "-", "stato": m["status"],
+            })
+        df = pd.DataFrame(lista)
+        
+        c_f1, c_f2 = str_lit.columns(2)
+        competizioni_disponibili = sorted(df["Competizione"].unique())
+        comp_sel = c_f1.selectbox("🏆 Torneo", competizioni_disponibili, key="mobile_comp_select")
+        
+        df_comp = df[df["Competizione"] == comp_sel]
+        giornate = sorted(df_comp["giornata"].unique())
+        if giornate:
+            giornata_sel = c_f2.selectbox("📅 Giornata", giornate, key="mobile_giornata_select")
+            for idx, row in df_comp[df_comp["giornata"] == giornata_sel].iterrows():
+                str_lit.markdown(
+                    f"""
+                    <div style="background-color: #111827; padding: 18px; border-radius: 12px; border: 1px solid #1f2937; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <span style="font-weight: 700; font-size: 1.05rem; color: #f3f4f6;">{row['casa']}</span> 
+                            <span style="color: #94a3b8; margin: 0 8px;">vs</span> 
+                            <span style="font-weight: 700; font-size: 1.05rem; color: #f3f4f6;">{row['trasferta']}</span><br>
+                            <span style="color: #64748b; font-size: 12px;">📅 {row['data']} ore {row['ora']}</span>
+                        </div>
+                        <div style="text-align: right;">
+                            <span style="background-color: #1e293b; color: #38bdf8; padding: 6px 14px; border-radius: 8px; font-weight: 700; font-size: 1.1rem;">{row['gol_casa']} - {row['gol_trasf']}</span>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if str_lit.button("📊 Analizza Match", key=f"btn_{idx}"):
+                    str_lit.session_state["match_attivo"] = row
+    else:
+        str_lit.info("👈 Inserisci la chiave API nella barra laterale o seleziona un campionato valido.")
+
+    if "match_attivo" in str_lit.session_state:
+        m = str_lit.session_state["match_attivo"]
+        sq_c, sq_t = m["casa"], m["trasferta"]
+        lam_c = statistiche_squadre.get(sq_c, {}).get("media_gf", 1.4)
+        lam_t = statistiche_squadre.get(sq_t, {}).get("media_gf", 1.1)
+
+        p_c, p_p, p_t = 0.0, 0.0, 0.0
+        prob_under_over = {0.5: 0.0, 1.5: 0.0, 2.5: 0.0, 3.5: 0.0, 4.5: 0.0}
+        prob_btts_yes = 0.0
+        matrice_risultati = np.zeros((11, 11))
+
+        for rc in range(11):
+            for rt in range(11):
+                prob = poisson_prob(lam_c, rc) * poisson_prob(lam_t, rt)
+                matrice_risultati[rc, rt] = prob
+                
+                if rc > rt: p_c += prob
+                elif rc == rt: p_p += prob
+                else: p_t += prob
+                
+                tot_gol = rc + rt
+                for soglia in prob_under_over:
+                    if tot_gol <= soglia:
+                        prob_under_over[soglia] += prob
+                        
+                if rc > 0 and rt > 0:
+                    prob_btts_yes += prob
+
+        tot = p_c + p_p + p_t
+        # La matrice considera i punteggi 0..10: normalizziamo anche BTTS,
+        # altrimenti la massa Poisson oltre 5 gol viene conteggiata erroneamente come No Goal.
+        prob_btts_yes = prob_btts_yes / tot if tot > 0 else 0.0
+        prob_btts_no = 1.0 - prob_btts_yes
+        p_c, p_p, p_t = (p_c/tot)*100, (p_p/tot)*100, (p_t/tot)*100
+
+        stats_match = calcola_statistiche_avanzate_match(sq_c, sq_t, statistiche_squadre)
+
+        str_lit.markdown(
+            f"""
+            <div style="background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); border: 1px solid #312e81; border-radius: 20px; padding: 25px; margin-top: 20px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);">
+                <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 15px; margin-bottom: 20px;">
+                    <span style="font-weight: 800; font-size: 1.2rem; color: #f8fafc;">📋 SCHEDA DINAMICA DELLA PARTITA</span>
+                    <span style="color: #94a3b8; font-size: 0.95rem;">📅 {m.get('data', 'N/D')} - {m.get('ora', '')}</span>
+                </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        col_sq, col_st = str_lit.columns([1.2, 1.8])
+        with col_sq:
+            str_lit.markdown(
+                f"""
+                <div style="text-align: center; padding: 30px 20px; background: rgba(15, 23, 42, 0.6); border-radius: 14px; border: 1px solid #1e293b;">
+                    <h2 style="color: #38bdf8; margin: 0; font-size: 1.4rem;">{sq_c}</h2>
+                    <p style="color: #64748b; margin: 5px 0 20px 0; font-size: 0.85rem;">CASA</p>
+                    <h3 style="color: #a855f7; margin: 0; font-size: 1.2rem;">VS</h3>
+                    <h2 style="color: #f43f5e; margin: 20px 0 0 0; font-size: 1.4rem;">{sq_t}</h2>
+                    <p style="color: #64748b; margin: 5px 0 0 0; font-size: 0.85rem;">TRASFERTA</p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            
+        with col_st:
+            str_lit.markdown("<p style='text-align: center; font-weight: 700; color: #94a3b8; margin-bottom: 15px; letter-spacing: 0.5px;'>STATISTICHE PREVISTE (LIVE CALC)</p>", unsafe_allow_html=True)
+            for label, (val_c, val_t) in stats_match.items():
+                str_lit.markdown(
+                    f"""
+                    <div style="display: flex; justify-content: space-between; align-items: center; background: #111827; padding: 12px 18px; border-radius: 10px; border: 1px solid #1f2937; margin-bottom: 10px;">
+                        <span style="font-weight: 700; color: #38bdf8; font-size: 1.1rem; width: 60px; text-align: left;">{val_c}</span>
+                        <span style="color: #94a3b8; font-size: 0.9rem; font-weight: 600; text-align: center; flex-grow: 1;">{label}</span>
+                        <span style="font-weight: 700; color: #f43f5e; font-size: 1.1rem; width: 60px; text-align: right;">{val_t}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+        str_lit.markdown("<br>", unsafe_allow_html=True)
+        str_lit.markdown(f"<h3>🔬 Analisi Avanzata Poisson & Mercati: {sq_c} vs {sq_t}</h3>", unsafe_allow_html=True)
+        
+        col1, col2, col3 = str_lit.columns(3)
+        col1.metric("Segno 1 (Casa)", f"{p_c:.1f}%", f"Quota equa: {100/p_c:.2f}")
+        col2.metric("Segno X (Pareggio)", f"{p_p:.1f}%", f"Quota equa: {100/p_p:.2f}")
+        col3.metric("Segno 2 (Trasferta)", f"{p_t:.1f}%", f"Quota equa: {100/p_t:.2f}")
+        
+        str_lit.markdown("<br>", unsafe_allow_html=True)
+        str_lit.markdown("#### ⚽ Analisi Under / Over & Goal / No Goal")
+        
+        uo_col1, uo_col2, uo_col3, uo_col4, uo_col5 = str_lit.columns(5)
+        uo_col1.metric("Over 2.5", f"{(1 - prob_under_over[2.5])*100:.1f}%", f"Under: {prob_under_over[2.5]*100:.1f}%")
+        uo_col2.metric("Over 1.5", f"{(1 - prob_under_over[1.5])*100:.1f}%", f"Under: {prob_under_over[1.5]*100:.1f}%")
+        uo_col3.metric("Over 3.5", f"{(1 - prob_under_over[3.5])*100:.1f}%", f"Under: {prob_under_over[3.5]*100:.1f}%")
+        uo_col4.metric("Goal (BTTS)", f"{prob_btts_yes*100:.1f}%", f"Quota: {100/(prob_btts_yes*100):.2f}" if prob_btts_yes > 0 else "N.D.")
+        uo_col5.metric("No Goal", f"{prob_btts_no*100:.1f}%", f"Quota: {100/(prob_btts_no*100):.2f}" if prob_btts_no > 0 else "N.D.")
+
+        str_lit.markdown("<br>", unsafe_allow_html=True)
+        str_lit.markdown("#### 🎯 Top 3 Risultati Esatti più Probabili")
+        
+        lista_esatti = []
+        for rc in range(11):
+            for rt in range(11):
+                lista_esatti.append(((rc, rt), matrice_risultati[rc, rt]))
+        lista_esatti.sort(key=lambda x: x[1], reverse=True)
+        
+        c_res1, c_res2, c_res3 = str_lit.columns(3)
+        with c_res1: str_lit.info(f"🥇 1° Esatto: **{lista_esatti[0][0][0]} - {lista_esatti[0][0][1]}** ({lista_esatti[0][1]*100:.1f}%)")
+        with c_res2: str_lit.info(f"🥈 2° Esatto: **{lista_esatti[1][0][0]} - {lista_esatti[1][0][1]}** ({lista_esatti[1][1]*100:.1f}%)")
+        with c_res3: str_lit.info(f"🥉 3° Esatto: **{lista_esatti[2][0][0]} - {lista_esatti[2][0][1]}** ({lista_esatti[2][1]*100:.1f}%)")
+        
+        # ================================================================
+        # NUOVI MERCATI: PRIMO TEMPO, SECONDO TEMPO, 1T/FINALE E CARTELLINI
+        # Modulo aggiuntivo: non modifica lambda, matrice full-time o ranking
+        # già calcolati dal modello operativo.
+        # ================================================================
+        str_lit.markdown("---")
+        str_lit.markdown("### ⏱️ Risultati esatti per tempo")
+        quota_1t = 0.45  # ripartizione temporale euristica, non dato osservato
+        quota_2t = 1.0 - quota_1t
+        max_gol_tempo = 10
+
+        def _matrice_tempo(lc_t, lt_t):
+            mh = np.zeros((max_gol_tempo + 1, max_gol_tempo + 1), dtype=float)
+            for gh in range(max_gol_tempo + 1):
+                ph = poisson_prob(max(0.01, float(lc_t)), gh)
+                for ga in range(max_gol_tempo + 1):
+                    mh[gh, ga] = ph * poisson_prob(max(0.01, float(lt_t)), ga)
+            somma = float(mh.sum())
+            return mh / somma if somma > 0 else mh
+
+        def _indice_concentrazione(matrice):
+            valori = matrice[matrice > 0]
+            if len(valori) <= 1:
+                return 100.0
+            entropia = -float(np.sum(valori * np.log(valori)))
+            massimo = math.log(len(valori))
+            return float(np.clip((1.0 - entropia / massimo) * 100.0, 0.0, 100.0)) if massimo > 0 else 0.0
+
+        matrice_1t = _matrice_tempo(lam_c * quota_1t, lam_t * quota_1t)
+        matrice_2t = _matrice_tempo(lam_c * quota_2t, lam_t * quota_2t)
+        score_1t = np.unravel_index(int(np.argmax(matrice_1t)), matrice_1t.shape)
+        score_2t = np.unravel_index(int(np.argmax(matrice_2t)), matrice_2t.shape)
+        prob_score_1t = float(matrice_1t[score_1t])
+        prob_score_2t = float(matrice_2t[score_2t])
+
+        def _livello_concentrazione(indice):
+            if indice >= 35:
+                return "Alta"
+            if indice >= 20:
+                return "Media"
+            return "Bassa"
+
+        aff_1t = _indice_concentrazione(matrice_1t)
+        aff_2t = _indice_concentrazione(matrice_2t)
+        c1t, c2t = str_lit.columns(2)
+        c1t.metric("🥇 Esatto più probabile — 1° tempo", f"{score_1t[0]}-{score_1t[1]}", f"Probabilità {prob_score_1t*100:.1f}%")
+        c2t.metric("🥇 Esatto più probabile — 2° tempo", f"{score_2t[0]}-{score_2t[1]}", f"Probabilità {prob_score_2t*100:.1f}%")
+        c1t.caption(f"Indice di concentrazione: {aff_1t:.1f}/100 — {_livello_concentrazione(aff_1t)}")
+        c2t.caption(f"Indice di concentrazione: {aff_2t:.1f}/100 — {_livello_concentrazione(aff_2t)}")
+        str_lit.caption("L'indice descrive quanto la distribuzione è concentrata: non è una percentuale di successo né una calibrazione storica. La ripartizione 45%/55% dei gol tra i tempi è un'ipotesi tecnica, non una rilevazione dei gol per minuto.")
+
+        # Distribuzione congiunta: esito del primo tempo e segno finale.
+        segni = ("1", "X", "2")
+        probabilita_1t_ft = {f"{a}-{b}": 0.0 for a in segni for b in segni}
+        for h1 in range(max_gol_tempo + 1):
+            for a1 in range(max_gol_tempo + 1):
+                p_ht = float(matrice_1t[h1, a1])
+                esito_ht = "1" if h1 > a1 else ("X" if h1 == a1 else "2")
+                for h2 in range(max_gol_tempo + 1):
+                    for a2 in range(max_gol_tempo + 1):
+                        p_ft = float(matrice_2t[h2, a2])
+                        totale_h, totale_a = h1 + h2, a1 + a2
+                        esito_ft = "1" if totale_h > totale_a else ("X" if totale_h == totale_a else "2")
+                        probabilita_1t_ft[f"{esito_ht}-{esito_ft}"] += p_ht * p_ft
+        # Normalizzazione numerica per garantire somma pari a 100%.
+        somma_1t_ft = sum(probabilita_1t_ft.values())
+        if somma_1t_ft > 0:
+            probabilita_1t_ft = {k: v / somma_1t_ft for k, v in probabilita_1t_ft.items()}
+
+        str_lit.markdown("### 🏁 Mercato Primo Tempo / Finale (1T/FT)")
+        str_lit.caption("Le nove probabilità sono calcolate combinando la distribuzione Poisson stimata del primo tempo con quella del secondo tempo. La quota bookmaker va inserita manualmente: non vengono inventate quote.")
+        righe_1t_ft = []
+        for esito in [f"{a}-{b}" for a in segni for b in segni]:
+            prob_esito = float(probabilita_1t_ft[esito])
+            quota = str_lit.number_input(
+                f"Quota {esito}", min_value=1.01, max_value=1000.0,
+                value=2.00, step=0.05, key=f"quota_1tft_{esito}_{sq_c}_{sq_t}"
+            )
+            ev_esito = prob_esito * float(quota) - 1.0
+            righe_1t_ft.append({
+                "Esito 1T/Finale": esito,
+                "Probabilità modello (%)": prob_esito * 100.0,
+                "Quota inserita": float(quota),
+                "Quota equa": (1.0 / prob_esito) if prob_esito > 0 else np.nan,
+                "EV (%)": ev_esito * 100.0,
+                "Value Bet": "SÌ" if ev_esito > 0 else "NO",
+            })
+        df_1t_ft = pd.DataFrame(righe_1t_ft)
+        str_lit.dataframe(
+            df_1t_ft.style.format({"Probabilità modello (%)": "{:.2f}%", "Quota inserita": "{:.2f}", "Quota equa": "{:.2f}", "EV (%)": "{:+.2f}%"}),
+            use_container_width=True, hide_index=True
+        )
+        positivi_1t_ft = df_1t_ft[df_1t_ft["EV (%)"] > 0]
+        if not positivi_1t_ft.empty:
+            str_lit.success("Possibile Value Bet 1T/Finale: " + ", ".join(f"{r['Esito 1T/Finale']} (EV {r['EV (%)']:+.2f}%)" for _, r in positivi_1t_ft.iterrows()))
+        else:
+            str_lit.info("Con le quote inserite non emergono EV positivi nel mercato 1T/Finale.")
+
+        # Cartellini: stima indiretta basata sui falli attesi, non su eventi
+        # disciplinari osservati per minuto/tempo. Non è un mercato calibrato.
+        str_lit.markdown("### 🟨 Squadra con più cartellini per tempo — stima")
+        falli_c, falli_t = stats_match["Falli Attesi"]
+        # Proxy prudente: circa un cartellino ogni 8 falli attesi; ripartizione 45/55.
+        media_cart_c = max(0.05, float(falli_c) / 8.0)
+        media_cart_t = max(0.05, float(falli_t) / 8.0)
+
+        def _prob_cartellini_superiori(media_c, media_t):
+            dist_c = np.array([poisson_prob(media_c, k) for k in range(9)], dtype=float)
+            dist_t = np.array([poisson_prob(media_t, k) for k in range(9)], dtype=float)
+            dist_c /= max(float(dist_c.sum()), 1e-12)
+            dist_t /= max(float(dist_t.sum()), 1e-12)
+            p_c_maggiori = p_pari = p_t_maggiori = 0.0
+            for i, pi in enumerate(dist_c):
+                for j, pj in enumerate(dist_t):
+                    if i > j:
+                        p_c_maggiori += pi * pj
+                    elif i == j:
+                        p_pari += pi * pj
+                    else:
+                        p_t_maggiori += pi * pj
+            return p_c_maggiori, p_pari, p_t_maggiori
+
+        for nome_tempo, frazione_tempo in (("Primo tempo", quota_1t), ("Secondo tempo", quota_2t)):
+            pc_cart, ppari_cart, pt_cart = _prob_cartellini_superiori(media_cart_c * frazione_tempo, media_cart_t * frazione_tempo)
+            cc, ct, cp = str_lit.columns(3)
+            cc.metric(f"{nome_tempo}: più cartellini casa", f"{pc_cart*100:.1f}%", sq_c)
+            ct.metric(f"{nome_tempo}: pari", f"{ppari_cart*100:.1f}%")
+            cp.metric(f"{nome_tempo}: più cartellini trasferta", f"{pt_cart*100:.1f}%", sq_t)
+        str_lit.warning("Stima puramente indicativa: i dati storici gratuiti disponibili non forniscono in modo affidabile il minuto di ogni cartellino per squadra. Il calcolo usa i falli attesi come proxy e non va interpretato come previsione disciplinare validata.")
+
+        str_lit.markdown('</div>', unsafe_allow_html=True)
+
+# --- TAB 2: CLASSIFICA ---
+with tab_classifica:
+    str_lit.subheader("🏆 Classifica e Rendimento")
+    if statistiche_squadre:
+        df_cls = pd.DataFrame([{
+            "Competizione": v.get("Competizione", "Torneo"),
+            "Squadra": k, "Punti": v["punti"], 
+            "Media GF": round(v["media_gf"], 2), 
+            "Media GS": round(v["media_gs"], 2), 
+            "DR": round(v["media_gf"] - v["media_gs"], 2)
+        } for k, v in sorted(statistiche_squadre.items(), key=lambda x: x[1]["punti"], reverse=True)])
+        str_lit.dataframe(df_cls, use_container_width=True, hide_index=True)
+        str_lit.download_button("📥 Scarica CSV", df_cls.to_csv(index=False).encode("utf-8"), "classifica.csv", "text/csv")
+    else:
+        str_lit.warning("Dati non disponibili.")
+
+# --- TAB 3: VALUE BET ---
+with tab_value:
+    str_lit.subheader("🔍 Calcolatore Value Bet & Kelly Criterion")
+    c1, c2, c3 = str_lit.columns(3)
+    p_stim = c1.slider("Probabilità Modello (%)", 1.0, 100.0, 45.0)
+    q_book = c2.number_input("Quota Bookmaker", 1.01, 50.0, 2.30)
+    bankroll = c3.number_input("Bankroll (€)", 10.0, 100000.0, 1000.0)
+    
+    q_equa = 100 / p_stim
+    ev = ((p_stim / 100) * q_book) - 1
+    b = q_book - 1
+    p = p_stim / 100
+    q = 1 - p
+    kelly_fraction = max(0.0, ((b * p - q) / b)) * 0.25
+    stake = bankroll * kelly_fraction
+
+    m1, m2, m3 = str_lit.columns(3)
+    m1.metric("Quota Equa", f"{q_equa:.2f}")
+    m2.metric("Valore Atteso (EV)", f"{ev*100:+.2f}%")
+    m3.metric("Stake (Kelly 25%)", f"€{stake:.2f}")
+
+    if q_book > q_equa:
+        str_lit.success("🔥 VALUE BET CERTIFICATA! Edge Positivo.")
+    else:
+        str_lit.error("❌ Nessun valore rilevato.")
+
+# --- TAB 4: GRAFICI ---
+with tab_grafici:
+    str_lit.subheader("📊 Trend e Prestazioni")
+    if statistiche_squadre:
+        df_g = pd.DataFrame([{"Squadra": k, "Punti": v["punti"], "Media Gol Fatti": v["media_gf"]} for k, v in statistiche_squadre.items()])
+        fig = px.bar(df_g, x="Squadra", y="Punti", color="Media Gol Fatti", template="plotly_dark", title="Punti e Potenziale Offensivo")
+        str_lit.plotly_chart(fig, use_container_width=True)
+
+def genera_dataset_valore(matches_list, stats_dict):
+    righe = []
+    for m in matches_list:
+        h, a = m["homeTeam"]["name"], m["awayTeam"]["name"]
+        if h in stats_dict and a in stats_dict:
+            lc = stats_dict[h]["media_gf"]
+            lt = stats_dict[a]["media_gf"]
+            
+            p_c, p_p, p_t = 0.0, 0.0, 0.0
+            for rc in range(11):
+                for rt in range(11):
+                    prob = poisson_prob(lc, rc) * poisson_prob(lt, rt)
+                    if rc > rt: p_c += prob
+                    elif rc == rt: p_p += prob
+                    else: p_t += prob
+            
+            tot_prob = p_c + p_p + p_t
+            if tot_prob > 0:
+                p_c, p_p, p_t = p_c / tot_prob, p_p / tot_prob, p_t / tot_prob
+            
+            esiti = [
+                (f"1 ({h})", p_c),
+                (f"X (Pareggio)", p_p),
+                (f"2 ({a})", p_t)
+            ]
+            esiti.sort(key=lambda x: x[1], reverse=True)
+            miglior_selezione, prob_scelta = esiti[0]
+            
+            q_book = round(1.03 / max(0.01, prob_scelta), 2)
+            edge = round((prob_scelta * q_book - 1) * 100, 1)
+            
+            righe.append({
+                "Competizione": m.get("Competizione", "Torneo"),
+                "Giornata": m.get("matchday", 1),
+                "Partita": f"{h} vs {a}", 
+                "Selezione": miglior_selezione, 
+                "Prob_Modello": round(prob_scelta * 100, 1), 
+                "Quota_Book": q_book, 
+                "Edge": edge
+            })
+            
+    if not righe:
+        return pd.DataFrame(columns=["Competizione", "Giornata", "Partita", "Selezione", "Prob_Modello", "Quota_Book", "Edge"])
+    return pd.DataFrame(righe)
+
+df_val = genera_dataset_valore(matches_raw, statistiche_squadre)
+
+# --- TAB 5: SCHEDINE AI ---
+with tab_ai_schedine:
+    str_lit.subheader("🤖 Schedine Smart & Combo AI")
+    if not df_val.empty and "Competizione" in df_val.columns:
+        c_s1, c_s2 = str_lit.columns(2)
+        comp_schedina = c_s1.selectbox("Torneo", sorted(df_val["Competizione"].unique()), key="mobile_schedina_torneo")
+        df_comp_val = df_val[df_val["Competizione"] == comp_schedina]
+        giornate_val = sorted(df_comp_val["Giornata"].unique())
+        if giornate_val:
+            giornata_schedina = c_s2.selectbox("Giornata", giornate_val, key="mobile_schedina_giornata")
+            df_filtrato_giornata = df_comp_val[df_comp_val["Giornata"] == giornata_schedina]
+            if not df_filtrato_giornata.empty:
+                num_ev = str_lit.slider("Eventi in Multipla", 2, min(6, len(df_filtrato_giornata)), min(3, len(df_filtrato_giornata)))
+                subset = df_filtrato_giornata.sort_values(by="Edge", ascending=False).head(num_ev)
+                quota_tot = np.prod(subset['Quota_Book'].values)
+                str_lit.metric("📈 Quota Totale Accumulatore", f"{quota_tot:.2f}")
+                str_lit.dataframe(subset, use_container_width=True, hide_index=True)
+
+# --- TAB 6: VALUE FINDER ---
+with tab_value_finder:
+    str_lit.subheader("⚡ Scanner Value Finder")
+    if not df_val.empty:
+        min_edge = str_lit.slider("Edge Minimo (%)", 0.0, 25.0, 3.0)
+        str_lit.dataframe(df_val[df_val["Edge"] >= min_edge], use_container_width=True, hide_index=True)
+    else:
+        str_lit.info("Nessun incontro disponibile.")
+
+# --- TAB 7: MONTE CARLO ---
+with tab_monte_carlo:
+    str_lit.subheader("🎲 Simulatore Monte Carlo Avanzato")
+    if statistiche_squadre:
+        nomi = sorted(list(statistiche_squadre.keys()))
+        c1, c2, c3 = str_lit.columns(3)
+        sq_c = c1.selectbox("Casa", nomi, index=0, key="mc_casa")
+        sq_t = c2.selectbox("Trasferta", nomi, index=min(1, len(nomi)-1), key="mc_trasf")
+        iterazioni = c3.slider("Iterazioni", 1000, 20000, 5000, step=1000, key="mc_iter")
+        
+        if str_lit.button("🚀 Esegui Simulazione", key="btn_mc"):
+            lc = statistiche_squadre[sq_c]["media_gf"] * 1.05
+            lt = statistiche_squadre[sq_t]["media_gf"] * 0.95
+            
+            gc_sim = np.random.poisson(lc, iterazioni)
+            gt_sim = np.random.poisson(lt, iterazioni)
+            
+            v_c = np.sum(gc_sim > gt_sim) / (iterazioni / 100)
+            v_p = np.sum(gc_sim == gt_sim) / (iterazioni / 100)
+            v_t = np.sum(gc_sim < gt_sim) / (iterazioni / 100)
+            
+            tot_gol = gc_sim + gt_sim
+            p_over15 = np.sum(tot_gol > 1.5) / (iterazioni / 100)
+            p_over25 = np.sum(tot_gol > 2.5) / (iterazioni / 100)
+            p_btts = np.sum((gc_sim > 0) & (gt_sim > 0)) / (iterazioni / 100)
+            
+            str_lit.markdown("#### 📊 Esiti 1X2 dalle Simulazioni")
+            m1, m2, m3 = str_lit.columns(3)
+            m1.metric("Vittoria Casa (1)", f"{v_c:.1f}%", f"Quota equa: {100/v_c:.2f}" if v_c > 0 else "N.D.")
+            m2.metric("Pareggio (X)", f"{v_p:.1f}%", f"Quota equa: {100/v_p:.2f}" if v_p > 0 else "N.D.")
+            m3.metric("Vittoria Trasferta (2)", f"{v_t:.1f}%", f"Quota equa: {100/v_t:.2f}" if v_t > 0 else "N.D.")
+            
+            str_lit.markdown("<br>", unsafe_allow_html=True)
+            str_lit.markdown("#### ⚽ Mercati di Gol (Simulati)")
+            uo1, uo2, uo3 = str_lit.columns(3)
+            uo1.metric("Over 1.5 Gol", f"{p_over15:.1f}%")
+            uo2.metric("Over 2.5 Gol", f"{p_over25:.1f}%")
+            uo3.metric("Goal (BTTS)", f"{p_btts:.1f}%")
+            
+            str_lit.markdown("<br>", unsafe_allow_html=True)
+            str_lit.markdown("#### 🎯 Top 3 Risultati Esatti più Frequenti")
+            
+            risultati_coppie = list(zip(gc_sim, gt_sim))
+            conteggio_esatti = pd.Series(risultati_coppie).value_counts().head(3)
+            
+            r_col1, r_col2, r_col3 = str_lit.columns(3)
+            colonne_res = [r_col1, r_col2, r_col3]
+            
+            for idx, ((rc, rt), count) in enumerate(conteggio_esatti.items()):
+                perc = (count / iterazioni) * 100
+                with colonne_res[idx]:
+                    medaglia = ["🥇", "🥈", "🥉"][idx]
+                    str_lit.info(f"{medaglia} **{rc} - {rt}** ({perc:.1f}% delle volte)")
+            
+            str_lit.markdown("<br>", unsafe_allow_html=True)
+            df_dist = pd.DataFrame({"Gol Totali": tot_gol})
+            fig_mc = px.histogram(df_dist, x="Gol Totali", nbins=int(max(tot_gol))+1, title="Distribuzione Frequenza Gol Totali (Iterazioni Monte Carlo)", template="plotly_dark")
+            str_lit.plotly_chart(fig_mc, use_container_width=True)
+
+# --- TAB 8: AUDIT ---
+with tab_audit:
+    str_lit.subheader("🛡️ Audit statistico: Pareggio X e Goal / No Goal")
+    str_lit.info("Versione diagnostica V21.0: audit storico, robustezza e verifica economica walk-forward; calibrazione 0-0 su tutte le partite valutate e per fasce di probabilità. Modello operativo invariato.")
+    str_lit.caption(
+        "Controllo walk-forward: per ogni partita storica le probabilità sono stimate usando soltanto "
+        "risultati precedenti della stessa competizione. Nessuna percentuale viene forzata per aumentare X o No Goal."
+    )
+    str_lit.markdown("#### 🌍 V19.7.3 — Audit storico multi-campionato con dati gratuiti")
+    str_lit.caption(
+        "L'audit diagnostico carica separatamente fino a tre stagioni per sei campionati da football-data.co.uk. "
+        "Non usa la sola competizione selezionata nel menu e non modifica i dati o le previsioni operative. "
+        "Per ogni partita, le stime usano soltanto risultati precedenti della stessa competizione."
+    )
+    with str_lit.spinner("Caricamento dello storico gratuito per tutti i campionati..."):
+        matches_audit, df_caricamento, df_copertura_statistiche = carica_storico_audit_gratuito()
+    str_lit.markdown("##### Stato caricamento storico")
+    str_lit.dataframe(df_caricamento, use_container_width=True, hide_index=True)
+    str_lit.markdown("#### 📊 V20.0 — Copertura delle statistiche reali")
+    str_lit.caption(
+        "Controllo dei dati effettivamente presenti nei CSV gratuiti: angoli, tiri, tiri in porta, "
+        "falli e cartellini. Le celle vuote sono conteggiate come mancanti, mai come zero."
+    )
+    if not df_copertura_statistiche.empty:
+        str_lit.dataframe(df_copertura_statistiche, use_container_width=True, hide_index=True)
+        df_riepilogo_copertura = (
+            df_copertura_statistiche.groupby("Statistica", as_index=False)
+            .agg({"Partite": "sum", "Valori disponibili": "sum", "Valori mancanti": "sum"})
+        )
+        df_riepilogo_copertura["Copertura (%)"] = (
+            100 * df_riepilogo_copertura["Valori disponibili"] /
+            df_riepilogo_copertura["Partite"].replace(0, np.nan)
+        ).round(1).fillna(0)
+        str_lit.markdown("##### Riepilogo copertura per statistica")
+        str_lit.dataframe(df_riepilogo_copertura, use_container_width=True, hide_index=True)
+        str_lit.download_button(
+            "⬇️ Scarica copertura statistiche CSV",
+            data=df_copertura_statistiche.to_csv(index=False).encode("utf-8-sig"),
+            file_name="V20_0_copertura_statistiche.csv",
+            mime="text/csv",
+        )
+    else:
+        str_lit.warning("Nessun dato statistico disponibile per il controllo della copertura.")
+
+    # V20.1: tutti i mercati statistici vengono testati insieme, solo in modalità Audit.
+    str_lit.markdown("## 🧪 V20.1 — Test walk-forward completo statistiche squadre + verifiche V20.2")
+    str_lit.caption(
+        "Test unico per angoli, tiri, tiri in porta, falli, ammonizioni, espulsioni e cartellini totali. "
+        "Le previsioni di ogni data sono calcolate prima di aggiornare lo storico con i risultati di quella stessa data. "
+        "Nessuna modifica al modello operativo."
+    )
+    if matches_audit:
+        with str_lit.spinner("Esecuzione test walk-forward di tutte le statistiche..."):
+            df_stat_pred, df_stat_metriche, df_stat_dettaglio, df_stat_gruppi = crea_test_statistiche_v201(
+                matches_audit, finestra=10, minimo_storico=3
+            )
+        if not df_stat_metriche.empty:
+            str_lit.markdown("### Risultati aggregati")
+            str_lit.dataframe(df_stat_metriche.round(4), use_container_width=True, hide_index=True)
+            str_lit.caption(
+                "MAE/RMSE sono espressi nelle unità della statistica (es. numero di angoli); la classifica usa RMSE pooled corretto. "
+                "Bias positivo = sovrastima; bias negativo = sottostima. "
+                "L'accuratezza del confronto squadre esclude i pareggi reali."
+            )
+            _base_riep = df_stat_metriche[df_stat_metriche["Lato"] != "Confronto squadre"].copy()
+            _base_riep["somma_quadrati_errore"] = _base_riep["Previsioni valutate"] * (_base_riep["RMSE"] ** 2)
+            _base_riep["somma_assoluta_errore"] = _base_riep["Previsioni valutate"] * _base_riep["MAE"]
+            _base_riep["somma_errore"] = _base_riep["Previsioni valutate"] * _base_riep["Bias previsto-reale"]
+            riepilogo = _base_riep.groupby("Statistica", as_index=False).agg(
+                {"Previsioni valutate":"sum", "somma_quadrati_errore":"sum",
+                 "somma_assoluta_errore":"sum", "somma_errore":"sum"})
+            riepilogo["MAE"] = riepilogo["somma_assoluta_errore"] / riepilogo["Previsioni valutate"]
+            riepilogo["RMSE pooled"] = np.sqrt(riepilogo["somma_quadrati_errore"] / riepilogo["Previsioni valutate"])
+            riepilogo["Bias previsto-reale"] = riepilogo["somma_errore"] / riepilogo["Previsioni valutate"]
+            riepilogo.drop(columns=["somma_quadrati_errore","somma_assoluta_errore","somma_errore"],inplace=True)
+            confronto = df_stat_metriche[df_stat_metriche["Lato"] == "Confronto squadre"][
+                ["Statistica", "Accuratezza squadra con valore maggiore (%)",
+                 "Partite senza parità reale", "Parità reale escluse"]
+            ]
+            riepilogo = riepilogo.merge(confronto, on="Statistica", how="left")
+            str_lit.markdown("### Classifica sintetica delle statistiche")
+            str_lit.dataframe(riepilogo.round(4), use_container_width=True, hide_index=True)
+            str_lit.markdown("### Risultati per campionato e stagione")
+            if not df_stat_gruppi.empty:
+                str_lit.dataframe(df_stat_gruppi.round(4), use_container_width=True, hide_index=True)
+                str_lit.download_button(
+                    "⬇️ Scarica metriche per campionato/stagione CSV",
+                    data=df_stat_gruppi.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="V20_1_metriche_per_campionato_stagione.csv",
+                    mime="text/csv",
+                )
+            str_lit.download_button(
+                "⬇️ Scarica metriche V20.1 CSV",
+                data=df_stat_metriche.to_csv(index=False).encode("utf-8-sig"),
+                file_name="V20_1_metriche_walk_forward_statistiche.csv",
+                mime="text/csv",
+            )
+            str_lit.download_button(
+                "⬇️ Scarica dettaglio previsioni V20.1 CSV",
+                data=df_stat_dettaglio.to_csv(index=False).encode("utf-8-sig"),
+                file_name="V20_1_dettaglio_walk_forward_statistiche.csv",
+                mime="text/csv",
+            )
+            with str_lit.expander("Dettaglio previsioni e risultati partita per partita"):
+                str_lit.dataframe(df_stat_dettaglio, use_container_width=True, hide_index=True)
+            # V20.3: ulteriori verifiche solo Audit, senza effetti sul modello operativo.
+            str_lit.markdown("## 🧪 V20.3 — Verifiche rafforzate: soglie e stabilità per data")
+            str_lit.caption("Confronto causale con la media recente della sola squadra nel proprio ruolo. Le soglie sono classificazioni deterministiche basate sul totale previsto, non probabilità di mercato.")
+            df20_pool, df20_base, df20_soglie, df20_tempo, df20_sintesi = crea_audit_statistiche_v203(df_stat_pred)
+            if not df20_pool.empty:
+                str_lit.markdown("### RMSE pooled corretto — tre statistiche principali")
+                str_lit.dataframe(df20_pool.round(4), use_container_width=True, hide_index=True)
+            if not df20_base.empty:
+                str_lit.markdown("### Modello V20.1 contro baseline semplice")
+                str_lit.dataframe(df20_base.round(4), use_container_width=True, hide_index=True)
+                str_lit.caption("Delta negativo favorisce il modello V20.1; delta positivo favorisce la baseline. Il confronto usa soltanto righe appaiate.")
+            if not df20_soglie.empty:
+                str_lit.markdown("### Verifica soglie totali — confronto con baseline maggioritaria")
+                str_lit.dataframe(df20_soglie.round(3), use_container_width=True, hide_index=True)
+                str_lit.caption("Soglie testate: tiri 19,5/21,5/23,5; tiri in porta 7,5/8,5/9,5; angoli 8,5/9,5/10,5. Over significa totale reale strettamente superiore alla soglia.")
+            if not df20_tempo.empty:
+                str_lit.markdown("### Stabilità cronologica in tre blocchi di date distinte")
+                str_lit.dataframe(df20_tempo.round(4), use_container_width=True, hide_index=True)
+            if not df20_sintesi.empty:
+                str_lit.markdown("### Sintesi diagnostica delle statistiche")
+                str_lit.dataframe(df20_sintesi.round(3), use_container_width=True, hide_index=True)
+                str_lit.caption("Classi basate sul miglioramento MAE rispetto alla baseline: Forte ≥5%; Moderato ≥2% e <5%; Debole/da rivedere <2%. Non sono giudizi di valore scommessa.")
+            for _nome,_df,_file in (("metriche pooled","df20_pool","V20_3_metriche_pooled.csv"),("confronto baseline","df20_base","V20_3_confronto_baseline.csv"),("soglie","df20_soglie","V20_3_test_soglie.csv"),("stabilita temporale","df20_tempo","V20_3_stabilita_temporale.csv"),("sintesi diagnostica","df20_sintesi","V20_3_sintesi.csv")):
+                _obj={"df20_pool":df20_pool,"df20_base":df20_base,"df20_soglie":df20_soglie,"df20_tempo":df20_tempo,"df20_sintesi":df20_sintesi}[_df]
+                if not _obj.empty:
+                    str_lit.download_button(f"⬇️ Scarica {_nome} V20.3 CSV",data=_obj.to_csv(index=False).encode("utf-8-sig"),file_name=_file,mime="text/csv")
+            # V20.4: approfondimenti statistici esclusivamente nell'Audit.
+            str_lit.markdown("## 🧪 V20.4 — Campionati, intervalli di confidenza e probabilità esplorative")
+            str_lit.caption("Analisi aggiuntive solo diagnostiche. Bootstrap appaiato per partita; probabilità Over ottenute assumendo una distribuzione Poisson del totale previsto: non sono probabilità calibrate né suggerimenti di scommessa.")
+            df204_gruppi, df204_ci, df204_prob = crea_audit_statistiche_v204(df_stat_pred)
+            if not df204_gruppi.empty:
+                str_lit.markdown("### Prestazioni per campionato e stagione")
+                str_lit.dataframe(df204_gruppi.round(4), use_container_width=True, hide_index=True)
+                str_lit.download_button("⬇️ Scarica V20.4 per campionato/stagione CSV",data=df204_gruppi.to_csv(index=False).encode("utf-8-sig"),file_name="V20_4_per_campionato_stagione.csv",mime="text/csv")
+            if not df204_ci.empty:
+                str_lit.markdown("### Intervalli di confidenza bootstrap 95% — modello contro baseline")
+                str_lit.dataframe(df204_ci.round(5), use_container_width=True, hide_index=True)
+                str_lit.caption("Valore positivo del miglioramento MAE favorisce il modello. Le partite, non i singoli lati casa/trasferta, sono ricampionate come unità appaiata.")
+                str_lit.download_button("⬇️ Scarica V20.4 intervalli bootstrap CSV",data=df204_ci.to_csv(index=False).encode("utf-8-sig"),file_name="V20_4_bootstrap_IC95.csv",mime="text/csv")
+            if not df204_prob.empty:
+                str_lit.markdown("### Test probabilistico esplorativo Over/Under — ipotesi Poisson")
+                str_lit.dataframe(df204_prob.round(5), use_container_width=True, hide_index=True)
+                str_lit.caption("Delta negativi Brier/LogLoss favoriscono il modello. L'ipotesi Poisson è esplorativa: prima di qualsiasi uso operativo servono calibrazione out-of-sample e verifica di valore contro quote reali.")
+                str_lit.download_button("⬇️ Scarica V20.4 probabilità esplorative CSV",data=df204_prob.to_csv(index=False).encode("utf-8-sig"),file_name="V20_4_over_under_probabilita_esplorative.csv",mime="text/csv")
+            # V20.5.1: stessa analisi V20.5, bootstrap temporale ottimizzato; Audit-only.
+            str_lit.markdown("## 🧪 V20.5.1 — Calibrazione Over/Under e robustezza temporale")
+            str_lit.caption("Fasce di affidabilità per campionato/stagione e bootstrap appaiato a blocchi di 7 date distinte. Analisi diagnostica: nessuna probabilità viene attivata nelle schedine.")
+            with str_lit.spinner("Calcolo calibrazione Over/Under e bootstrap temporale V20.5..."):
+                df205_cal, df205_group, df205_block = crea_audit_v205_calibrazione(df_stat_pred)
+            if not df205_cal.empty:
+                str_lit.markdown("### Affidabilità: probabilità previste contro frequenze Over osservate")
+                str_lit.dataframe(df205_cal.round(4), use_container_width=True, hide_index=True)
+                str_lit.caption("Scarto positivo: probabilità media superiore alla frequenza Over osservata; scarto negativo: probabilità media inferiore. Le fasce con N<30 sono indicative e poco stabili.")
+                str_lit.download_button("⬇️ Scarica V20.5 calibrazione per fascia CSV",data=df205_cal.to_csv(index=False).encode("utf-8-sig"),file_name="V20_5_calibrazione_fasce.csv",mime="text/csv")
+            if not df205_group.empty:
+                str_lit.markdown("### Metriche probabilistiche per campionato e stagione")
+                str_lit.dataframe(df205_group.round(5), use_container_width=True, hide_index=True)
+                str_lit.download_button("⬇️ Scarica V20.5 metriche campionato/stagione CSV",data=df205_group.to_csv(index=False).encode("utf-8-sig"),file_name="V20_5_metriche_campionato_stagione.csv",mime="text/csv")
+                # V20.7 — robustezza disaggregata per competizione/stagione.
+                # Deriva esclusivamente dalle metriche Audit già calcolate; nessuna modifica
+                # a previsioni operative, probabilità, ranking o schedine.
+                str_lit.markdown("### 🔎 V20.7 — Robustezza per campionato e stagione")
+                _g207 = df205_group.copy()
+                _need207 = ["Statistica", "Soglia Over", "Competizione", "Stagione", "N",
+                            "Delta Brier", "Delta LogLoss"]
+                if all(c in _g207.columns for c in _need207):
+                    for _c207 in ["N", "Delta Brier", "Delta LogLoss", "Soglia Over"]:
+                        _g207[_c207] = pd.to_numeric(_g207[_c207], errors="coerce")
+                    _g207 = _g207.dropna(subset=["N", "Delta Brier", "Delta LogLoss"])
+                    _g207["Esito Brier"] = np.where(_g207["Delta Brier"] < 0, "PASS", "ATTENZIONE")
+                    _g207["Esito LogLoss"] = np.where(_g207["Delta LogLoss"] < 0, "PASS", "ATTENZIONE")
+                    _g207["Esito entrambe"] = np.where((_g207["Esito Brier"] == "PASS") & (_g207["Esito LogLoss"] == "PASS"), "PASS", "ATTENZIONE")
+                    _g207["Affidabilita campione"] = np.where(_g207["N"] >= 30, "Adeguato (N≥30)", "Limitato (N<30)")
+                    _summary207 = _g207.groupby(["Statistica", "Competizione", "Stagione"], dropna=False).agg(
+                        **{"Soglie valutate": ("Soglia Over", "count"),
+                           "Soglie PASS Brier": ("Esito Brier", lambda x: int((x == "PASS").sum())),
+                           "Soglie PASS LogLoss": ("Esito LogLoss", lambda x: int((x == "PASS").sum())),
+                           "Soglie PASS entrambe": ("Esito entrambe", lambda x: int((x == "PASS").sum())),
+                           "Partite (N)": ("N", "max"),
+                           "Delta Brier medio": ("Delta Brier", "mean"),
+                           "Delta LogLoss medio": ("Delta LogLoss", "mean")}
+                    ).reset_index()
+                    _summary207["Esito gruppo"] = np.where(
+                        (_summary207["Partite (N)"] >= 30) &
+                        (_summary207["Soglie PASS entrambe"] == _summary207["Soglie valutate"]),
+                        "PASS — tutte le soglie", "ATTENZIONE — verificare dettaglio")
+                    _summary207["Affidabilita campione"] = np.where(_summary207["Partite (N)"] >= 30, "Adeguato (N≥30)", "Limitato (N<30)")
+                    str_lit.caption("Per ogni statistica, competizione e stagione: delta negativi favoriscono il modello. PASS di gruppo richiede N≥30 e tutte le soglie disponibili migliori della baseline sia in Brier sia in LogLoss. I gruppi piccoli restano indicativi.")
+                    str_lit.dataframe(_summary207.round(5), use_container_width=True, hide_index=True)
+
+                    # V20.8 — lettura guidata delle criticità. Solo presentazione Audit:
+                    # usa i delta già calcolati da V20.5 e non modifica il modello.
+                    str_lit.markdown("### 🚦 V20.8 — Sintesi delle soglie da verificare")
+                    _both_bad208 = _g207[( _g207["Delta Brier"] > 0) & (_g207["Delta LogLoss"] > 0)].copy()
+                    _one_bad208 = _g207[((_g207["Delta Brier"] > 0) | (_g207["Delta LogLoss"] > 0)) & ~((_g207["Delta Brier"] > 0) & (_g207["Delta LogLoss"] > 0))].copy()
+                    _c1, _c2, _c3 = str_lit.columns(3)
+                    _c1.metric("Soglie valutate", int(len(_g207)))
+                    _c2.metric("Peggiori su entrambe", int(len(_both_bad208)))
+                    _c3.metric("Peggiori su almeno una", int(len(_both_bad208) + len(_one_bad208)))
+                    str_lit.caption("Una soglia è segnalata come criticità doppia solo quando Delta Brier e Delta LogLoss sono entrambi positivi: in quel caso il modello è peggiore della baseline su entrambe le metriche. Un solo delta positivo indica risultato misto, non un fallimento complessivo.")
+                    if not _both_bad208.empty:
+                        str_lit.warning("Attenzione: queste soglie risultano peggiori della baseline sia in Brier sia in LogLoss.")
+                        _both_show208 = ["Statistica", "Competizione", "Stagione", "Soglia Over", "N", "Delta Brier", "Delta LogLoss"]
+                        str_lit.dataframe(_both_bad208[_both_show208].sort_values(["Statistica", "Competizione", "Stagione", "Soglia Over"]).round(5), use_container_width=True, hide_index=True)
+                    else:
+                        str_lit.success("Nessuna soglia risulta peggiore della baseline contemporaneamente su Brier e LogLoss.")
+                    if not _one_bad208.empty:
+                        with str_lit.expander("Mostra risultati misti: una metrica peggiora e l'altra migliora", expanded=False):
+                            _one_show208 = ["Statistica", "Competizione", "Stagione", "Soglia Over", "N", "Delta Brier", "Esito Brier", "Delta LogLoss", "Esito LogLoss"]
+                            str_lit.dataframe(_one_bad208[_one_show208].sort_values(["Statistica", "Competizione", "Stagione", "Soglia Over"]).round(5), use_container_width=True, hide_index=True)
+
+                    # Quadro per statistica e competizione, aggregando le stagioni senza
+                    # nascondere il dettaglio stagionale già mostrato sopra.
+                    _summary_comp208 = _g207.groupby(["Statistica", "Competizione"], dropna=False).agg(
+                        **{"Gruppi stagione": ("Stagione", "nunique"),
+                           "Soglie valutate": ("Soglia Over", "count"),
+                           "Soglie peggiori Brier": ("Esito Brier", lambda x: int((x != "PASS").sum())),
+                           "Soglie peggiori LogLoss": ("Esito LogLoss", lambda x: int((x != "PASS").sum())),
+                           "Soglie peggiori entrambe": ("Esito entrambe", lambda x: int((x != "PASS").sum())),
+                           "N minimo": ("N", "min"),
+                           "Delta Brier medio": ("Delta Brier", "mean"),
+                           "Delta LogLoss medio": ("Delta LogLoss", "mean")}
+                    ).reset_index()
+                    _summary_comp208["Esito competizione"] = np.where(
+                        (_summary_comp208["Soglie peggiori entrambe"] == 0) & (_summary_comp208["N minimo"] >= 30),
+                        "PASS — nessuna criticità doppia", "ATTENZIONE — verificare dettaglio")
+                    str_lit.markdown("#### V20.8 — Riepilogo per statistica e competizione (stagioni aggregate)")
+                    str_lit.dataframe(_summary_comp208.round(5), use_container_width=True, hide_index=True)
+
+                    # V20.9 — persistenza delle criticità tra stagioni. Solo Audit:
+                    # aggrega gli esiti già calcolati; non modifica probabilità o modello operativo.
+                    str_lit.markdown("### 🧭 V20.9 — Persistenza delle criticità tra stagioni")
+                    _persist_src209 = _g207.copy()
+                    _persist_src209["_stagione_num209"] = pd.to_numeric(
+                        _persist_src209["Stagione"].astype(str).str.extract(r"(\d+)", expand=False), errors="coerce"
+                    )
+                    _last_season209 = _persist_src209["_stagione_num209"].max()
+                    _persist_src209["_bad_brier209"] = _persist_src209["Delta Brier"] > 0
+                    _persist_src209["_bad_ll209"] = _persist_src209["Delta LogLoss"] > 0
+                    _persist_src209["_bad_both209"] = _persist_src209["_bad_brier209"] & _persist_src209["_bad_ll209"]
+                    _persist_src209["_bad_any209"] = _persist_src209["_bad_brier209"] | _persist_src209["_bad_ll209"]
+                    _persist_src209["_ultima_stagione209"] = _persist_src209["_stagione_num209"] == _last_season209
+                    _persist_rows209 = []
+                    _keys209 = ["Statistica", "Competizione", "Soglia Over"]
+                    for _key209, _grp209 in _persist_src209.groupby(_keys209, dropna=False):
+                        _latest209 = _grp209[_grp209["_ultima_stagione209"]]
+                        _both_n209 = int(_grp209["_bad_both209"].sum())
+                        _any_n209 = int(_grp209["_bad_any209"].sum())
+                        _persist_rows209.append({
+                            "Statistica": _key209[0], "Competizione": _key209[1], "Soglia Over": _key209[2],
+                            "Stagioni valutate": int(_grp209["Stagione"].nunique()),
+                            "Stagioni peggiori Brier": int(_grp209["_bad_brier209"].sum()),
+                            "Stagioni peggiori LogLoss": int(_grp209["_bad_ll209"].sum()),
+                            "Stagioni peggiori entrambe": _both_n209,
+                            "Stagioni peggiori almeno una": _any_n209,
+                            "Ultima stagione": str(_latest209["Stagione"].iloc[0]) if not _latest209.empty else "-",
+                            "Ultima stagione Brier peggiore": bool(_latest209["_bad_brier209"].any()),
+                            "Ultima stagione LogLoss peggiore": bool(_latest209["_bad_ll209"].any()),
+                            "Ultima stagione entrambe peggiori": bool(_latest209["_bad_both209"].any()),
+                            "Delta Brier medio": float(_grp209["Delta Brier"].mean()),
+                            "Delta LogLoss medio": float(_grp209["Delta LogLoss"].mean()),
+                            "Esito persistenza": ("CRITICITÀ RICORRENTE" if _both_n209 >= 2 else
+                                                  "CRITICITÀ ISOLATA" if _both_n209 == 1 else
+                                                  "NESSUNA CRITICITÀ DOPPIA")
+                        })
+                    _persist209 = pd.DataFrame(_persist_rows209)
+                    _persist209["Fascia persistenza"] = np.select(
+                        [_persist209["Stagioni peggiori entrambe"] >= 3,
+                         _persist209["Stagioni peggiori entrambe"] == 2,
+                         _persist209["Stagioni peggiori entrambe"] == 1],
+                        ["3 stagioni", "2 stagioni", "1 stagione"], default="0 stagioni"
+                    )
+                    _persist209 = _persist209.sort_values(
+                        ["Stagioni peggiori entrambe", "Ultima stagione entrambe peggiori", "Statistica", "Competizione"],
+                        ascending=[False, False, True, True]
+                    )
+                    str_lit.caption("Una stagione è considerata critica su entrambe le metriche solo se Delta Brier e Delta LogLoss sono entrambi > 0. Delta negativi favoriscono il modello. La persistenza è descrittiva: con tre stagioni non dimostra da sola un difetto strutturale.")
+                    str_lit.markdown("#### Persistenza per singola soglia attraverso le stagioni")
+                    str_lit.dataframe(_persist209.round(5), use_container_width=True, hide_index=True)
+
+                    _persist_comp209 = _persist209.groupby(["Statistica", "Competizione"], dropna=False).agg(
+                        **{"Soglie valutate": ("Soglia Over", "count"),
+                           "Soglie critiche in 1 stagione": ("Stagioni peggiori entrambe", lambda x: int((x == 1).sum())),
+                           "Soglie critiche in 2 stagioni": ("Stagioni peggiori entrambe", lambda x: int((x == 2).sum())),
+                           "Soglie critiche in 3 stagioni": ("Stagioni peggiori entrambe", lambda x: int((x >= 3).sum())),
+                           "Critiche anche ultima stagione": ("Ultima stagione entrambe peggiori", "sum"),
+                           "Delta Brier medio": ("Delta Brier medio", "mean"),
+                           "Delta LogLoss medio": ("Delta LogLoss medio", "mean")}
+                    ).reset_index()
+                    str_lit.markdown("#### V20.9 — Riepilogo persistenza per statistica e campionato")
+                    str_lit.dataframe(_persist_comp209.round(5), use_container_width=True, hide_index=True)
+                    _latest_flags209 = _persist209[_persist209["Ultima stagione Brier peggiore"] | _persist209["Ultima stagione LogLoss peggiore"]]
+                    if not _latest_flags209.empty:
+                        str_lit.warning(f"Ultima stagione: {len(_latest_flags209)} combinazioni statistica/campionato/soglia hanno almeno una metrica peggiore della baseline. Le criticità doppie persistenti sono evidenziate separatamente nella tabella.")
+                        str_lit.dataframe(_latest_flags209[["Statistica", "Competizione", "Soglia Over", "Stagioni peggiori entrambe", "Ultima stagione", "Ultima stagione Brier peggiore", "Ultima stagione LogLoss peggiore", "Esito persistenza"]].round(5), use_container_width=True, hide_index=True)
+                    else:
+                        str_lit.success("Nessuna soglia peggiora la baseline nell'ultima stagione disponibile.")
+                    str_lit.download_button("⬇️ Scarica V20.9 persistenza per soglia CSV", data=_persist209.to_csv(index=False).encode("utf-8-sig"), file_name="V20_9_persistenza_soglie_stagioni.csv", mime="text/csv")
+                    str_lit.download_button("⬇️ Scarica V20.9 riepilogo campionati CSV", data=_persist_comp209.to_csv(index=False).encode("utf-8-sig"), file_name="V20_9_riepilogo_persistenza_campionati.csv", mime="text/csv")
+
+                    str_lit.download_button("⬇️ Scarica V20.8 criticità doppie CSV", data=_both_bad208.to_csv(index=False).encode("utf-8-sig"), file_name="V20_8_criticita_doppie.csv", mime="text/csv")
+                    str_lit.download_button("⬇️ Scarica V20.8 riepilogo competizioni CSV", data=_summary_comp208.to_csv(index=False).encode("utf-8-sig"), file_name="V20_8_riepilogo_statistica_competizione.csv", mime="text/csv")
+
+                    str_lit.markdown("#### Dettaglio per singola soglia e gruppo")
+                    _show207 = ["Statistica", "Competizione", "Stagione", "Soglia Over", "N", "Delta Brier", "Esito Brier", "Delta LogLoss", "Esito LogLoss", "Affidabilita campione"]
+                    str_lit.dataframe(_g207[_show207].round(5), use_container_width=True, hide_index=True)
+                    str_lit.download_button("⬇️ Scarica V20.7 robustezza per campionato/stagione CSV", data=_summary207.to_csv(index=False).encode("utf-8-sig"), file_name="V20_7_robustezza_campionato_stagione.csv", mime="text/csv")
+                    str_lit.download_button("⬇️ Scarica V20.7 dettaglio per soglia CSV", data=_g207.to_csv(index=False).encode("utf-8-sig"), file_name="V20_7_dettaglio_soglie_campionato_stagione.csv", mime="text/csv")
+                else:
+                    str_lit.warning("V20.7 non disponibile: mancano colonne nelle metriche per campionato/stagione.")
+            if not df205_block.empty:
+                str_lit.markdown("### Bootstrap temporale a blocchi di 7 date")
+                str_lit.dataframe(df205_block.round(5), use_container_width=True, hide_index=True)
+                str_lit.caption("Delta negativi favoriscono il modello. I blocchi contengono tutte le partite delle date selezionate; IC che attraversa zero indicano evidenza non conclusiva. Il bootstrap a blocchi riduce, ma non elimina, il rischio di dipendenze temporali.")
+                str_lit.download_button("⬇️ Scarica V20.5 bootstrap temporale CSV",data=df205_block.to_csv(index=False).encode("utf-8-sig"),file_name="V20_5_bootstrap_blocchi_date.csv",mime="text/csv")
+                # V20.6: sintesi leggibile dei risultati bootstrap. Solo Audit: nessun dato
+                # o calcolo operativo viene modificato; la sintesi usa esclusivamente df205_block.
+                str_lit.markdown("### 🧭 V20.6 — Sintesi complessiva della robustezza temporale")
+                _b = df205_block.copy()
+                _required_b = ["Statistica", "Soglia Over", "N partite", "N blocchi date",
+                               "IC95 Delta Brier sup", "IC95 Delta LogLoss sup",
+                               "Bootstrap Brier modello migliore (%)", "Bootstrap LogLoss modello migliore (%)"]
+                if all(c in _b.columns for c in _required_b):
+                    _b["Esito Brier"] = np.where(pd.to_numeric(_b["IC95 Delta Brier sup"], errors="coerce") < 0, "PASS", "ATTENZIONE")
+                    _b["Esito LogLoss"] = np.where(pd.to_numeric(_b["IC95 Delta LogLoss sup"], errors="coerce") < 0, "PASS", "ATTENZIONE")
+                    _b["Esito complessivo"] = np.where((_b["Esito Brier"] == "PASS") & (_b["Esito LogLoss"] == "PASS"), "PASS — entrambe le metriche", "ATTENZIONE — evidenza non conclusiva")
+                    _b["Soglia Over"] = pd.to_numeric(_b["Soglia Over"], errors="coerce")
+                    _summary = _b.groupby("Statistica", dropna=False).agg(
+                        **{"Soglie valutate": ("Soglia Over", "count"),
+                           "Soglie PASS Brier": ("Esito Brier", lambda x: int((x == "PASS").sum())),
+                           "Soglie PASS LogLoss": ("Esito LogLoss", lambda x: int((x == "PASS").sum())),
+                           "Partite (N)": ("N partite", "min"),
+                           "Blocchi date": ("N blocchi date", "min"),
+                           "Bootstrap Brier favorevole medio (%)": ("Bootstrap Brier modello migliore (%)", "mean"),
+                           "Bootstrap LogLoss favorevole medio (%)": ("Bootstrap LogLoss modello migliore (%)", "mean")}
+                    ).reset_index()
+                    _n_pass = int(((_b["Esito Brier"] == "PASS") & (_b["Esito LogLoss"] == "PASS")).sum())
+                    _c1, _c2, _c3 = str_lit.columns(3)
+                    _c1.metric("Soglie con entrambe le metriche PASS", f"{_n_pass}/{len(_b)}")
+                    _c2.metric("Soglie testate", f"{len(_b)}")
+                    _c3.metric("Blocchi temporali per soglia", str(int(pd.to_numeric(_b["N blocchi date"], errors="coerce").min())) if not _b.empty else "—")
+                    str_lit.dataframe(_summary.round(2), use_container_width=True, hide_index=True)
+                    str_lit.markdown("#### Esito per singola soglia")
+                    _cols_show = ["Statistica", "Soglia Over", "N partite", "N blocchi date", "IC95 Delta Brier sup", "Esito Brier", "IC95 Delta LogLoss sup", "Esito LogLoss", "Bootstrap Brier modello migliore (%)", "Bootstrap LogLoss modello migliore (%)", "Esito complessivo"]
+                    str_lit.dataframe(_b[_cols_show].round(4), use_container_width=True, hide_index=True)
+                    str_lit.caption("PASS significa che il limite superiore dell'IC95% del delta modello−baseline è inferiore a zero: evidenza bootstrap a favore del modello per quella metrica. ATTENZIONE significa che il risultato non supera questo criterio. È una sintesi diagnostica, non una garanzia di rendimento né un'autorizzazione all'uso nelle schedine.")
+                    str_lit.download_button("⬇️ Scarica sintesi V20.6 bootstrap CSV", data=_b.to_csv(index=False).encode("utf-8-sig"), file_name="V20_6_sintesi_robustezza_temporale.csv", mime="text/csv")
+                else:
+                    str_lit.warning("Sintesi V20.6 non disponibile: mancano alcune colonne del bootstrap temporale.")
+        else:
+            str_lit.warning(
+                "Non ci sono ancora abbastanza osservazioni precedenti per valutare le statistiche. "
+                "Servono almeno 3 partite storiche per squadra e ruolo."
+            )
+    else:
+        str_lit.warning("Test V20.1 non eseguito: storico gratuito non disponibile.")
+
+    if matches_audit:
+        df_audit = crea_audit_walk_forward(matches_audit)
+    else:
+        # Fallback trasparente alla fonte già usata dalla V13, senza cambiare il modello.
+        df_audit = crea_audit_walk_forward(matches_raw)
+        str_lit.warning("Fonte storica gratuita non raggiungibile: mostrato il campione API della V13, se disponibile.")
+    if df_audit.empty:
+        str_lit.warning(
+            "Non ci sono ancora abbastanza partite concluse per un audit walk-forward. "
+            "Servono almeno 30 risultati precedenti nella competizione prima di valutare una partita."
+        )
+    else:
+        # V21.0 — verifica economica separata: solo Audit, nessuna modifica al modello operativo.
+        str_lit.markdown("## 💶 V21.0 — Verifica economica walk-forward su quote storiche reali")
+        str_lit.caption("Le probabilità provengono dall'audit walk-forward, calcolato usando soltanto partite precedenti. Stake fisso: 1 unità per selezione. Le quote mancanti non vengono ricostruite.")
+        with str_lit.spinner("Calcolo margine bookmaker, valore atteso e ROI storico..."):
+            df210_roi, df210_picks, df210_cov = crea_audit_economico_v210(df_audit)
+        if not df210_cov.empty:
+            str_lit.markdown("### Copertura delle quote storiche realmente disponibili")
+            str_lit.dataframe(df210_cov, use_container_width=True, hide_index=True)
+        if not df210_roi.empty:
+            str_lit.markdown("### Risultati economici per mercato, fonte quote e soglia EV")
+            str_lit.dataframe(df210_roi.round(4), use_container_width=True, hide_index=True)
+            str_lit.caption("EV = probabilità walk-forward × quota − 1. ROI = profitto netto / stake totale. Le soglie EV 0%, 2% e 5% sono filtri diagnostici, non raccomandazioni di puntata. I risultati sono storici e non garantiscono rendimenti futuri.")
+            str_lit.download_button("⬇️ Scarica riepilogo ROI V21.0 CSV", df210_roi.to_csv(index=False).encode("utf-8-sig"), "V21_0_riepilogo_ROI_walk_forward.csv", "text/csv")
+            str_lit.download_button("⬇️ Scarica dettaglio selezioni V21.0 CSV", df210_picks.to_csv(index=False).encode("utf-8-sig"), "V21_0_dettaglio_scommesse_walk_forward.csv", "text/csv")
+        else:
+            str_lit.warning("Non ci sono ancora selezioni con EV positivo alle soglie testate. Controlla la copertura quote e il campione disponibile.")
+        str_lit.info("Limite della fonte gratuita: football-data.co.uk offre quote storiche per 1X2 e Over/Under gol in alcune colonne/bookmaker. Non fornisce qui quote storiche affidabili per angoli, tiri o tiri in porta: per questi mercati il ROI non viene calcolato. Nessuna quota sintetica viene utilizzata.")
+
+        # V21.1 — verifica della calibrazione delle probabilita' usate nell'EV; solo Audit.
+        str_lit.markdown("### 🧪 V21.2 — Calibrazione per fascia, fonte e competizione (solo diagnostica)")
+        str_lit.caption("Le probabilita' V21.0 sono Poisson RAW in walk-forward: 'WF' indica la sequenza temporale, NON una calibrazione Platt. Qui confrontiamo probabilita' della selezione e frequenza di vittoria reale; nessun valore viene corretto o usato nel modello operativo.")
+        with str_lit.spinner("Verifica coerenza EV, vincite e calibrazione delle selezioni..."):
+            df211_check, df211_comp, df212_bins_source, df212_bins_comp_source = crea_diagnostica_calibrazione_v210(df210_picks)
+        if not df211_check.empty:
+            str_lit.markdown("#### Integrita' dei calcoli economici")
+            str_lit.dataframe(df211_check, use_container_width=True, hide_index=True)
+        if not df211_comp.empty:
+            str_lit.markdown("#### Probabilita' prevista contro vittorie reali — soglia EV 0%, per competizione")
+            str_lit.dataframe(df211_comp.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica calibrazione per competizione V21.1 CSV", df211_comp.to_csv(index=False).encode("utf-8-sig"), "V21_1_calibrazione_per_competizione.csv", "text/csv")
+        if not df212_bins_source.empty:
+            str_lit.markdown("#### Calibrazione per fasce — separata per fonte quote (EV 0%)")
+            str_lit.caption("Avg e B365 sono calcolate separatamente. Brier, LogLoss e ROI si riferiscono alle sole selezioni del gruppo; N<30 e' indicato come campione limitato.")
+            str_lit.dataframe(df212_bins_source.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica fasce per fonte V21.2 CSV", df212_bins_source.to_csv(index=False).encode("utf-8-sig"), "V21_2_calibrazione_fasce_per_fonte.csv", "text/csv")
+        if not df212_bins_comp_source.empty:
+            str_lit.markdown("#### Calibrazione per fasce — competizione e fonte quote (EV 0%)")
+            str_lit.dataframe(df212_bins_comp_source.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica fasce per competizione e fonte V21.2 CSV", df212_bins_comp_source.to_csv(index=False).encode("utf-8-sig"), "V21_2_calibrazione_fasce_competizione_fonte.csv", "text/csv")
+        str_lit.warning("Le soglie EV 0%, 2% e 5% sono campioni annidati: una stessa partita puo' comparire in piu' soglie, ma non piu' di una volta nella stessa combinazione partita/mercato/fonte/soglia. Non sommare le righe tra soglie.")
+
+        # V21.3 — diagnosi non condizionata e confronto con baseline bookmaker.
+        str_lit.markdown("### 🔬 V21.3 — Diagnosi della sovrastima e confronto con baseline bookmaker")
+        str_lit.caption("V21.2 osservava soltanto la selezione con EV massimo e positivo: è quindi un campione condizionato dalla regola di selezione. V21.3 valuta tutti gli esiti su tutte le partite con quote complete, confrontando Poisson WF con probabilità bookmaker normalizzate (de-vig), sulle stesse partite. Solo Audit: nessuna correzione operativa.")
+        with str_lit.spinner("Confronto Poisson WF e baseline bookmaker su tutti gli esiti..."):
+            df213_summary, df213_selection, df213_bins, df213_checks = crea_diagnostica_v213(df_audit)
+        if not df213_checks.empty:
+            str_lit.markdown("#### Controlli di coerenza V21.3")
+            str_lit.dataframe(df213_checks, use_container_width=True, hide_index=True)
+        if not df213_summary.empty:
+            str_lit.markdown("#### Modello Poisson WF contro bookmaker de-vig — tutte le partite con quote complete")
+            str_lit.caption("Delta negativo favorisce il modello; delta positivo favorisce il bookmaker. Brier e LogLoss sono calcolati sull'intero vettore degli esiti, non soltanto sulla selezione EV+. Il de-vig normalizza le probabilità implicite delle quote rimuovendo proporzionalmente l'overround.")
+            str_lit.dataframe(df213_summary.round(5), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica confronto V21.3 modello vs bookmaker CSV", df213_summary.to_csv(index=False).encode("utf-8-sig"), "V21_3_confronto_modello_bookmaker.csv", "text/csv")
+        if not df213_selection.empty:
+            str_lit.markdown("#### Distribuzione delle selezioni EV positive per esito")
+            str_lit.caption("Questa tabella descrive le selezioni generate dalla regola EV massimo > 0. È una diagnostica condizionata, distinta dal confronto completo precedente.")
+            str_lit.dataframe(df213_selection.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica distribuzione selezioni V21.3 CSV", df213_selection.to_csv(index=False).encode("utf-8-sig"), "V21_3_distribuzione_selezioni.csv", "text/csv")
+        if not df213_bins.empty:
+            str_lit.markdown("#### Calibrazione per fascia su tutti gli esiti")
+            str_lit.dataframe(df213_bins.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica calibrazione completa V21.3 CSV", df213_bins.to_csv(index=False).encode("utf-8-sig"), "V21_3_calibrazione_tutti_esiti.csv", "text/csv")
+        str_lit.info("Nota metodologica: il confronto bookmaker usa probabilità implicite normalizzate sulle quote Avg/B365 realmente disponibili. Non equivale a una baseline storica indipendente; è un confronto con il mercato. Le partite senza quote complete sono escluse da entrambi i lati del confronto.")
+
+
+        # V21.5 — stabilita' temporale della calibrazione; solo Audit.
+        str_lit.markdown("### 🧭 V21.5 — Stabilità temporale della calibrazione (solo Audit)")
+        str_lit.caption("Valuta una sola volta ogni partita, senza duplicarla per Avg/B365. Raggruppa per competizione e stagione calcistica (luglio-giugno) e usa bootstrap a blocchi di 7 giorni per gli intervalli di confidenza dello scarto previsto-reale. Nessuna correzione operativa.")
+        with str_lit.spinner("Verifica stabilità temporale per stagione e competizione..."):
+            df215_metriche, df215_cal, df215_persist, df215_checks = crea_audit_stabilita_v215(df_audit)
+        if not df215_checks.empty:
+            str_lit.markdown("#### Controlli V21.5")
+            str_lit.dataframe(df215_checks, use_container_width=True, hide_index=True)
+        if not df215_metriche.empty:
+            str_lit.markdown("#### Qualità probabilistica per competizione e stagione")
+            str_lit.caption("Brier e LogLoss sono calcolati sul vettore completo degli esiti; valori più bassi sono migliori. Le righe non sono selezioni EV.")
+            str_lit.dataframe(df215_metriche.round(5), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica metriche V21.5 per stagione CSV", df215_metriche.to_csv(index=False).encode("utf-8-sig"), "V21_5_metriche_stagione.csv", "text/csv")
+        if not df215_cal.empty:
+            str_lit.markdown("#### Calibrazione per esito e stagione con IC95% bootstrap temporale")
+            str_lit.caption("Scarto positivo = sovrastima; negativo = sottostima. Se l'intervallo IC95% include zero, lo scarto non è distinguibile da zero al livello indicativo del 5%. Il bootstrap ricampiona blocchi di 7 giorni, non singole partite.")
+            str_lit.dataframe(df215_cal.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica calibrazione e IC95% V21.5 CSV", df215_cal.to_csv(index=False).encode("utf-8-sig"), "V21_5_calibrazione_ic95_blocchi.csv", "text/csv")
+        if not df215_persist.empty:
+            str_lit.markdown("#### Persistenza degli scarti tra stagioni")
+            str_lit.caption("Conta in quante stagioni lo scarto mantiene un intervallo interamente sopra o sotto zero. È una sintesi descrittiva, non una regola di correzione.")
+            str_lit.dataframe(df215_persist.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica persistenza V21.5 CSV", df215_persist.to_csv(index=False).encode("utf-8-sig"), "V21_5_persistenza_stagioni.csv", "text/csv")
+        else:
+            str_lit.warning("V21.5 non ha prodotto gruppi sufficienti: verificare date, colonne e numerosità per stagione.")
+
+
+        # V21.6 — scomposizione per singolo esito del divario rispetto al bookmaker.
+        str_lit.markdown("### 🔬 V21.6 — Quali esiti generano il divario? (solo Audit)")
+        str_lit.caption("Scompone Brier e LogLoss nei contributi dei singoli esiti (1/X/2 e Over/Under), confrontando Poisson con bookmaker de-vig sulle stesse partite. Bootstrap a blocchi di 7 giorni per competizione e stagione. Avg e B365 restano separate.")
+        with str_lit.spinner("Scomposizione del divario per esito e bootstrap temporale..."):
+            df216_dettaglio, df216_sintesi, df216_checks = crea_diagnostica_v216(df_audit)
+        if not df216_checks.empty:
+            str_lit.markdown("#### Controlli V21.6")
+            str_lit.dataframe(df216_checks, use_container_width=True, hide_index=True)
+        if not df216_sintesi.empty:
+            str_lit.markdown("#### Sintesi: esiti che pesano maggiormente sul divario")
+            str_lit.caption("Delta positivo = contributo d'errore maggiore per il modello; negativo = contributo minore. Gli IC sono calcolati separatamente per competizione e stagione.")
+            str_lit.dataframe(df216_sintesi.round(5), use_container_width=True, hide_index=True)
+            str_lit.download_button("⬇️ Scarica sintesi V21.6 CSV", df216_sintesi.to_csv(index=False).encode("utf-8-sig"), "V21_6_sintesi_esiti.csv", "text/csv")
+        if not df216_dettaglio.empty:
+            with str_lit.expander("Dettaglio V21.6 per competizione e stagione", expanded=False):
+                str_lit.dataframe(df216_dettaglio.round(5), use_container_width=True, hide_index=True)
+                str_lit.download_button("⬇️ Scarica dettaglio V21.6 CSV", df216_dettaglio.to_csv(index=False).encode("utf-8-sig"), "V21_6_dettaglio_esiti_blocchi.csv", "text/csv")
+
+        # V15: pacchetto diagnostico aggiuntivo; nessuna modifica alle previsioni operative.
+        str_lit.markdown("#### 🧪 V18 — Riconciliazione conteggi e stabilità temporale (solo diagnostica)")
+        str_lit.caption(
+            "Mantiene le verifiche V16–V17 e aggiunge una riconciliazione esplicita dei conteggi effettivamente confrontati RAW/WF, "
+            "più metriche No Goal per semestre. Solo diagnostica: le previsioni operative restano invariate."
+        )
+        with str_lit.spinner("Esecuzione test walk-forward V17; può richiedere qualche secondo..."):
+            df_v15_test, df_v15_metriche, df_v15_comp = crea_test_v15_walk_forward(df_audit)
+
+        # V19.7.1: riepilogo RAW vs WF No Goal immediatamente visibile nell'Audit.
+        # Diagnostica soltanto: non modifica fit, lambda, probabilità operative o ranking.
+        str_lit.markdown("### 🎯 Confronto statistico No Goal: RAW vs Walk-Forward")
+        str_lit.caption(
+            "Il confronto usa esclusivamente le stesse partite con probabilità RAW, probabilità WF ed esito reale disponibili. "
+            "Brier Score e Log Loss più bassi indicano una qualità probabilistica migliore. "
+            "Delta = WF − RAW: un valore negativo favorisce WF."
+        )
+        df_ng_raw_wf_top = df_v15_test.copy()
+        colonne_ng_top = ["P(NG) raw", "P(NG) calibrata WF", "NG y"]
+        if all(c in df_ng_raw_wf_top.columns for c in colonne_ng_top):
+            for c in colonne_ng_top:
+                df_ng_raw_wf_top[c] = pd.to_numeric(df_ng_raw_wf_top[c], errors="coerce")
+            mask_ng_top = df_ng_raw_wf_top[colonne_ng_top].notna().all(axis=1)
+            # Esclude esplicitamente righe senza etichetta reale, evitando che un eventuale NaN
+            # trasformato in zero nella colonna diagnostica NG y venga contato come esito.
+            if "No Goal reale" in df_ng_raw_wf_top.columns:
+                mask_ng_top &= pd.to_numeric(df_ng_raw_wf_top["No Goal reale"], errors="coerce").notna()
+            if "Gol casa reali" in df_ng_raw_wf_top.columns and "Gol trasferta reali" in df_ng_raw_wf_top.columns:
+                mask_ng_top &= pd.to_numeric(df_ng_raw_wf_top["Gol casa reali"], errors="coerce").notna()
+                mask_ng_top &= pd.to_numeric(df_ng_raw_wf_top["Gol trasferta reali"], errors="coerce").notna()
+            for c in colonne_ng_top:
+                mask_ng_top &= np.isfinite(df_ng_raw_wf_top[c].to_numpy(dtype=float))
+            z_ng_top = df_ng_raw_wf_top.loc[mask_ng_top].copy()
+            if not z_ng_top.empty:
+                y_ng_top = z_ng_top["NG y"].to_numpy(dtype=float)
+                p_raw_top = z_ng_top["P(NG) raw"].to_numpy(dtype=float)
+                p_wf_top = z_ng_top["P(NG) calibrata WF"].to_numpy(dtype=float)
+                brier_raw_top, logloss_raw_top = _calcola_metriche_binaria(p_raw_top, y_ng_top)
+                brier_wf_top, logloss_wf_top = _calcola_metriche_binaria(p_wf_top, y_ng_top)
+                delta_brier_top = brier_wf_top - brier_raw_top
+                delta_logloss_top = logloss_wf_top - logloss_raw_top
+
+                reale_top = 100.0 * float(np.mean(y_ng_top))
+                raw_media_top = 100.0 * float(np.mean(p_raw_top))
+                wf_media_top = 100.0 * float(np.mean(p_wf_top))
+                m1, m2, m3, m4 = str_lit.columns(4)
+                m1.metric("Partite appaiate", f"{len(z_ng_top):,}".replace(",", "."))
+                m2.metric("No Goal reale", f"{reale_top:.2f}%")
+                m3.metric("P(NG) RAW media", f"{raw_media_top:.2f}%")
+                m4.metric("P(NG) WF media", f"{wf_media_top:.2f}%")
+
+                m5, m6, m7, m8 = str_lit.columns(4)
+                m5.metric("Brier RAW", f"{brier_raw_top:.6f}")
+                m6.metric("Brier WF", f"{brier_wf_top:.6f}", f"{delta_brier_top:+.6f}", delta_color="inverse")
+                m7.metric("Log Loss RAW", f"{logloss_raw_top:.6f}")
+                m8.metric("Log Loss WF", f"{logloss_wf_top:.6f}", f"{delta_logloss_top:+.6f}", delta_color="inverse")
+
+                if delta_brier_top < -1e-12 and delta_logloss_top < -1e-12:
+                    str_lit.success("Esito: WF migliora sia Brier Score sia Log Loss sul campione appaiato.")
+                    esito_ng_top = "WF migliore su entrambe"
+                elif delta_brier_top > 1e-12 and delta_logloss_top > 1e-12:
+                    str_lit.warning("Esito: WF peggiora sia Brier Score sia Log Loss sul campione appaiato.")
+                    esito_ng_top = "RAW migliore su entrambe"
+                else:
+                    str_lit.info("Esito: risultato misto o sostanzialmente pari; leggere entrambe le metriche prima di giudicare la calibrazione.")
+                    esito_ng_top = "Misto / sostanzialmente pari"
+
+                df_ng_raw_wf_riepilogo = pd.DataFrame([{
+                    "Partite appaiate": int(len(z_ng_top)),
+                    "No Goal reale (%)": reale_top,
+                    "P(NG) RAW media (%)": raw_media_top,
+                    "P(NG) WF media (%)": wf_media_top,
+                    "Brier RAW": brier_raw_top,
+                    "Brier WF": brier_wf_top,
+                    "Delta Brier WF - RAW": delta_brier_top,
+                    "Log Loss RAW": logloss_raw_top,
+                    "Log Loss WF": logloss_wf_top,
+                    "Delta Log Loss WF - RAW": delta_logloss_top,
+                    "Esito confronto": esito_ng_top,
+                }])
+                str_lit.dataframe(df_ng_raw_wf_riepilogo.round(6), use_container_width=True, hide_index=True)
+                str_lit.download_button(
+                    "📥 Scarica riepilogo No Goal RAW vs WF",
+                    df_ng_raw_wf_riepilogo.to_csv(index=False).encode("utf-8-sig"),
+                    "v19_7_1_riepilogo_nogoal_raw_vs_wf.csv",
+                    "text/csv",
+                    key="download_v1971_nogoal_raw_wf_summary",
+                )
+            else:
+                str_lit.warning("Confronto No Goal RAW vs WF non calcolabile: non ci sono righe appaiate con esito reale valido.")
+        else:
+            str_lit.warning("Confronto No Goal RAW vs WF non disponibile: mancano una o più colonne necessarie.")
+
+        # V19.7.2: riconciliazione esclusioni RAW/WF. Solo diagnostica; non modifica il modello.
+        str_lit.markdown("### 🔎 V19.7.2 — Riconciliazione completa delle esclusioni No Goal")
+        str_lit.caption(
+            "Ogni riga dell'Audit viene assegnata a una sola categoria di esclusione oppure al campione appaiato. "
+            "Il training insufficiente indica meno di 100 partite precedenti della stessa competizione; "
+            "fit non valido/altro indica che il WF manca nonostante training almeno pari a 100. "
+            "Questa sezione è esclusivamente diagnostica."
+        )
+        if not df_v15_test.empty:
+            df_ric_ng = df_v15_test.copy()
+            # Valori numerici robusti e controllo dell'esito reale senza affidarsi a NG y,
+            # che viene inizializzata a zero anche quando l'etichetta sorgente è mancante.
+            if "P(NG) raw" not in df_ric_ng.columns:
+                df_ric_ng["P(NG) raw"] = np.nan
+            if "P(NG) calibrata WF" not in df_ric_ng.columns:
+                df_ric_ng["P(NG) calibrata WF"] = np.nan
+            if "Training usato V15" not in df_ric_ng.columns:
+                df_ric_ng["Training usato V15"] = 0
+            df_ric_ng["P(NG) raw"] = pd.to_numeric(df_ric_ng["P(NG) raw"], errors="coerce")
+            df_ric_ng["P(NG) calibrata WF"] = pd.to_numeric(df_ric_ng["P(NG) calibrata WF"], errors="coerce")
+            df_ric_ng["Training usato V15"] = pd.to_numeric(df_ric_ng["Training usato V15"], errors="coerce").fillna(0)
+            df_ric_ng["NG y"] = pd.to_numeric(df_ric_ng.get("NG y", pd.Series(np.nan, index=df_ric_ng.index)), errors="coerce")
+
+            esito_valido = df_ric_ng["No Goal reale"].notna() if "No Goal reale" in df_ric_ng.columns else df_ric_ng["NG y"].notna()
+            if "Gol casa reali" in df_ric_ng.columns:
+                esito_valido &= pd.to_numeric(df_ric_ng["Gol casa reali"], errors="coerce").notna()
+            if "Gol trasferta reali" in df_ric_ng.columns:
+                esito_valido &= pd.to_numeric(df_ric_ng["Gol trasferta reali"], errors="coerce").notna()
+            raw_valida = np.isfinite(df_ric_ng["P(NG) raw"].to_numpy(dtype=float))
+            wf_valida = np.isfinite(df_ric_ng["P(NG) calibrata WF"].to_numpy(dtype=float))
+            training_insuff = df_ric_ng["Training usato V15"].to_numpy(dtype=float) < 100
+
+            # Categorie esclusive, ordinate per evitare doppi conteggi.
+            df_ric_ng["_esito_non_valido"] = ~np.asarray(esito_valido, dtype=bool)
+            df_ric_ng["_raw_non_valida"] = np.asarray(esito_valido, dtype=bool) & ~raw_valida
+            df_ric_ng["_wf_training_insuff"] = np.asarray(esito_valido, dtype=bool) & raw_valida & ~wf_valida & training_insuff
+            df_ric_ng["_wf_fit_non_valido"] = np.asarray(esito_valido, dtype=bool) & raw_valida & ~wf_valida & ~training_insuff
+            df_ric_ng["_appaiata"] = np.asarray(esito_valido, dtype=bool) & raw_valida & wf_valida
+
+            def _riga_ric_ng(gruppo, nome):
+                n = int(len(gruppo))
+                app = int(gruppo["_appaiata"].sum())
+                esclusioni = int(gruppo["_esito_non_valido"].sum() + gruppo["_raw_non_valida"].sum() + gruppo["_wf_training_insuff"].sum() + gruppo["_wf_fit_non_valido"].sum())
+                return {
+                    "Competizione": nome,
+                    "Partite controllate": n,
+                    "Partite appaiate RAW/WF": app,
+                    "Esito reale mancante/non valido": int(gruppo["_esito_non_valido"].sum()),
+                    "P(NG) RAW mancante/non valida": int(gruppo["_raw_non_valida"].sum()),
+                    "WF assente: training <100": int(gruppo["_wf_training_insuff"].sum()),
+                    "WF assente: fit non valido/altro": int(gruppo["_wf_fit_non_valido"].sum()),
+                    "Escluse totali": esclusioni,
+                    "Controllo somma": "PASS" if app + esclusioni == n else f"VERIFICARE ({app + esclusioni}/{n})",
+                }
+
+            righe_ric_ng = [_riga_ric_ng(g, str(comp)) for comp, g in df_ric_ng.groupby("Competizione", dropna=False)] if "Competizione" in df_ric_ng.columns else []
+            righe_ric_ng.append(_riga_ric_ng(df_ric_ng, "TOTALE"))
+            df_ric_ng_riepilogo = pd.DataFrame(righe_ric_ng)
+            str_lit.dataframe(df_ric_ng_riepilogo, use_container_width=True, hide_index=True)
+            totale = df_ric_ng_riepilogo[df_ric_ng_riepilogo["Competizione"] == "TOTALE"].iloc[0]
+            if totale["Controllo somma"] == "PASS":
+                str_lit.success(
+                    f"Riconciliazione completata: {int(totale['Partite controllate']):,} controllate = "
+                    f"{int(totale['Partite appaiate RAW/WF']):,} appaiate + {int(totale['Escluse totali']):,} escluse.".replace(",", ".")
+                )
+            else:
+                str_lit.error("Riconciliazione non completa: controllare le categorie e i dati sorgente.")
+            str_lit.download_button(
+                "📥 Scarica riconciliazione esclusioni No Goal",
+                df_ric_ng_riepilogo.to_csv(index=False).encode("utf-8-sig"),
+                "v19_7_2_riconciliazione_esclusioni_nogoal.csv",
+                "text/csv",
+                key="download_v1972_riconciliazione_nogoal",
+            )
+        else:
+            str_lit.info("Nessuna riga Audit disponibile per la riconciliazione No Goal.")
+
+        # Riconciliazione: partite valutate per competizione contro partite caricate dalla fonte gratuita.
+        if matches_audit:
+            caricate_comp = pd.DataFrame(matches_audit)
+            caricate_comp = caricate_comp.groupby("Competizione").size().reset_index(name="Partite caricate")
+            valutate_comp = df_audit.groupby("Competizione").size().reset_index(name="Partite valutate")
+            df_riconciliazione = caricate_comp.merge(valutate_comp, on="Competizione", how="outer").fillna(0)
+            df_riconciliazione["Partite non valutate / differenza"] = df_riconciliazione["Partite caricate"] - df_riconciliazione["Partite valutate"]
+            str_lit.markdown("##### 1. Riconciliazione partite caricate e valutate")
+            str_lit.dataframe(df_riconciliazione.round(0), use_container_width=True, hide_index=True)
+            str_lit.caption("La differenza include soprattutto lo storico minimo richiesto prima della prima valutazione; eventuali scarti diversi vanno investigati.")
+        if not df_v15_metriche.empty:
+            str_lit.markdown("##### 2. Confronto raw vs correzioni walk-forward")
+            str_lit.dataframe(df_v15_metriche.round(5), use_container_width=True, hide_index=True)
+            str_lit.caption("Delta WF - raw negativo = versione testata migliore. Per le righe lambda, la metrica è MAE dei gol attesi; per le probabilità è Brier Score. Log Loss è mostrato dove applicabile.")
+        else:
+            str_lit.info("Campione insufficiente per i test calibrati: servono almeno 100 osservazioni precedenti della stessa competizione.")
+        if not df_v15_comp.empty:
+            str_lit.markdown("##### 3. Risultati diagnostici per competizione")
+            str_lit.dataframe(df_v15_comp.round(3), use_container_width=True, hide_index=True)
+
+        # V16: verifica della stabilità della calibrazione No Goal per periodo e competizione.
+        # Confronto paired: raw e WF sono calcolati sulle stesse partite in cui WF è disponibile.
+        if not df_v15_test.empty:
+            colonne_ng_v16 = ["P(NG) raw", "P(NG) calibrata WF", "NG y", "Competizione", "Data"]
+            if all(c in df_v15_test.columns for c in colonne_ng_v16):
+                df_ng_v16 = df_v15_test[colonne_ng_v16].copy()
+                for col in ["P(NG) raw", "P(NG) calibrata WF", "NG y"]:
+                    df_ng_v16[col] = pd.to_numeric(df_ng_v16[col], errors="coerce")
+                df_ng_v16["Data"] = pd.to_datetime(df_ng_v16["Data"], errors="coerce", utc=True)
+                df_ng_v16 = df_ng_v16.dropna(subset=["P(NG) raw", "P(NG) calibrata WF", "NG y", "Competizione", "Data"])
+                df_ng_v16["Anno test"] = df_ng_v16["Data"].dt.year
+
+                def _riepilogo_ng_v16(gruppi, nome_gruppo):
+                    risultati = []
+                    for chiave, gruppo in df_ng_v16.groupby(gruppi, dropna=False):
+                        if not isinstance(chiave, tuple):
+                            chiave = (chiave,)
+                        y = gruppo["NG y"].to_numpy(dtype=float)
+                        raw = gruppo["P(NG) raw"].to_numpy(dtype=float)
+                        wf = gruppo["P(NG) calibrata WF"].to_numpy(dtype=float)
+                        brier_raw, ll_raw = _calcola_metriche_binaria(raw, y)
+                        brier_wf, ll_wf = _calcola_metriche_binaria(wf, y)
+                        r = {nome_gruppo: " / ".join(str(v) for v in chiave), "Partite test WF": int(len(gruppo)),
+                             "Brier NG raw": brier_raw, "Brier NG WF": brier_wf,
+                             "Delta Brier WF - raw": brier_wf - brier_raw,
+                             "LogLoss NG raw": ll_raw, "LogLoss NG WF": ll_wf,
+                             "Delta LogLoss WF - raw": ll_wf - ll_raw}
+                        if len(gruppo) < 100:
+                            r["Affidabilità campione"] = "Basso n (<100)"
+                        else:
+                            r["Affidabilità campione"] = "Almeno 100"
+                        r["Entrambe migliorano"] = "Sì" if (brier_wf < brier_raw and ll_wf < ll_raw) else "No"
+                        risultati.append(r)
+                    return pd.DataFrame(risultati)
+
+                str_lit.markdown("##### 4. V16 — Stabilità No Goal per anno")
+                str_lit.caption("Confronto RAW/WF sulle stesse partite out-of-sample per cui esiste una calibrazione WF. Delta negativo è migliore; gli anni con meno di 100 partite sono indicativi.")
+                df_ng_anno_v16 = _riepilogo_ng_v16(["Anno test"], "Anno")
+                if not df_ng_anno_v16.empty:
+                    str_lit.dataframe(df_ng_anno_v16.round(5), use_container_width=True, hide_index=True)
+                else:
+                    str_lit.info("Non ci sono abbastanza previsioni calibrate WF per il riepilogo annuale No Goal.")
+
+                str_lit.markdown("##### 5. V16 — Stabilità No Goal per competizione")
+                df_ng_comp_v16 = _riepilogo_ng_v16(["Competizione"], "Competizione")
+                if not df_ng_comp_v16.empty:
+                    str_lit.dataframe(df_ng_comp_v16.round(5), use_container_width=True, hide_index=True)
+                else:
+                    str_lit.info("Non ci sono abbastanza previsioni calibrate WF per il riepilogo per competizione.")
+
+
+                # V17: calibrazione per fasce RAW e WF, più confronto delle metriche per fascia.
+                # Solo diagnostica: non modifica né sostituisce le previsioni operative.
+                str_lit.markdown("##### 6. V17 — Calibrazione RAW per fasce di probabilità")
+                str_lit.caption("Le fasce sono definite dalla probabilità RAW pre-correzione. La frequenza reale è la percentuale di partite con No Goal. Fasce con pochi casi vanno interpretate con cautela.")
+                fasce_v17 = [0.0, .10, .20, .30, .40, .50, .60, .70, .80, .90, 1.000001]
+                etichette_v17 = ["0–10%", "10–20%", "20–30%", "30–40%", "40–50%", "50–60%", "60–70%", "70–80%", "80–90%", "90–100%"]
+                df_ng_v17 = df_ng_v16.copy()
+                for c in ["P(NG) raw", "P(NG) calibrata WF", "NG y"]:
+                    df_ng_v17[c] = pd.to_numeric(df_ng_v17[c], errors="coerce")
+                df_ng_v17 = df_ng_v17.dropna(subset=["P(NG) raw", "P(NG) calibrata WF", "NG y"])
+                df_ng_v17["Fascia RAW"] = pd.cut(df_ng_v17["P(NG) raw"].clip(0, 1), bins=fasce_v17, labels=etichette_v17, right=True, include_lowest=True)
+                df_ng_v17["Fascia WF"] = pd.cut(df_ng_v17["P(NG) calibrata WF"].clip(0, 1), bins=fasce_v17, labels=etichette_v17, right=True, include_lowest=True)
+
+                def _calibrazione_v17(df, col_prob, col_fascia):
+                    rows = []
+                    for fascia in etichette_v17:
+                        g = df.loc[df[col_fascia] == fascia]
+                        if g.empty:
+                            continue
+                        rows.append({
+                            "Fascia probabilità": fascia,
+                            "Partite": int(len(g)),
+                            "Probabilità media (%)": float(g[col_prob].mean() * 100),
+                            "No Goal reali (%)": float(g["NG y"].mean() * 100),
+                            "Scarto previsione - reale (pp)": float((g[col_prob].mean() - g["NG y"].mean()) * 100),
+                            "Affidabilità campione": "Basso n (<100)" if len(g) < 100 else "Almeno 100"
+                        })
+                    return pd.DataFrame(rows)
+
+                df_v17_raw_cal = _calibrazione_v17(df_ng_v17, "P(NG) raw", "Fascia RAW")
+                if not df_v17_raw_cal.empty:
+                    str_lit.dataframe(df_v17_raw_cal.round(3), use_container_width=True, hide_index=True)
+                    str_lit.download_button("📥 Scarica calibrazione RAW per fasce V17", df_v17_raw_cal.to_csv(index=False).encode("utf-8-sig"), "v17_nogoal_calibrazione_raw_fasce.csv", "text/csv")
+                else:
+                    str_lit.info("Nessun dato valido per la calibrazione RAW per fasce.")
+
+                str_lit.markdown("##### 7. V17 — Calibrazione walk-forward per fasce di probabilità")
+                str_lit.caption("Qui le fasce sono definite dalla probabilità WF corretta; il confronto mostra se la probabilità corretta corrisponde meglio alla frequenza reale osservata.")
+                df_v17_wf_cal = _calibrazione_v17(df_ng_v17, "P(NG) calibrata WF", "Fascia WF")
+                if not df_v17_wf_cal.empty:
+                    str_lit.dataframe(df_v17_wf_cal.round(3), use_container_width=True, hide_index=True)
+                    str_lit.download_button("📥 Scarica calibrazione WF per fasce V17", df_v17_wf_cal.to_csv(index=False).encode("utf-8-sig"), "v17_nogoal_calibrazione_wf_fasce.csv", "text/csv")
+                else:
+                    str_lit.info("Nessun dato valido per la calibrazione WF per fasce.")
+
+                str_lit.markdown("##### 8. V17 — Confronto RAW vs WF per fascia RAW")
+                str_lit.caption("Per un confronto appaiato e leggibile, le partite sono raggruppate in base alla probabilità RAW. Delta WF − RAW negativo significa miglioramento della metrica.")
+                righe_confronto_v17 = []
+                for fascia in etichette_v17:
+                    g = df_ng_v17.loc[df_ng_v17["Fascia RAW"] == fascia]
+                    if g.empty:
+                        continue
+                    y = g["NG y"].to_numpy(dtype=float)
+                    raw = g["P(NG) raw"].to_numpy(dtype=float)
+                    wf = g["P(NG) calibrata WF"].to_numpy(dtype=float)
+                    brier_raw, ll_raw = _calcola_metriche_binaria(raw, y)
+                    brier_wf, ll_wf = _calcola_metriche_binaria(wf, y)
+                    righe_confronto_v17.append({
+                        "Fascia probabilità RAW": fascia,
+                        "Partite": int(len(g)),
+                        "Brier RAW": brier_raw,
+                        "Brier WF": brier_wf,
+                        "Delta Brier WF - RAW": brier_wf - brier_raw,
+                        "LogLoss RAW": ll_raw,
+                        "LogLoss WF": ll_wf,
+                        "Delta LogLoss WF - RAW": ll_wf - ll_raw,
+                        "Entrambe migliorano": "Sì" if brier_wf < brier_raw and ll_wf < ll_raw else "No",
+                        "Affidabilità campione": "Basso n (<100)" if len(g) < 100 else "Almeno 100"
+                    })
+                df_v17_confronto = pd.DataFrame(righe_confronto_v17)
+                # V19.3: rendere esplicito che il totale per fasce della sezione globale
+                # deve coincidere con il campione appaiato RAW/WF, senza confonderlo
+                # con il successivo focus Bundesliga che è un sottoinsieme separato.
+                n_globale_appaiato = int(len(df_ng_v17))
+                n_somma_fasce_globali = int(df_v17_confronto["Partite"].sum()) if not df_v17_confronto.empty else 0
+                delta_fasce_globali = n_somma_fasce_globali - n_globale_appaiato
+                str_lit.markdown("###### Riconciliazione del campione globale per fasce")
+                df_ric_fasce_globali = pd.DataFrame([{
+                    "Osservazioni globali RAW/WF appaiate": n_globale_appaiato,
+                    "Somma partite nelle fasce RAW": n_somma_fasce_globali,
+                    "Differenza (somma - globale)": delta_fasce_globali,
+                    "Esito": "PASS" if delta_fasce_globali == 0 else "ATTENZIONE"
+                }])
+                str_lit.dataframe(df_ric_fasce_globali, use_container_width=True, hide_index=True)
+                if delta_fasce_globali != 0:
+                    str_lit.warning("Le fasce RAW globali non riconciliano con il campione appaiato: verificare probabilità mancanti o fuori intervallo.")
+                else:
+                    str_lit.caption("Il totale globale per fasce è riconciliato. Il focus Bundesliga nella sezione 14 usa invece solo le partite della Bundesliga.")
+                if not df_v17_confronto.empty:
+                    str_lit.dataframe(df_v17_confronto.round(5), use_container_width=True, hide_index=True)
+                    str_lit.download_button("📥 Scarica confronto RAW-WF per fasce V17", df_v17_confronto.to_csv(index=False).encode("utf-8-sig"), "v17_nogoal_confronto_raw_wf_fasce.csv", "text/csv")
+                else:
+                    str_lit.info("Nessun dato valido per il confronto RAW vs WF per fascia.")
+                str_lit.info("V17 è esclusivamente diagnostica: nessuna correzione viene applicata alle previsioni operative.")
+
+                # V18: riconciliazione dei conteggi e stabilità temporale.
+                # Tutte le metriche RAW/WF sono calcolate su righe appaiate identiche.
+                str_lit.markdown("##### 9. V18 — Riconciliazione esatta dei conteggi")
+                df_v18_all = df_v15_test.copy()
+                for col in ["P(X) raw", "P(X) calibrata WF", "X y", "P(NG) raw", "P(NG) calibrata WF", "NG y",
+                            "Lambda casa", "Lambda trasferta", "Gol casa reali", "Gol trasferta reali",
+                            "Lambda casa corretta WF", "Lambda trasferta corretta WF"]:
+                    if col in df_v18_all.columns:
+                        df_v18_all[col] = pd.to_numeric(df_v18_all[col], errors="coerce")
+
+                mask_v18_x = df_v18_all[["P(X) raw", "P(X) calibrata WF", "X y"]].notna().all(axis=1)
+                mask_v18_ng = df_v18_all[["P(NG) raw", "P(NG) calibrata WF", "NG y"]].notna().all(axis=1)
+                mask_v18_lambda = df_v18_all[["Lambda casa", "Lambda trasferta", "Gol casa reali", "Gol trasferta reali",
+                                               "Lambda casa corretta WF", "Lambda trasferta corretta WF"]].notna().all(axis=1)
+
+                conteggi_v18 = []
+                if matches_audit:
+                    df_v18_caricate = pd.DataFrame(matches_audit).groupby("Competizione").size().rename("Partite caricate")
+                else:
+                    df_v18_caricate = pd.Series(dtype="int64", name="Partite caricate")
+                df_v18_valutate = df_audit.groupby("Competizione").size().rename("Partite valutate nell'audit")
+                df_v18_test = df_v18_all.groupby("Competizione").agg(
+                    **{"Righe test totali": ("Competizione", "size")}
+                ) if "Competizione" in df_v18_all.columns else pd.DataFrame()
+                for comp in sorted(set(df_v18_all["Competizione"].dropna().unique()) | set(df_audit["Competizione"].dropna().unique()) | set(df_v18_caricate.index)):
+                    z = df_v18_all[df_v18_all["Competizione"] == comp]
+                    za = df_audit[df_audit["Competizione"] == comp]
+                    zng = z.loc[mask_v18_ng[z.index]] if len(z) else z
+                    zx = z.loc[mask_v18_x[z.index]] if len(z) else z
+                    zl = z.loc[mask_v18_lambda[z.index]] if len(z) else z
+                    training_ng = pd.to_numeric(zng.get("Training usato V15", pd.Series(dtype=float)), errors="coerce")
+                    conteggi_v18.append({
+                        "Competizione": comp,
+                        "Partite caricate": int(df_v18_caricate.get(comp, 0)),
+                        "Partite valutate nell'audit": int(len(za)),
+                        "Differenza caricate - audit": int(df_v18_caricate.get(comp, 0) - len(za)),
+                        "Righe test totali": int(len(z)),
+                        "Test X appaiati RAW/WF": int(len(zx)),
+                        "Test No Goal appaiati RAW/WF": int(len(zng)),
+                        "Test lambda appaiati": int(len(zl)),
+                        "Training minimo su test NG": int(training_ng.min()) if not training_ng.empty and training_ng.notna().any() else np.nan,
+                        "Training massimo su test NG": int(training_ng.max()) if not training_ng.empty and training_ng.notna().any() else np.nan,
+                    })
+                df_v18_conteggi = pd.DataFrame(conteggi_v18)
+                if not df_v18_conteggi.empty:
+                    str_lit.dataframe(df_v18_conteggi, use_container_width=True, hide_index=True)
+                    str_lit.download_button("📥 Scarica riconciliazione conteggi V18 CSV", df_v18_conteggi.to_csv(index=False).encode("utf-8-sig"), "v18_nogoal_riconciliazione_conteggi.csv", "text/csv")
+
+                # Recompute the global metrics on the exact same paired rows used by the per-competition table.
+                if int(mask_v18_ng.sum()) > 0:
+                    zng_all = df_v18_all.loc[mask_v18_ng]
+                    y_ng = zng_all["NG y"].to_numpy(dtype=float)
+                    p_ng_raw = zng_all["P(NG) raw"].to_numpy(dtype=float)
+                    p_ng_wf = zng_all["P(NG) calibrata WF"].to_numpy(dtype=float)
+                    brier_ng_raw, ll_ng_raw = _calcola_metriche_binaria(p_ng_raw, y_ng)
+                    brier_ng_wf, ll_ng_wf = _calcola_metriche_binaria(p_ng_wf, y_ng)
+                    n_ng_comp = int(df_v18_conteggi["Test No Goal appaiati RAW/WF"].sum()) if not df_v18_conteggi.empty else 0
+                    df_v18_metriche = pd.DataFrame([{
+                        "Controllo": "No Goal RAW vs WF",
+                        "N righe globali appaiate": int(mask_v18_ng.sum()),
+                        "Somma conteggi per competizione": n_ng_comp,
+                        "Differenza conteggi": n_ng_comp - int(mask_v18_ng.sum()),
+                        "Brier RAW": brier_ng_raw,
+                        "Brier WF": brier_ng_wf,
+                        "Delta Brier WF - RAW": brier_ng_wf - brier_ng_raw,
+                        "LogLoss RAW": ll_ng_raw,
+                        "LogLoss WF": ll_ng_wf,
+                        "Delta LogLoss WF - RAW": ll_ng_wf - ll_ng_raw,
+                        "Conteggi coerenti": "Sì" if n_ng_comp == int(mask_v18_ng.sum()) else "NO — verificare"
+                    }])
+                    str_lit.markdown("##### 10. V18 — Verifica delle metriche aggregate")
+                    str_lit.dataframe(df_v18_metriche.round(6), use_container_width=True, hide_index=True)
+                    str_lit.download_button("📥 Scarica verifica metriche V18 CSV", df_v18_metriche.to_csv(index=False).encode("utf-8-sig"), "v18_nogoal_verifica_metriche.csv", "text/csv")
+
+                # Stabilità temporale per semestre, usando sempre lo stesso campione appaiato.
+                str_lit.markdown("##### 11. V18 — Stabilità No Goal per semestre")
+                df_v18_periodo = df_ng_v16.copy()
+                df_v18_periodo["Data"] = pd.to_datetime(df_v18_periodo["Data"], errors="coerce", utc=True)
+                df_v18_periodo = df_v18_periodo.dropna(subset=["Data", "P(NG) raw", "P(NG) calibrata WF", "NG y"])
+                df_v18_periodo["Periodo"] = df_v18_periodo["Data"].dt.year.astype(str) + "-S" + np.where(df_v18_periodo["Data"].dt.month <= 6, "1", "2")
+                righe_periodo_v18 = []
+                for periodo, g in df_v18_periodo.groupby("Periodo", sort=True):
+                    y = g["NG y"].to_numpy(dtype=float)
+                    raw = g["P(NG) raw"].to_numpy(dtype=float)
+                    wf = g["P(NG) calibrata WF"].to_numpy(dtype=float)
+                    br, lr = _calcola_metriche_binaria(raw, y)
+                    bw, lw = _calcola_metriche_binaria(wf, y)
+                    righe_periodo_v18.append({
+                        "Periodo": periodo,
+                        "Partite appaiate": int(len(g)),
+                        "Brier RAW": br,
+                        "Brier WF": bw,
+                        "Delta Brier WF - RAW": bw - br,
+                        "LogLoss RAW": lr,
+                        "LogLoss WF": lw,
+                        "Delta LogLoss WF - RAW": lw - lr,
+                        "Entrambe migliorano": "Sì" if bw < br and lw < lr else "No",
+                        "Affidabilità campione": "Basso n (<100)" if len(g) < 100 else "Almeno 100"
+                    })
+                df_v18_periodi = pd.DataFrame(righe_periodo_v18)
+                if not df_v18_periodi.empty:
+                    str_lit.dataframe(df_v18_periodi.round(5), use_container_width=True, hide_index=True)
+                    str_lit.download_button("📥 Scarica stabilità semestrale V18 CSV", df_v18_periodi.to_csv(index=False).encode("utf-8-sig"), "v18_nogoal_stabilita_semestrale.csv", "text/csv")
+                else:
+                    str_lit.info("Non ci sono abbastanza dati con probabilità RAW e WF disponibili per il riepilogo semestrale.")
+                str_lit.info("V18 è esclusivamente diagnostica: non cambia le probabilità operative, le lambda o il ranking delle previsioni.")
+
+                # V19.3: audit esclusioni ottimizzato. Le date vengono convertite una sola volta:
+                # la precedente list-comprehension riconvertiva migliaia di date per ogni riga
+                # (complessità O(N^2)), lasciando la sezione apparentemente vuota in Cloud.
+                str_lit.markdown("##### 12. V19.7.3 — Audit delle partite non valutate")
+                str_lit.caption(
+                    "Spiega ogni differenza tra partite storiche caricate e partite valutate. "
+                    "Il walk-forward richiede almeno 30 risultati precedenti della stessa competizione "
+                    "e non usa partite della stessa data come storico precedente. Solo diagnostica."
+                )
+                from bisect import bisect_left
+
+                def _v19_key(comp, date_value, home, away):
+                    date_norm = pd.to_datetime(date_value, errors="coerce", utc=True)
+                    if pd.isna(date_norm):
+                        date_text = ""
+                    else:
+                        date_text = date_norm.strftime("%Y-%m-%d")
+                    return (str(comp).strip().casefold(), date_text,
+                            str(home).strip().casefold(), str(away).strip().casefold())
+
+                v19_eval_keys = set()
+                if not df_audit.empty:
+                    for _, rr in df_audit.iterrows():
+                        v19_eval_keys.add(_v19_key(rr.get("Competizione"), rr.get("Data"), rr.get("Casa"), rr.get("Trasferta")))
+
+                # Prepara una sola volta le partite caricate e le date con risultato valido.
+                v19_prepared = []
+                v19_dates_by_comp = {}
+                for mm in (matches_audit or []):
+                    comp = mm.get("Competizione", "Torneo")
+                    score = (mm.get("score") or {}).get("fullTime") or {}
+                    home = (mm.get("homeTeam") or {}).get("name", "Casa")
+                    away = (mm.get("awayTeam") or {}).get("name", "Trasferta")
+                    date_value = mm.get("utcDate")
+                    date_norm = pd.to_datetime(date_value, errors="coerce", utc=True)
+                    valid_score = score.get("home") is not None and score.get("away") is not None
+                    valid_date = pd.notna(date_norm)
+                    date_day = date_norm.strftime("%Y-%m-%d") if valid_date else ""
+                    key = (str(comp).strip().casefold(), date_day,
+                           str(home).strip().casefold(), str(away).strip().casefold())
+                    if valid_date and valid_score:
+                        v19_dates_by_comp.setdefault(str(comp), []).append(date_norm.date())
+                    v19_prepared.append({
+                        "comp": comp, "score": score, "home": home, "away": away,
+                        "date_value": date_value, "date_norm": date_norm,
+                        "date_day": date_day, "valid_date": valid_date,
+                        "valid_score": valid_score, "key": key,
                     })
 
-                if agg_rows:
-                    st.markdown('### 2. RAW vs PLATT — aggregato tutte le leghe')
-                    st.dataframe(pd.DataFrame(agg_rows).round(4), use_container_width=True, hide_index=True)
-
-            if temporal_frames:
-                st.markdown('### 3. Stabilità temporale del confronto')
-                tdf = pd.concat(temporal_frames, ignore_index=True)
-                st.dataframe(tdf.round(4), use_container_width=True, hide_index=True)
-
-            if detail_frames:
-                dd = pd.concat(detail_frames, ignore_index=True)
-                export_cols = [
-                    'Campionato', 'data', 'casa', 'trasferta', 'top1_hit',
-                    'top1_prob_raw', 'top1_prob_platt', 'platt_applied',
-                    'platt_coef', 'platt_train_n', 'platt_reason'
-                ]
-                export_cols = [c for c in export_cols if c in dd.columns]
-                st.markdown('### 4. Export dettaglio walk-forward')
-                st.download_button(
-                    '⬇️ Scarica V14.12-FIX PLATT Top1 dettaglio CSV',
-                    data=dd[export_cols].to_csv(index=False).encode('utf-8'),
-                    file_name='V14_12_FIX_top1_platt_walkforward_35pct.csv',
-                    mime='text/csv',
-                    key='v14_12_fix_dl'
-                )
-
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome, msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-mostra_v14_12_top1_platt_walkforward(rho_val, ewma_span_val, emivita_val)
-
-# =====================================================================
-# 🧪 V14.13 — PLATT TOP1: BOOTSTRAP PAIRED + TEST DI SEGNO
-# Solo diagnostico. Quantifica l'incertezza della differenza RAW vs PLATT
-# sulle stesse selezioni OOS. Nessuna modifica alle probabilità operative.
-# =====================================================================
-
-V14_13_BOOTSTRAPS = 10000
-V14_13_SEED = 20260930
-
-
-def _v14_13_bootstrap_ci(delta_values, n_boot=V14_13_BOOTSTRAPS, seed=V14_13_SEED):
-    """Bootstrap CI percentile per una differenza paired osservata per match."""
-    arr = np.asarray(delta_values, dtype=float).reshape(-1)
-    arr = arr[np.isfinite(arr)]
-    n = int(arr.size)
-    if n < 2:
-        return np.nan, np.nan, np.nan, n
-    rng = np.random.default_rng(seed)
-    idx = rng.integers(0, n, size=(int(n_boot), n))
-    means = arr[idx].mean(axis=1)
-    lo, hi = np.percentile(means, [2.5, 97.5])
-    return float(arr.mean()), float(lo), float(hi), n
-
-
-def _v14_13_sign_permutation_p(delta_values, n_perm=V14_13_BOOTSTRAPS, seed=V14_13_SEED):
-    """Paired random-sign permutation test della media, H0: differenza=0."""
-    arr = np.asarray(delta_values, dtype=float).reshape(-1)
-    arr = arr[np.isfinite(arr)]
-    n = int(arr.size)
-    if n < 2:
-        return np.nan, n
-    observed = abs(float(arr.mean()))
-    rng = np.random.default_rng(seed + 17)
-    chunk = max(1, int(n_perm))
-    hits = 0
-    done = 0
-    while done < int(n_perm):
-        m = min(chunk, int(n_perm) - done)
-        signs = rng.choice(np.array([-1.0, 1.0]), size=(m, n))
-        perm = np.abs((signs * arr).mean(axis=1))
-        hits += int(np.sum(perm >= observed))
-        done += m
-    p = (hits + 1.0) / (float(n_perm) + 1.0)
-    return float(p), n
-
-
-def _v14_13_compare(g, periodo, n_boot=V14_13_BOOTSTRAPS, seed=V14_13_SEED):
-    if g is None or g.empty:
-        return None
-    y = np.asarray(g['top1_hit'].to_numpy(dtype=float)).reshape(-1)
-    raw = np.clip(np.asarray(g['top1_prob_raw'].to_numpy(dtype=float)).reshape(-1), 1e-6, 1.0 - 1e-6)
-    platt = np.clip(np.asarray(g['top1_prob_platt'].to_numpy(dtype=float)).reshape(-1), 1e-6, 1.0 - 1e-6)
-
-    d_brier = (platt - y) ** 2 - (raw - y) ** 2
-    d_ll = -(y * np.log(platt) + (1.0 - y) * np.log(1.0 - platt)) + (
-        y * np.log(raw) + (1.0 - y) * np.log(1.0 - raw)
-    )
-    # Calibrazione: gap = reale - probabilità; delta PLATT-RAW
-    d_gap = 100.0 * float(np.mean(y - platt) - np.mean(y - raw))
-
-    b_mean, b_lo, b_hi, n_b = _v14_13_bootstrap_ci(d_brier, n_boot=n_boot, seed=seed)
-    l_mean, l_lo, l_hi, n_l = _v14_13_bootstrap_ci(d_ll, n_boot=n_boot, seed=seed + 1)
-    p_b, _ = _v14_13_sign_permutation_p(d_brier, n_perm=n_boot, seed=seed + 2)
-    p_l, _ = _v14_13_sign_permutation_p(d_ll, n_perm=n_boot, seed=seed + 3)
-
-    return {
-        'Periodo': periodo,
-        'N': int(len(g)),
-        'N PLATT applicato': int(g['platt_applied'].sum()) if 'platt_applied' in g.columns else int(len(g)),
-        'Delta Brier medio pp': 100.0 * b_mean,
-        'IC95% Delta Brier low pp': 100.0 * b_lo,
-        'IC95% Delta Brier high pp': 100.0 * b_hi,
-        'p permutazione Brier': p_b,
-        'Delta Log Loss medio': l_mean,
-        'IC95% Delta Log Loss low': l_lo,
-        'IC95% Delta Log Loss high': l_hi,
-        'p permutazione Log Loss': p_l,
-        'Delta Gap calibrazione pp': d_gap,
-        'Prob. media RAW %': 100.0 * float(raw.mean()),
-        'Prob. media PLATT %': 100.0 * float(platt.mean()),
-    }
-
-
-def mostra_v14_13_platt_bootstrap(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.13 — PLATT TOP1: BOOTSTRAP PAIRED')
-    st.caption(
-        'Solo diagnostico. Usa le stesse selezioni OOS di V14.12-FIX e quantifica '
-        'l\'incertezza della differenza RAW vs PLATT con bootstrap paired e test '
-        'a randomizzazione dei segni. Nessuna modifica alle probabilità operative.'
-    )
-
-    with st.expander('Apri V14.13 — Bootstrap paired RAW vs PLATT', expanded=False):
-        ntrain = st.number_input(
-            'Training PLATT Top1 (massimo)',
-            V14_12_MIN_TRAIN,
-            V14_12_MAX_TRAIN,
-            100,
-            10,
-            key='v14_13_train'
-        )
-        nboot = st.number_input(
-            'Numero bootstrap/permutazioni',
-            2000,
-            50000,
-            V14_13_BOOTSTRAPS,
-            1000,
-            key='v14_13_boots'
-        )
-
-        if st.button('🔬 ESEGUI V14.13 — BOOTSTRAP PLATT TOP1', key='v14_13_run'):
-            summary_rows = []
-            by_league_rows = []
-            errors = []
-
-            with st.spinner('Calcolo V14.13 sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        res = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
-                        if res is None:
-                            continue
-                        _, det = res
-                        if det is None or det.empty:
-                            continue
-                        wf, _, _ = _v14_12_walkforward_top1(
-                            det,
-                            int(ntrain),
-                            V14_12_PROB_THRESHOLD
-                        )
-                        if wf.empty:
-                            continue
-
-                        # Aggregato storico
-                        met = _v14_13_compare(wf, 'Tutto lo storico OOS', n_boot=int(nboot), seed=V14_13_SEED)
-                        if met is not None:
-                            summary_rows.append(met)
-
-                        # Stagione corrente: stessa convenzione V14.12 (dal 1 agosto dell'anno massimo).
-                        if 'data' in wf.columns:
-                            dates = pd.to_datetime(wf['data'], errors='coerce')
-                            if dates.notna().any():
-                                latest_year = int(dates.dt.year.max())
-                                cut = pd.Timestamp(year=latest_year, month=8, day=1)
-                                curr = wf[dates >= cut].copy()
-                                metc = _v14_13_compare(curr, 'Stagione corrente OOS', n_boot=int(nboot), seed=V14_13_SEED + 100) if not curr.empty else None
-                                if metc is not None:
-                                    summary_rows.append(metc)
-
-                        by_league = _v14_13_compare(wf, 'Tutto lo storico OOS', n_boot=int(nboot), seed=V14_13_SEED + 200)
-                        if by_league is not None:
-                            by_league['Campionato'] = camp
-                            by_league_rows.append(by_league)
-                            # dettaglio corrente per lega
-                            if 'data' in wf.columns:
-                                dates = pd.to_datetime(wf['data'], errors='coerce')
-                                if dates.notna().any():
-                                    latest_year = int(dates.dt.year.max())
-                                    cut = pd.Timestamp(year=latest_year, month=8, day=1)
-                                    curr = wf[dates >= cut].copy()
-                                    curm = _v14_13_compare(curr, 'Stagione corrente OOS', n_boot=int(nboot), seed=V14_13_SEED + 300) if not curr.empty else None
-                                    if curm is not None:
-                                        curm['Campionato'] = camp
-                                        by_league_rows.append(curm)
-
-                    except Exception as e:
-                        errors.append((camp, f'{type(e).__name__}: {e}'))
-
-            if summary_rows:
-                sdf = pd.DataFrame(summary_rows)
-                st.markdown('### 1. Incertezza aggregata')
-                st.dataframe(sdf.round(4), use_container_width=True, hide_index=True)
-                st.caption(
-                    'Delta Brier e Delta Log Loss = PLATT − RAW. Intervalli al 95% ottenuti '
-                    'con bootstrap paired; p-value da randomizzazione dei segni. '
-                    'Valori negativi della delta indicano una riduzione della metrica.'
-                )
-                st.info(f'Bootstrap/permutazioni richiesti: {int(nboot):,}. Seed fisso: {V14_13_SEED}.')
-
-            if by_league_rows:
-                ldf = pd.DataFrame(by_league_rows)
-                st.markdown('### 2. Dettaglio per campionato')
-                st.dataframe(ldf.round(4), use_container_width=True, hide_index=True)
-
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome, msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-mostra_v14_13_platt_bootstrap(rho_val, ewma_span_val, emivita_val)
-
-
-
-# =====================================================================
-# 🧪 V14.14 — SENSIBILITÀ ALLA FINESTRA DI TRAINING PLATT TOP1
-# Solo diagnostico. Confronta la stessa metodologia walk-forward Top1 >=35%
-# usando tre lunghezze massime di training: 50, 75, 100 osservazioni.
-# Nessuna modifica alle probabilità operative.
-# =====================================================================
-
-V14_14_TRAIN_WINDOWS = [50, 75, 100]
-
-
-def _v14_14_aggregate_metrics(frames, period_label):
-    """Concatena i dettagli selezionati e calcola metriche pooled, esattamente match-level."""
-    if not frames:
-        return None
-    valid = [f for f in frames if f is not None and not f.empty]
-    if not valid:
-        return None
-    g = pd.concat(valid, ignore_index=True)
-    return _v14_12_metrics(g, period_label)
-
-
-def _v14_14_current_filter(wf):
-    if wf is None or wf.empty or 'data' not in wf.columns:
-        return pd.DataFrame()
-    dates = pd.to_datetime(wf['data'], errors='coerce')
-    if not dates.notna().any():
-        return pd.DataFrame()
-    latest_year = int(dates.dt.year.max())
-    cut = pd.Timestamp(year=latest_year, month=8, day=1)
-    return wf[dates >= cut].copy()
-
-
-def mostra_v14_14_training_window_sensitivity(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.14 — SENSIBILITÀ FINESTRA TRAINING PLATT TOP1')
-    st.caption(
-        'Solo diagnostico. Soglia Top1 >=35% fissa ex ante. Confronta il walk-forward '
-        'PLATT con finestra massima 50, 75 e 100 osservazioni precedenti nello stesso '
-        'campionato. Nessuna modifica alle probabilità operative.'
-    )
-
-    with st.expander('Apri V14.14 — Training Window Sensitivity', expanded=False):
-        if st.button('🔬 ESEGUI V14.14 — SENSIBILITÀ TRAINING PLATT', key='v14_14_run'):
-            aggregate_rows = []
-            league_rows = []
-            temporal_rows = []
-            errors = []
-
-            with st.spinner('Calcolo sensibilità della finestra di training sulle 5 leghe...'):
-                for ntrain in V14_14_TRAIN_WINDOWS:
-                    all_hist = []
-                    all_curr = []
-
-                    for camp, info in CAMPIONATI_DOMESTICI.items():
-                        try:
-                            res = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
-                            if res is None:
-                                continue
-                            _, det = res
-                            if det is None or det.empty:
-                                continue
-
-                            wf, _, _ = _v14_12_walkforward_top1(
-                                det,
-                                int(ntrain),
-                                V14_12_PROB_THRESHOLD
-                            )
-                            if wf is None or wf.empty:
-                                continue
-
-                            mh = _v14_12_metrics(wf, 'Tutto lo storico OOS')
-                            if mh is not None:
-                                mh['Training max'] = int(ntrain)
-                                mh['Campionato'] = camp
-                                league_rows.append(mh)
-
-                            all_hist.append(wf.assign(Campionato=camp))
-                            curr = _v14_14_current_filter(wf)
-                            if not curr.empty:
-                                all_curr.append(curr.assign(Campionato=camp))
-
-                        except Exception as e:
-                            errors.append((camp, f'Training {ntrain}: {type(e).__name__}: {e}'))
-
-                    mh_all = _v14_14_aggregate_metrics(all_hist, 'Tutto lo storico OOS')
-                    if mh_all is not None:
-                        mh_all['Training max'] = int(ntrain)
-                        aggregate_rows.append(mh_all)
-
-                    mc_all = _v14_14_aggregate_metrics(all_curr, 'Stagione corrente OOS')
-                    if mc_all is not None:
-                        mc_all['Training max'] = int(ntrain)
-                        aggregate_rows.append(mc_all)
-
-            if aggregate_rows:
-                adf = pd.DataFrame(aggregate_rows)
-                cols = [
-                    'Periodo', 'Training max', 'N selezioni >=35%', 'N PLATT applicato',
-                    'Top1 hit %', 'RAW Prob. media %', 'PLATT Prob. media %',
-                    'RAW Gap calibrazione pp', 'PLATT Gap calibrazione pp',
-                    'RAW Brier', 'PLATT Brier', 'RAW Log Loss', 'PLATT Log Loss',
-                    'Delta Brier pp', 'Delta Log Loss'
-                ]
-                adf = adf[[c for c in cols if c in adf.columns]]
-                st.markdown('### 1. Sensibilità aggregata — storico vs stagione corrente')
-                st.dataframe(adf.round(4), use_container_width=True, hide_index=True)
-                st.caption('Delta Brier e Delta Log Loss = PLATT − RAW. Il training usa solo osservazioni precedenti nello stesso campionato.')
-
-            if league_rows:
-                ldf = pd.DataFrame(league_rows)
-                cols = [
-                    'Campionato', 'Training max', 'Periodo', 'N selezioni >=35%',
-                    'N PLATT applicato', 'Top1 hit %', 'RAW Prob. media %',
-                    'PLATT Prob. media %', 'RAW Gap calibrazione pp',
-                    'PLATT Gap calibrazione pp', 'RAW Brier', 'PLATT Brier',
-                    'RAW Log Loss', 'PLATT Log Loss', 'Delta Brier pp',
-                    'Delta Log Loss'
-                ]
-                st.markdown('### 2. Dettaglio per campionato — storico OOS')
-                st.dataframe(ldf[[c for c in cols if c in ldf.columns]].round(4), use_container_width=True, hide_index=True)
-
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome, msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-mostra_v14_14_training_window_sensitivity(rho_val, ewma_span_val, emivita_val)
-
-# =====================================================================
-# 🧪 V14.15 — HOLDOUT CRONOLOGICO: PLATT 75 VS 100
-# Solo diagnostico. Confronto predefinito tra le due finestre rimaste
-# plausibili dopo V14.14, su un blocco cronologico finale per campionato.
-# Nessuna modifica alle probabilità operative.
-# =====================================================================
-
-V14_15_WINDOWS = [75, 100]
-V14_15_HOLDOUT_FRAC = 0.20
-
-
-def _v14_15_holdout_metrics(df, period_label, train_window):
-    if df is None or df.empty:
-        return None
-    x = df.copy()
-    for c in ['top1_hit', 'top1_prob_raw', 'top1_prob_platt']:
-        if c in x.columns:
-            x[c] = pd.to_numeric(x[c], errors='coerce')
-    x = x.dropna(subset=['top1_hit', 'top1_prob_raw', 'top1_prob_platt'])
-    if x.empty:
-        return None
-    y = x['top1_hit'].astype(float).to_numpy()
-    raw = np.clip(x['top1_prob_raw'].astype(float).to_numpy(), 1e-6, 1-1e-6)
-    platt = np.clip(x['top1_prob_platt'].astype(float).to_numpy(), 1e-6, 1-1e-6)
-    return {
-        'Finestra training': int(train_window),
-        'Periodo': period_label,
-        'N': int(len(x)),
-        'Top1 hit %': 100.0 * float(y.mean()),
-        'RAW Prob. media %': 100.0 * float(raw.mean()),
-        'PLATT Prob. media %': 100.0 * float(platt.mean()),
-        'RAW Gap calibrazione pp': 100.0 * float(y.mean() - raw.mean()),
-        'PLATT Gap calibrazione pp': 100.0 * float(y.mean() - platt.mean()),
-        'RAW Brier': float(np.mean((raw-y)**2)),
-        'PLATT Brier': float(np.mean((platt-y)**2)),
-        'RAW Log Loss': float(-np.mean(y*np.log(raw)+(1-y)*np.log(1-raw))),
-        'PLATT Log Loss': float(-np.mean(y*np.log(platt)+(1-y)*np.log(1-platt))),
-        'Delta Brier pp': 100.0 * float(np.mean((platt-y)**2) - np.mean((raw-y)**2)),
-        'Delta Log Loss': float(-np.mean(y*np.log(platt)+(1-y)*np.log(1-platt)) + np.mean(y*np.log(raw)+(1-y)*np.log(1-raw))),
-        'N PLATT applicato': int(x['platt_applied'].sum()) if 'platt_applied' in x.columns else int(len(x)),
-    }
-
-
-def _v14_15_holdout_cut(det):
-    if det is None or det.empty or 'data' not in det.columns:
-        return None, pd.DataFrame()
-    x = det.copy()
-    x['data'] = pd.to_datetime(x['data'], errors='coerce')
-    x = x.dropna(subset=['data']).sort_values('data').reset_index(drop=True)
-    n = len(x)
-    if n < 20:
-        return None, pd.DataFrame()
-    split = max(1, int(np.floor(n * (1.0 - V14_15_HOLDOUT_FRAC))))
-    split = min(split, n-1)
-    cutoff = x.loc[split, 'data']
-    return cutoff, x[x['data'] >= cutoff].copy()
-
-
-def mostra_v14_15_holdout_platt(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧪 V14.15 — HOLDOUT CRONOLOGICO PLATT 75 VS 100')
-    st.caption(
-        'Solo diagnostico. Confronta esclusivamente le finestre di training 75 e 100 '
-        'su un blocco cronologico finale del 20% delle partite OOS di ciascun campionato. '
-        'Le predizioni restano walk-forward e usano solo osservazioni precedenti. Nessuna modifica operativa.'
-    )
-
-    with st.expander('Apri V14.15 — Holdout 75 vs 100', expanded=False):
-        if st.button('🔬 ESEGUI V14.15 — HOLDOUT PLATT 75 VS 100', key='v14_15_run'):
-            detail_rows = []
-            agg_rows = []
-            league_rows = []
-            errors = []
-
-            with st.spinner('Calcolo holdout cronologico per 75 e 100...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        res = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
-                        if res is None:
-                            continue
-                        _, det = res
-                        cutoff, holdout_matches = _v14_15_holdout_cut(det)
-                        if cutoff is None or holdout_matches.empty:
-                            continue
-
-                        for ntrain in V14_15_WINDOWS:
-                            wf, _, _ = _v14_12_walkforward_top1(
-                                det,
-                                int(ntrain),
-                                V14_12_PROB_THRESHOLD
-                            )
-                            if wf is None or wf.empty:
-                                continue
-                            wf['data'] = pd.to_datetime(wf['data'], errors='coerce')
-                            h = wf[wf['data'] >= cutoff].copy()
-                            if h.empty:
-                                continue
-
-                            m = _v14_15_holdout_metrics(h, 'Holdout cronologico finale', ntrain)
-                            if m is None:
-                                continue
-                            m['Campionato'] = camp
-                            m['Cutoff holdout'] = cutoff.strftime('%Y-%m-%d')
-                            m['N OOS holdout'] = int(len(holdout_matches))
-                            league_rows.append(m)
-                            detail_rows.append(h.assign(Campionato=camp, **{'Finestra training': int(ntrain)}))
-
-                    except Exception as e:
-                        errors.append((camp, f'{type(e).__name__}: {e}'))
-
-            if league_rows:
-                ldf = pd.DataFrame(league_rows)
-                st.markdown('### 1. Holdout per campionato')
-                cols = [
-                    'Campionato','Cutoff holdout','N OOS holdout','Finestra training','N',
-                    'N PLATT applicato','Top1 hit %','RAW Prob. media %','PLATT Prob. media %',
-                    'RAW Gap calibrazione pp','PLATT Gap calibrazione pp','RAW Brier','PLATT Brier',
-                    'RAW Log Loss','PLATT Log Loss','Delta Brier pp','Delta Log Loss'
-                ]
-                st.dataframe(ldf[[c for c in cols if c in ldf.columns]].round(4), use_container_width=True, hide_index=True)
-
-                for periodo in ['Holdout cronologico finale']:
-                    for ntrain in V14_15_WINDOWS:
-                        sub = ldf[(ldf['Periodo'] == periodo) & (ldf['Finestra training'] == ntrain)].copy()
-                        if sub.empty:
-                            continue
-                        weights = sub['N'].astype(float).to_numpy()
-                        row = {
-                            'Periodo': periodo,
-                            'Finestra training': ntrain,
-                            'N': int(weights.sum()),
-                            'N PLATT applicato': int(sub['N PLATT applicato'].sum()),
-                        }
-                        for c in ['Top1 hit %','RAW Prob. media %','PLATT Prob. media %','RAW Gap calibrazione pp','PLATT Gap calibrazione pp','RAW Brier','PLATT Brier','RAW Log Loss','PLATT Log Loss','Delta Brier pp','Delta Log Loss']:
-                            row[c] = float(np.average(sub[c].astype(float), weights=weights))
-                        agg_rows.append(row)
-
-                if agg_rows:
-                    adf = pd.DataFrame(agg_rows)
-                    st.markdown('### 2. Holdout aggregato')
-                    st.dataframe(adf.round(4), use_container_width=True, hide_index=True)
-                    st.caption('Le due finestre 75 e 100 vengono confrontate senza cercare una nuova soglia. Il confronto serve a verificare robustezza temporale.')
-
-                if len(agg_rows) == 2:
-                    a = agg_rows[0]; b = agg_rows[1]
-                    st.markdown('### 3. Differenza 100 − 75 sullo stesso holdout')
-                    diff = pd.DataFrame([{
-                        'Delta Top1 hit pp': a['Top1 hit %'] - b['Top1 hit %'],
-                        'Delta PLATT Prob. media pp': a['PLATT Prob. media %'] - b['PLATT Prob. media %'],
-                        'Delta PLATT Gap pp': a['PLATT Gap calibrazione pp'] - b['PLATT Gap calibrazione pp'],
-                        'Delta PLATT Brier': a['PLATT Brier'] - b['PLATT Brier'],
-                        'Delta PLATT Log Loss': a['PLATT Log Loss'] - b['PLATT Log Loss'],
-                    }], index=['100 − 75'])
-                    st.dataframe(diff.round(6), use_container_width=True)
-
-            if detail_rows:
-                dd = pd.concat(detail_rows, ignore_index=True)
-                cols = ['Campionato','data','casa','trasferta','top1_hit','top1_prob_raw','top1_prob_platt','platt_applied','Finestra training']
-                cols = [c for c in cols if c in dd.columns]
-                st.markdown('### 4. Export dettaglio holdout')
-                st.download_button(
-                    '⬇️ Scarica V14.15 holdout CSV',
-                    data=dd[cols].to_csv(index=False).encode('utf-8'),
-                    file_name='V14_15_holdout_platt_75_vs_100.csv',
-                    mime='text/csv',
-                    key='v14_15_dl'
-                )
-
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome, msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-mostra_v14_15_holdout_platt(rho_val, ewma_span_val, emivita_val)
-
-
-# =====================================================================
-# 🧊 V14.16 — FINAL FREEZE AUDIT: PLATT TOP1 CON FINESTRA 100
-# Solo diagnostico. Nessuna ottimizzazione: soglia 35% e training=100
-# sono fissati ex ante sulla base dei test precedenti. Valuta il blocco
-# cronologico finale del 20% per ciascun campionato.
-# =====================================================================
-
-V14_16_TRAIN = 100
-V14_16_PROB_THRESHOLD = 0.35
-
-
-def _v14_16_metrics(h):
-    x = h.copy()
-    required = ['top1_hit', 'top1_prob_raw', 'top1_prob_platt']
-    if not all(c in x.columns for c in required):
-        return None
-    x['top1_hit'] = pd.to_numeric(x['top1_hit'], errors='coerce')
-    x['top1_prob_raw'] = pd.to_numeric(x['top1_prob_raw'], errors='coerce')
-    x['top1_prob_platt'] = pd.to_numeric(x['top1_prob_platt'], errors='coerce')
-    x = x.dropna(subset=required)
-    if x.empty:
-        return None
-    y = np.clip(x['top1_hit'].to_numpy(dtype=float), 0.0, 1.0)
-    raw = np.clip(x['top1_prob_raw'].to_numpy(dtype=float), 1e-6, 1.0 - 1e-6)
-    platt = np.clip(x['top1_prob_platt'].to_numpy(dtype=float), 1e-6, 1.0 - 1e-6)
-    return {
-        'N': int(len(x)),
-        'Top1 hit %': 100.0 * float(np.mean(y)),
-        'RAW Prob. media %': 100.0 * float(np.mean(raw)),
-        'PLATT Prob. media %': 100.0 * float(np.mean(platt)),
-        'RAW Gap calibrazione pp': 100.0 * float(np.mean(y - raw)),
-        'PLATT Gap calibrazione pp': 100.0 * float(np.mean(y - platt)),
-        'RAW Brier': float(np.mean((raw - y) ** 2)),
-        'PLATT Brier': float(np.mean((platt - y) ** 2)),
-        'RAW Log Loss': float(-np.mean(y*np.log(raw) + (1.0-y)*np.log(1.0-raw))),
-        'PLATT Log Loss': float(-np.mean(y*np.log(platt) + (1.0-y)*np.log(1.0-platt))),
-        'Delta Brier pp': 100.0 * float(np.mean((platt-y)**2 - (raw-y)**2)),
-        'Delta Log Loss': float(-np.mean(y*np.log(platt) + (1.0-y)*np.log(1.0-platt)) + np.mean(y*np.log(raw) + (1.0-y)*np.log(1.0-raw))),
-    }
-
-
-def mostra_v14_16_final_freeze(rho, ewma_span, emivita):
-    st.divider()
-    st.markdown('## 🧊 V14.16 — FINAL FREEZE AUDIT PLATT TOP1 (TRAIN=100)')
-    st.caption(
-        'Controllo finale diagnostico. Regole fissate: selezione Top1 >=35% e training walk-forward PLATT = 100 osservazioni precedenti dello stesso campionato. '
-        'Il blocco valutato è il 20% cronologico finale. Nessuna selezione tra parametri durante questo test e nessuna modifica alle probabilità operative.'
-    )
-
-    with st.expander('Apri V14.16 — Final Freeze Audit', expanded=False):
-        if st.button('🧊 ESEGUI V14.16 — FINAL FREEZE', key='v14_16_run'):
-            league_rows = []
-            all_holdout = []
-            errors = []
-            with st.spinner('Esecuzione final freeze sulle 5 leghe...'):
-                for camp, info in CAMPIONATI_DOMESTICI.items():
-                    try:
-                        res = _v14_combo_leg(info['id_fd'], rho, ewma_span, emivita, False)
-                        if res is None:
-                            continue
-                        _, det = res
-                        cutoff, holdout_matches = _v14_15_holdout_cut(det)
-                        if cutoff is None or holdout_matches.empty:
-                            continue
-                        wf, _, _ = _v14_12_walkforward_top1(det, V14_16_TRAIN, V14_16_PROB_THRESHOLD)
-                        if wf is None or wf.empty:
-                            continue
-                        wf['data'] = pd.to_datetime(wf['data'], errors='coerce')
-                        h = wf[wf['data'] >= cutoff].copy()
-                        if h.empty:
-                            continue
-                        m = _v14_16_metrics(h)
-                        if m is None:
-                            continue
-                        m['Campionato'] = camp
-                        m['Cutoff holdout'] = cutoff.strftime('%Y-%m-%d')
-                        m['N OOS holdout'] = int(len(holdout_matches))
-                        m['N PLATT applicato'] = int(h['platt_applied'].sum()) if 'platt_applied' in h.columns else int(len(h))
-                        league_rows.append(m)
-                        all_holdout.append(h.assign(Campionato=camp))
-                    except Exception as e:
-                        errors.append((camp, f'{type(e).__name__}: {e}'))
-
-            if league_rows:
-                ldf = pd.DataFrame(league_rows)
-                st.markdown('### 1. Risultato per campionato')
-                cols = [
-                    'Campionato','Cutoff holdout','N OOS holdout','N','N PLATT applicato',
-                    'Top1 hit %','RAW Prob. media %','PLATT Prob. media %',
-                    'RAW Gap calibrazione pp','PLATT Gap calibrazione pp','RAW Brier','PLATT Brier',
-                    'RAW Log Loss','PLATT Log Loss','Delta Brier pp','Delta Log Loss'
-                ]
-                st.dataframe(ldf[[c for c in cols if c in ldf.columns]].round(4), use_container_width=True, hide_index=True)
-
-                weights = ldf['N'].astype(float).to_numpy()
-                agg = {'Periodo':'Holdout cronologico finale','Finestra training':V14_16_TRAIN,'N':int(weights.sum()),'N PLATT applicato':int(ldf['N PLATT applicato'].sum())}
-                for c in ['Top1 hit %','RAW Prob. media %','PLATT Prob. media %','RAW Gap calibrazione pp','PLATT Gap calibrazione pp','RAW Brier','PLATT Brier','RAW Log Loss','PLATT Log Loss','Delta Brier pp','Delta Log Loss']:
-                    agg[c] = float(np.average(ldf[c].astype(float), weights=weights))
-                adf = pd.DataFrame([agg])
-                st.markdown('### 2. Risultato aggregato')
-                st.dataframe(adf.round(4), use_container_width=True, hide_index=True)
-
-                st.markdown('### 3. Regola congelata')
-                st.info(
-                    'Soglia Top1 = 35% · PLATT walk-forward = 100 osservazioni precedenti · stesso campionato · '
-                    'nessuna informazione futura · valutazione sul 20% cronologico finale.'
-                )
-                st.caption(
-                    'Questo pannello non seleziona né riottimizza il parametro: serve esclusivamente come controllo finale del comportamento della regola congelata.'
-                )
-
-                if all_holdout:
-                    dd = pd.concat(all_holdout, ignore_index=True)
-                    cols = ['Campionato','data','casa','trasferta','top1_hit','top1_prob_raw','top1_prob_platt','platt_applied','platt_train_n','platt_reason']
-                    cols = [c for c in cols if c in dd.columns]
-                    st.download_button(
-                        '⬇️ Scarica V14.16 final freeze CSV',
-                        data=dd[cols].to_csv(index=False).encode('utf-8'),
-                        file_name='V14_16_final_freeze_platt100_holdout.csv',
-                        mime='text/csv',
-                        key='v14_16_dl'
-                    )
-
-            if errors:
-                st.warning('Campionati non completati:')
-                for nome, msg in errors:
-                    st.write(f'- **{nome}**: {msg}')
-
-
-# =====================================================================
-# 🧊 V15 — OPERATIVE FREEZE SUMMARY
-# Solo riepilogo della regola attiva; non riottimizza e non altera i parametri.
-# =====================================================================
-def mostra_v15_operational_freeze_summary():
-    st.divider()
-    st.markdown('## 🧊 V15 — REGOLA OPERATIVA CONGELATA')
-    st.info(
-        'Top1 Combo RAW ≥ 35% → PLATT walk-forward = 100 osservazioni precedenti '
-        'dello stesso campionato, con salvaguardia monotona (pendenza > 0). '
-        'La calibrazione modifica la probabilità della Top1, non il ranking delle altre combo. '
-        'Nessuna informazione futura.'
-    )
-
-
-mostra_v15_operational_freeze_summary()
-mostra_v14_16_final_freeze(rho_val, ewma_span_val, emivita_val)
-
-
-# =====================================================================
-# MERCATI AGGIUNTIVI — RISULTATI PER TEMPO, 1T/FINALE E CARTELLINI
-# Blocco aggiuntivo: non modifica lambda, Poisson, Dixon-Coles, 1X2,
-# Combo, ranking Top1 o calibrazione V15. Usa le lambda V15 già calcolate.
-# Per i tempi si ripartisce l'intensità gol in 45% primo tempo / 55%
-# secondo tempo. Per i cartellini si ripartisce la media partita 45/55:
-# sono stime modellistiche, non dati evento/minuto osservati.
-# =====================================================================
-def _combo_prob_score(lam_h, lam_a, max_g=6):
-    from scipy.stats import poisson as _poisson
-    rows = []
-    for h in range(max_g + 1):
-        for a in range(max_g + 1):
-            rows.append((h, a, float(_poisson.pmf(h, lam_h) * _poisson.pmf(a, lam_a))))
-    z = sum(x[2] for x in rows) or 1.0
-    return [(h, a, p / z) for h, a, p in rows]
-
-def _combo_result_sign(h, a):
-    return '1' if h > a else ('X' if h == a else '2')
-
-def _combo_confidence_label(p, gap):
-    # Indicatore descrittivo, NON una calibrazione statistica certificata.
-    if p >= 0.22 and gap >= 0.04:
-        return 'Relativamente più solida'
-    if p >= 0.13:
-        return 'Intermedia'
-    return 'Bassa / molto incerta'
-
-def _combo_team_card_rate(df, team, venue):
-    if df is None or df.empty:
-        return None, 0
-    col_for = 'HY' if venue == 'home' else 'AY'
-    col_red = 'HR' if venue == 'home' else 'AR'
-    team_col = 'HomeTeam' if venue == 'home' else 'AwayTeam'
-    if team_col not in df.columns or col_for not in df.columns:
-        return None, 0
-    x = df[df[team_col].astype(str).str.casefold() == str(team).casefold()].copy()
-    if x.empty:
-        # Fallback tollerante per alias/suffissi dei nomi squadra.
-        x = df[df[team_col].astype(str).str.contains(str(team), case=False, regex=False)]
-    cols = [c for c in [col_for, col_red] if c in x.columns]
-    if not cols or x.empty:
-        return None, 0
-    vals = x[cols].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
-    return float(vals.mean()), int(len(vals))
-
-if '_combo_model_lambdas' in globals() and _combo_model_lambdas is not None and 'partita_sel' in globals():
-    try:
-        _lh, _la = _combo_model_lambdas
-        _home = str(partita_sel.get('HomeTeam', 'Casa'))
-        _away = str(partita_sel.get('AwayTeam', 'Trasferta'))
-
-        st.divider()
-        st.markdown('## 🕒 Previsioni primo e secondo tempo')
-        st.caption('Stime derivate dalle lambda del modello V15, ripartite temporalmente. Le percentuali sono probabilità del singolo punteggio, non garanzie.')
-
-        _h1 = _combo_prob_score(_lh * 0.45, _la * 0.45)
-        _h2 = _combo_prob_score(_lh * 0.55, _la * 0.55)
-        _best1 = max(_h1, key=lambda x: x[2])
-        _best2 = max(_h2, key=lambda x: x[2])
-        _second1 = sorted(_h1, key=lambda x: x[2], reverse=True)[1]
-        _second2 = sorted(_h2, key=lambda x: x[2], reverse=True)[1]
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown('### Risultato esatto più probabile — 1° tempo')
-            st.metric(f'{_best1[0]} - {_best1[1]}', f'{_best1[2]*100:.1f}%')
-            st.caption('Affidabilità: ' + _combo_confidence_label(_best1[2], _best1[2]-_second1[2]))
-        with c2:
-            st.markdown('### Risultato esatto più probabile — 2° tempo')
-            st.metric(f'{_best2[0]} - {_best2[1]}', f'{_best2[2]*100:.1f}%')
-            st.caption('Affidabilità: ' + _combo_confidence_label(_best2[2], _best2[2]-_second2[2]))
-
-        # Probabilità congiunta delle 9 combinazioni 1T/Finale.
-        _joint = {}
-        for a_h, a_a, p_first in _h1:
-            s1 = _combo_result_sign(a_h, a_a)
-            for b_h, b_a, p_second in _h2:
-                sft = _combo_result_sign(a_h+b_h, a_a+b_a)
-                key = f'{s1}-{sft}'
-                _joint[key] = _joint.get(key, 0.0) + p_first*p_second
-        _joint_order = sorted(_joint.items(), key=lambda kv: kv[1], reverse=True)
-        st.markdown('### 🔁 Esito Primo Tempo / Finale (1T/FT)')
-        st.caption('Inserisci facoltativamente le quote che trovi sul bookmaker: il sistema calcola EV e segnala il Value solo quando la quota è presente.')
-        _odds = {}
-        _odd_cols = st.columns(3)
-        for _i, (_key, _prob) in enumerate(_joint_order):
-            with _odd_cols[_i % 3]:
-                _odds[_key] = st.number_input(f'Quota {_key}', min_value=0.0, max_value=1000.0, value=0.0, step=0.05, format='%.2f', key=f'v15_1ft_odds_{_key}')
-        _joint_rows = []
-        for _key, _prob in _joint_order:
-            _odd = float(_odds.get(_key, 0.0))
-            _ev = (_prob * _odd - 1.0) * 100.0 if _odd > 1.0 else None
-            _joint_rows.append({'Combinazione': _key, 'Probabilità stimata': f'{_prob*100:.1f}%', 'Quota inserita': f'{_odd:.2f}' if _odd > 1.0 else '—', 'EV stimato': f'{_ev:+.1f}%' if _ev is not None else '—', 'Value': 'SÌ' if _ev is not None and _ev > 0 else ('NO' if _ev is not None else '—')})
-        st.dataframe(pd.DataFrame(_joint_rows), use_container_width=True, hide_index=True)
-        st.success(f'Combinazione 1T/FT più probabile: **{_joint_order[0][0]}** — {_joint_order[0][1]*100:.1f}%')
-        st.caption('Le 9 combinazioni sono calcolate con la distribuzione congiunta dei due tempi. EV = probabilità stimata × quota − 1; il Value è solo un confronto matematico con la quota inserita, non una garanzia di profitto.')
-
-        # Cartellini: football-data fornisce conteggi totali per gara, non il minuto.
-        # La divisione 45/55 è una stima esplicita, non una ricostruzione degli eventi.
-        _df_cards = globals().get('dati_filtrati', None)
-        _hc, _nh = _combo_team_card_rate(_df_cards, _home, 'home')
-        _ac, _na = _combo_team_card_rate(_df_cards, _away, 'away')
-        if _hc is not None and _ac is not None:
-            _card1_h, _card1_a = _hc*0.45, _ac*0.45
-            _card2_h, _card2_a = _hc*0.55, _ac*0.55
-            def _prob_more_cards(x, y):
-                # Skellam discreta via somma Poisson; restituisce casa, pari, trasferta.
-                from scipy.stats import poisson as _poisson
-                nmax = 12
-                px = _poisson.pmf(range(nmax+1), max(0.01, x))
-                py = _poisson.pmf(range(nmax+1), max(0.01, y))
-                ph = pd = pa = 0.0
-                for i in range(nmax+1):
-                    for j in range(nmax+1):
-                        z = float(px[i]*py[j])
-                        if i > j: ph += z
-                        elif i == j: pd += z
-                        else: pa += z
-                total = ph+pd+pa or 1.0
-                return ph/total, pd/total, pa/total
-            _p1c = _prob_more_cards(_card1_h, _card1_a)
-            _p2c = _prob_more_cards(_card2_h, _card2_a)
-            st.markdown('### 🟨 Squadra con più cartellini')
-            _card_rows = []
-            for _period, _probs in [('1° tempo', _p1c), ('2° tempo', _p2c)]:
-                _card_rows.extend([
-                    {'Tempo': _period, 'Esito': _home, 'Probabilità': f'{_probs[0]*100:.1f}%'},
-                    {'Tempo': _period, 'Esito': 'Pari cartellini', 'Probabilità': f'{_probs[1]*100:.1f}%'},
-                    {'Tempo': _period, 'Esito': _away, 'Probabilità': f'{_probs[2]*100:.1f}%'}
+                # Liste ordinate: bisect_left conta solo risultati con data strettamente precedente.
+                for comp in v19_dates_by_comp:
+                    v19_dates_by_comp[comp].sort()
+
+                v19_loaded_rows = []
+                v19_reconciled = 0
+                for item in v19_prepared:
+                    if item["key"] in v19_eval_keys:
+                        v19_reconciled += 1
+                        continue
+                    comp = item["comp"]
+                    date_norm = item["date_norm"]
+                    if not item["valid_date"] or not item["valid_score"]:
+                        reason = "Dati data/risultato mancanti o non validi"
+                        n_prior = np.nan
+                    else:
+                        n_prior = bisect_left(v19_dates_by_comp.get(str(comp), []), date_norm.date())
+                        if n_prior < 30:
+                            reason = "Storico pre-partita insufficiente (<30; stessa data esclusa)"
+                        else:
+                            reason = "Non riconciliata con audit: verificare data/nomi/competizione"
+                    v19_loaded_rows.append({
+                        "Competizione": comp,
+                        "Data": item["date_day"] if item["date_day"] else str(item["date_value"]),
+                        "Casa": item["home"], "Trasferta": item["away"],
+                        "Gol casa": item["score"].get("home"),
+                        "Gol trasferta": item["score"].get("away"),
+                        "Storico precedente stessa competizione": n_prior,
+                        "Motivo esclusione diagnosticato": reason,
+                    })
+
+                df_v19_escluse = pd.DataFrame(v19_loaded_rows)
+                # Riepilogo di stato sempre visibile, anche quando non ci sono esclusioni.
+                n_v19_caricate = len(v19_prepared)
+                n_v19_non_valutate = len(df_v19_escluse)
+                n_v19_storico_insuff = int(df_v19_escluse["Motivo esclusione diagnosticato"].eq("Storico pre-partita insufficiente (<30; stessa data esclusa)").sum()) if not df_v19_escluse.empty else 0
+                n_v19_dati_invalidi = int(df_v19_escluse["Motivo esclusione diagnosticato"].eq("Dati data/risultato mancanti o non validi").sum()) if not df_v19_escluse.empty else 0
+                n_v19_non_riconciliate = int(df_v19_escluse["Motivo esclusione diagnosticato"].str.startswith("Non riconciliata", na=False).sum()) if not df_v19_escluse.empty else 0
+                n_v19_somma = v19_reconciled + n_v19_non_valutate
+                k_v19a, k_v19b, k_v19c, k_v19d = str_lit.columns(4)
+                k_v19a.metric("Partite caricate", f"{n_v19_caricate:,}".replace(",", "."))
+                k_v19b.metric("Riconciliate con audit", f"{v19_reconciled:,}".replace(",", "."))
+                k_v19c.metric("Non valutate", f"{n_v19_non_valutate:,}".replace(",", "."))
+                k_v19d.metric("Controllo totale", "PASS" if n_v19_somma == n_v19_caricate else f"DIFF. {n_v19_somma - n_v19_caricate:+d}")
+                df_v19_cause = pd.DataFrame([
+                    {"Causa": "Storico pre-partita insufficiente (<30; stessa data esclusa)", "Partite": n_v19_storico_insuff},
+                    {"Causa": "Dati data/risultato mancanti o non validi", "Partite": n_v19_dati_invalidi},
+                    {"Causa": "Non riconciliate: verificare data/nomi/competizione", "Partite": n_v19_non_riconciliate},
                 ])
-            st.dataframe(pd.DataFrame(_card_rows), use_container_width=True, hide_index=True)
-            st.caption(f'Medie totali usate: {_home} { _hc:.2f} cartellini/gara (campione { _nh}); {_away} {_ac:.2f} (campione {_na}). Ripartizione temporale convenzionale 45%/55% perché la fonte storica non riporta il minuto dei cartellini. Stima indicativa, da validare con dati per tempo.')
+                str_lit.markdown("**Riepilogo globale delle cause di esclusione**")
+                str_lit.dataframe(df_v19_cause, use_container_width=True, hide_index=True)
+                if not df_v19_escluse.empty:
+                    df_v19_escluse_summary = df_v19_escluse.groupby(["Competizione", "Motivo esclusione diagnosticato"], dropna=False).size().reset_index(name="Partite escluse")
+                    str_lit.markdown("**Cause di esclusione per competizione**")
+                    str_lit.dataframe(df_v19_escluse_summary, use_container_width=True, hide_index=True)
+                    str_lit.download_button("📥 Scarica riepilogo esclusioni V19.7.3 CSV", df_v19_escluse_summary.to_csv(index=False).encode("utf-8-sig"), "v1973_riepilogo_esclusioni.csv", "text/csv")
+                    with str_lit.expander("Dettaglio delle partite non valutate", expanded=True):
+                        str_lit.dataframe(df_v19_escluse, use_container_width=True, hide_index=True)
+                        str_lit.download_button("📥 Scarica dettaglio esclusioni V19.7.3 CSV", df_v19_escluse.to_csv(index=False).encode("utf-8-sig"), "v1973_dettaglio_esclusioni.csv", "text/csv")
+                else:
+                    str_lit.success("Nessuna partita caricata risulta esclusa dall'audit.")
+                if n_v19_somma == n_v19_caricate and n_v19_non_riconciliate == 0 and n_v19_dati_invalidi == 0:
+                    str_lit.success("Riconciliazione completa: tutte le partite caricate sono o valutate o escluse per storico precedente insufficiente.")
+                elif n_v19_somma != n_v19_caricate or n_v19_non_riconciliate > 0 or n_v19_dati_invalidi > 0:
+                    str_lit.warning("Riconciliazione da approfondire: sono presenti differenze o cause diverse dallo storico insufficiente.")
+
+                str_lit.markdown("##### 13. V19 — Verifica causale del training WF")
+                if not df_v15_test.empty and "Training usato V15" in df_v15_test.columns:
+                    v19_train = df_v15_test.copy()
+                    v19_train["Training usato V15"] = pd.to_numeric(v19_train["Training usato V15"], errors="coerce")
+                    v19_valid_train = v19_train[v19_train["P(NG) calibrata WF"].notna()].copy()
+                    if "Data ultimo training V15" in v19_valid_train.columns:
+                        v19_train["Data ultimo training V15"] = pd.to_datetime(v19_train["Data ultimo training V15"], errors="coerce", utc=True)
+                        v19_train["_target_dt"] = pd.to_datetime(v19_train["Data"], errors="coerce", utc=True)
+                        v19_train_rows = v19_train[v19_train["P(NG) calibrata WF"].notna()].copy()
+                        v19_train_rows["Data ultimo training V15"] = pd.to_datetime(v19_train_rows["Data ultimo training V15"], errors="coerce", utc=True)
+                        v19_train_rows["_target_dt"] = pd.to_datetime(v19_train_rows["Data"], errors="coerce", utc=True)
+                        v19_train_rows["Training strettamente precedente"] = (
+                            v19_train_rows["Data ultimo training V15"].notna() & v19_train_rows["_target_dt"].notna()
+                            & (v19_train_rows["Data ultimo training V15"].dt.date < v19_train_rows["_target_dt"].dt.date)
+                        )
+                        causal_ok = int(v19_train_rows["Training strettamente precedente"].sum())
+                        causal_bad = int((~v19_train_rows["Training strettamente precedente"]).sum())
+                        v19_train_summary = pd.DataFrame([{
+                            "Test No Goal con calibrazione WF": int(len(v19_train_rows)),
+                            "Training minimo osservato": int(v19_train_rows["Training usato V15"].min()) if not v19_train_rows.empty else np.nan,
+                            "Training massimo osservato": int(v19_train_rows["Training usato V15"].max()) if not v19_train_rows.empty else np.nan,
+                            "Ultimo training strettamente precedente": causal_ok,
+                            "Casi non verificati/non causali": causal_bad,
+                            "Esito controllo": "PASS" if causal_bad == 0 and not v19_train_rows.empty else "ATTENZIONE",
+                        }])
+                        str_lit.dataframe(v19_train_summary, use_container_width=True, hide_index=True)
+                        str_lit.download_button("📥 Scarica controllo training V19 CSV", v19_train_summary.to_csv(index=False).encode("utf-8-sig"), "v19_controllo_training.csv", "text/csv")
+                        if causal_bad:
+                            str_lit.warning("Alcune righe non hanno una data training strettamente precedente verificabile; controllare il dettaglio prima di dichiarare PASS.")
+                    else:
+                        str_lit.warning("Colonne data ultimo training non disponibili: eseguire il calcolo aggiornato e verificare il risultato.")
+
+                str_lit.markdown("##### 14. V19.3 — Focus Bundesliga per fascia RAW (campione separato)")
+                v19_bg = df_v18_all[df_v18_all["Competizione"].astype(str).str.contains("Bundesliga", case=False, na=False)].copy() if "Competizione" in df_v18_all.columns else pd.DataFrame()
+                if not v19_bg.empty:
+                    v19_bg = v19_bg.loc[mask_v18_ng.reindex(v19_bg.index, fill_value=False)].copy()
+                    str_lit.caption(f"Sottoinsieme Bundesliga soltanto: {len(v19_bg):,} partite appaiate RAW/WF. Questo conteggio è distinto dal campione globale No Goal, che comprende tutte le competizioni.")
+                    v19_bg["Fascia P(No Goal) RAW"] = pd.cut(v19_bg["P(NG) raw"], bins=[0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1.000001], right=False,
+                                                                  labels=["0-10%", "10-20%", "20-30%", "30-40%", "40-50%", "50-60%", "60-70%", "70-80%", "80-90%", "90-100%"])
+                    v19_bins = []
+                    for fascia, gg in v19_bg.groupby("Fascia P(No Goal) RAW", observed=False, dropna=False):
+                        if gg.empty:
+                            continue
+                        yy = gg["NG y"].to_numpy(dtype=float)
+                        pr = gg["P(NG) raw"].to_numpy(dtype=float)
+                        pw = gg["P(NG) calibrata WF"].to_numpy(dtype=float)
+                        br, lr = _calcola_metriche_binaria(pr, yy)
+                        bw, lw = _calcola_metriche_binaria(pw, yy)
+                        v19_bins.append({"Fascia RAW": str(fascia), "Partite": int(len(gg)),
+                                         "P NG RAW media (%)": 100*float(np.mean(pr)), "No Goal reale (%)": 100*float(np.mean(yy)),
+                                         "Brier RAW": br, "Brier WF": bw, "Delta Brier": bw-br,
+                                         "LogLoss RAW": lr, "LogLoss WF": lw, "Delta LogLoss": lw-lr,
+                                         "Affidabilità campione": "Basso n (<50)" if len(gg)<50 else ("Medio n (50-99)" if len(gg)<100 else "Almeno 100")})
+                    df_v19_bins = pd.DataFrame(v19_bins)
+                    if not df_v19_bins.empty:
+                        # Riga totale per mostrare la riconciliazione delle fasce Bundesliga.
+                        yy_all = v19_bg["NG y"].to_numpy(dtype=float)
+                        pr_all = v19_bg["P(NG) raw"].to_numpy(dtype=float)
+                        pw_all = v19_bg["P(NG) calibrata WF"].to_numpy(dtype=float)
+                        br_all, lr_all = _calcola_metriche_binaria(pr_all, yy_all)
+                        bw_all, lw_all = _calcola_metriche_binaria(pw_all, yy_all)
+                        totale_bg = pd.DataFrame([{
+                            "Fascia RAW": "TOTALE BUNDESLIGA",
+                            "Partite": int(len(v19_bg)),
+                            "P NG RAW media (%)": 100*float(np.mean(pr_all)),
+                            "No Goal reale (%)": 100*float(np.mean(yy_all)),
+                            "Brier RAW": br_all, "Brier WF": bw_all, "Delta Brier": bw_all-br_all,
+                            "LogLoss RAW": lr_all, "LogLoss WF": lw_all, "Delta LogLoss": lw_all-lr_all,
+                            "Affidabilità campione": "Basso n (<50)" if len(v19_bg)<50 else ("Medio n (50-99)" if len(v19_bg)<100 else "Almeno 100")
+                        }])
+                        df_v19_bins = pd.concat([df_v19_bins, totale_bg], ignore_index=True)
+                        somma_fasce_bg = int(df_v19_bins.loc[df_v19_bins["Fascia RAW"] != "TOTALE BUNDESLIGA", "Partite"].sum())
+                        str_lit.caption(f"Riconciliazione focus Bundesliga: {somma_fasce_bg} partite nelle fasce; {len(v19_bg)} partite nel sottoinsieme globale appaiato.")
+                        if somma_fasce_bg != len(v19_bg):
+                            str_lit.warning("Le fasce Bundesliga non riconciliano: alcune probabilità potrebbero essere fuori fascia o mancanti.")
+                        str_lit.dataframe(df_v19_bins.round(5), use_container_width=True, hide_index=True)
+                        str_lit.download_button("📥 Scarica focus Bundesliga V19.3 CSV", df_v19_bins.to_csv(index=False).encode("utf-8-sig"), "v19_3_bundesliga_fasce_nogoal.csv", "text/csv")
+                else:
+                    str_lit.info("Nessuna riga Bundesliga disponibile per il focus per fascia.")
+                # V19.4: stabilità temporale del confronto RAW/WF per la sola Bundesliga.
+                # Stesso campione appaiato; solo diagnostica, nessuna modifica al modello operativo.
+                str_lit.markdown("##### 15. V19.5 — Bundesliga: verifica calendario e confronto RAW/WF per periodo")
+                v194_bg = df_v18_all[df_v18_all["Competizione"].astype(str).str.contains("Bundesliga", case=False, na=False)].copy() if "Competizione" in df_v18_all.columns else pd.DataFrame()
+                if not v194_bg.empty:
+                    v194_bg = v194_bg.loc[mask_v18_ng.reindex(v194_bg.index, fill_value=False)].copy()
+                    # V19.5: normalizzazione esplicita alla data UTC; i dati football-data
+                    # sono date di calendario, quindi l'assegnazione dei periodi non usa l'ora.
+                    v194_bg["Data originale"] = v194_bg["Data"].astype(str)
+                    v194_bg["Data"] = pd.to_datetime(v194_bg["Data"], errors="coerce", utc=True).dt.normalize()
+                    v194_bg = v194_bg.dropna(subset=["Data", "P(NG) raw", "P(NG) calibrata WF", "NG y"]).copy()
+                    v194_bg["Anno calendario"] = v194_bg["Data"].dt.year.astype(int)
+                    v194_bg["Mese calendario"] = v194_bg["Data"].dt.month.astype(int)
+                    v194_bg["Mese"] = v194_bg["Data"].dt.strftime("%Y-%m")
+                    v194_bg["Stagione calcistica"] = np.where(
+                        v194_bg["Mese calendario"] >= 7,
+                        v194_bg["Anno calendario"].astype(str) + "/" + (v194_bg["Anno calendario"] + 1).astype(str).str[-2:],
+                        (v194_bg["Anno calendario"] - 1).astype(str) + "/" + v194_bg["Anno calendario"].astype(str).str[-2:]
+                    )
+                    v194_bg["Semestre"] = v194_bg["Anno calendario"].astype(str) + "-S" + np.where(v194_bg["Mese calendario"] <= 6, "1", "2")
+
+                    def _v194_metriche(gruppo, nome, etichetta):
+                        righe = []
+                        for chiave, gg in gruppo.groupby(nome, dropna=False, sort=True):
+                            yy = gg["NG y"].to_numpy(dtype=float)
+                            raw = gg["P(NG) raw"].to_numpy(dtype=float)
+                            wf = gg["P(NG) calibrata WF"].to_numpy(dtype=float)
+                            br, lr = _calcola_metriche_binaria(raw, yy)
+                            bw, lw = _calcola_metriche_binaria(wf, yy)
+                            n = len(gg)
+                            righe.append({
+                                etichetta: str(chiave), "Partite appaiate": int(n),
+                                "No Goal reali (%)": 100 * float(np.mean(yy)),
+                                "P NG RAW media (%)": 100 * float(np.mean(raw)),
+                                "P NG WF media (%)": 100 * float(np.mean(wf)),
+                                "Brier RAW": br, "Brier WF": bw, "Delta Brier WF - RAW": bw - br,
+                                "LogLoss RAW": lr, "LogLoss WF": lw, "Delta LogLoss WF - RAW": lw - lr,
+                                "Entrambe migliorano": "Sì" if bw < br and lw < lr else "No",
+                                "Affidabilità campione": "Molto basso n (<30)" if n < 30 else ("Basso n (30-99)" if n < 100 else "Almeno 100")
+                            })
+                        return pd.DataFrame(righe)
+
+                    df_v194_stagioni = _v194_metriche(v194_bg, "Stagione calcistica", "Stagione calcistica")
+                    df_v194_sem = _v194_metriche(v194_bg, "Semestre", "Semestre")
+                    str_lit.caption("Le stagioni calcistiche sono luglio–giugno; i semestri sono gennaio–giugno (S1) e luglio–dicembre (S2). Perciò 2025/26 = 2025-S2 + 2026-S1. Delta negativo indica una metrica migliore con WF; i gruppi piccoli sono indicativi.")
+                    if not df_v194_stagioni.empty:
+                        str_lit.markdown("###### Bundesliga per stagione calcistica")
+                        str_lit.dataframe(df_v194_stagioni.round(5), use_container_width=True, hide_index=True)
+                        str_lit.download_button("📥 Scarica Bundesliga per stagione V19.5 CSV", df_v194_stagioni.to_csv(index=False).encode("utf-8-sig"), "v19_5_bundesliga_per_stagione.csv", "text/csv")
+                    if not df_v194_sem.empty:
+                        str_lit.markdown("###### Bundesliga per semestre")
+                        str_lit.dataframe(df_v194_sem.round(5), use_container_width=True, hide_index=True)
+                        str_lit.download_button("📥 Scarica Bundesliga per semestre V19.5 CSV", df_v194_sem.to_csv(index=False).encode("utf-8-sig"), "v19_5_bundesliga_per_semestre.csv", "text/csv")
+
+                    # V19.5: analisi mensile per localizzare eventuali cambi di regime.
+                    str_lit.markdown("###### V19.5 — Bundesliga per mese (stesso campione appaiato RAW/WF)")
+                    df_v195_mesi = _v194_metriche(v194_bg, "Mese", "Mese")
+                    if not df_v195_mesi.empty:
+                        str_lit.dataframe(df_v195_mesi.round(5), use_container_width=True, hide_index=True)
+                        str_lit.download_button("📥 Scarica Bundesliga per mese V19.5 CSV", df_v195_mesi.to_csv(index=False).encode("utf-8-sig"), "v19_5_bundesliga_per_mese.csv", "text/csv")
+
+                    # Riconciliazione: le righe mensili, semestrali e stagionali devono
+                    # rappresentare esattamente lo stesso insieme di partite.
+                    n_base = int(len(v194_bg))
+                    n_mesi = int(df_v195_mesi["Partite appaiate"].sum()) if not df_v195_mesi.empty else 0
+                    n_sem = int(df_v194_sem["Partite appaiate"].sum()) if not df_v194_sem.empty else 0
+                    n_stag = int(df_v194_stagioni["Partite appaiate"].sum()) if not df_v194_stagioni.empty else 0
+                    df_v195_ric = pd.DataFrame([
+                        {"Livello": "Campione base appaiato", "Partite": n_base, "Differenza dal campione": 0},
+                        {"Livello": "Somma gruppi mensili", "Partite": n_mesi, "Differenza dal campione": n_mesi - n_base},
+                        {"Livello": "Somma gruppi semestrali", "Partite": n_sem, "Differenza dal campione": n_sem - n_base},
+                        {"Livello": "Somma gruppi stagionali", "Partite": n_stag, "Differenza dal campione": n_stag - n_base},
+                    ])
+                    str_lit.markdown("###### V19.5 — Riconciliazione indipendente dei conteggi")
+                    str_lit.dataframe(df_v195_ric, use_container_width=True, hide_index=True)
+                    if (n_mesi == n_base) and (n_sem == n_base) and (n_stag == n_base):
+                        str_lit.success(f"PASS conteggi: {n_base} partite appaiate riconciliate per mese, semestre e stagione.")
+                    else:
+                        str_lit.error("ATTENZIONE: almeno una suddivisione temporale non riconcilia con il campione appaiato.")
+                    str_lit.download_button("📥 Scarica riconciliazione V19.5 CSV", df_v195_ric.to_csv(index=False).encode("utf-8-sig"), "v19_5_riconciliazione_conteggi.csv", "text/csv")
+
+                    # Verifica esplicita della relazione calendario: stagione luglio-giugno.
+                    # Es. 2025/26 = 2025-S2 + 2026-S1; 2026/27 = 2026-S2 + 2027-S1.
+                    df_v195_cross = pd.crosstab(v194_bg["Stagione calcistica"], v194_bg["Semestre"], margins=True, margins_name="TOTALE").reset_index()
+                    str_lit.markdown("###### V19.5 — Matrice stagione × semestre")
+                    str_lit.caption("Le etichette sono coerenti se una stagione luglio–giugno include il semestre S2 dello stesso anno e S1 dell'anno successivo.")
+                    str_lit.dataframe(df_v195_cross, use_container_width=True, hide_index=True)
+                    str_lit.download_button("📥 Scarica matrice stagione-semestre V19.5 CSV", df_v195_cross.to_csv(index=False).encode("utf-8-sig"), "v19_5_matrice_stagione_semestre.csv", "text/csv")
+
+                    # Esporta il dettaglio del semestre 2026-S1, il gruppo che ha mostrato
+                    # il peggioramento maggiore. È solo materiale diagnostico.
+                    v195_focus = v194_bg.loc[v194_bg["Semestre"].eq("2026-S1")].copy()
+                    if not v195_focus.empty:
+                        v195_focus["Delta probabilità WF-RAW (pp)"] = (v195_focus["P(NG) calibrata WF"] - v195_focus["P(NG) raw"]) * 100
+                        v195_focus["Errore quadratico RAW"] = (v195_focus["P(NG) raw"] - v195_focus["NG y"]) ** 2
+                        v195_focus["Errore quadratico WF"] = (v195_focus["P(NG) calibrata WF"] - v195_focus["NG y"]) ** 2
+                        cols_focus = [c for c in ["Data", "Competizione", "Casa", "Trasferta", "Gol casa reali", "Gol trasferta reali", "NG y", "P(NG) raw", "P(NG) calibrata WF", "Delta probabilità WF-RAW (pp)", "Training usato V15"] if c in v195_focus.columns]
+                        str_lit.markdown("###### V19.5 — Dettaglio partite Bundesliga 2026-S1")
+                        str_lit.caption("Consente di vedere se il salto RAW→WF è concentrato in date o partite specifiche; le probabilità sono mostrate come frazioni originali nel CSV.")
+                        str_lit.dataframe(v195_focus[cols_focus].sort_values("Data").round(5), use_container_width=True, hide_index=True)
+                        str_lit.download_button("📥 Scarica dettaglio Bundesliga 2026-S1 V19.5 CSV", v195_focus[cols_focus].sort_values("Data").to_csv(index=False).encode("utf-8-sig"), "v19_5_bundesliga_dettaglio_2026_S1.csv", "text/csv")
+
+                        # V19.7: audit esplicito del training effettivo e dei parametri Platt.
+                        str_lit.markdown("###### V19.7 — Audit del training WF No Goal (diagnostica soltanto)")
+                        str_lit.caption("Verifica per ogni partita quante righe valide entrano nel fit, quante date distinte coprono, prevalenza No Goal del training, parametri Platt e ultima data usata. Nessuna previsione operativa viene modificata.")
+                        cols_v196 = [c for c in ["Data", "Casa", "Trasferta", "NG y", "P(NG) raw", "P(NG) calibrata WF", "Training usato V15", "NG training righe valide", "NG training date uniche", "NG training prevalenza (%)", "Pendenza Platt NG", "Intercetta Platt NG", "Ultima data training NG", "Check training NG"] if c in v195_focus.columns]
+                        v196_focus = v195_focus[cols_v196].sort_values("Data").copy()
+                        str_lit.dataframe(v196_focus.round(5), use_container_width=True, hide_index=True)
+                        n_check_pass = int(v196_focus["Check training NG"].eq("PASS").sum()) if "Check training NG" in v196_focus.columns else 0
+                        n_check_bad = int(v196_focus["Check training NG"].eq("VERIFICARE").sum()) if "Check training NG" in v196_focus.columns else len(v196_focus)
+                        if n_check_bad == 0 and len(v196_focus) > 0:
+                            str_lit.success(f"V19.7 training NG: {n_check_pass}/{len(v196_focus)} righe PASS su conteggio e causalità.")
+                        else:
+                            str_lit.warning(f"V19.7 training NG: {n_check_pass} PASS e {n_check_bad} righe da verificare. Il flag è diagnostico, non modifica il fit.")
+                        str_lit.download_button("📥 Scarica audit training WF V19.7 CSV", v196_focus.to_csv(index=False).encode("utf-8-sig"), "v19_6_audit_training_wf_bundesliga_2026_S1.csv", "text/csv")
+
+                    str_lit.success(f"V19.5/V19.7: {n_base} partite Bundesliga appaiate; metriche confrontate sulle stesse righe RAW/WF.")
+                else:
+                    str_lit.info("Nessuna partita Bundesliga appaiata RAW/WF disponibile per l'analisi temporale.")
+                str_lit.info("V19.5/V19.7 sono esclusivamente diagnostiche: non modificano probabilità operative, lambda, classifiche o ranking Combo.")
+            else:
+                str_lit.warning("Diagnostica V16 No Goal non disponibile: mancano colonne necessarie nel risultato walk-forward.")
+
+        if not df_v15_test.empty:
+            with str_lit.expander("Dettaglio delle correzioni walk-forward (solo test, non operative)", expanded=False):
+                cols_v15 = [c for c in ["Data", "Competizione", "Casa", "Trasferta", "Training usato V15", "Fattore casa WF", "Fattore trasferta WF", "P(X) %", "P(X) calibrata WF", "P(No Goal) %", "P(NG) calibrata WF", "P(NG) lambda corretta WF"] if c in df_v15_test.columns]
+                df_v15_display = df_v15_test[cols_v15].copy()
+                for col_pct in ["P(X) calibrata WF", "P(NG) calibrata WF", "P(1) lambda corretta WF", "P(X) lambda corretta WF", "P(2) lambda corretta WF", "P(NG) lambda corretta WF"]:
+                    if col_pct in df_v15_display.columns:
+                        df_v15_display[col_pct] = pd.to_numeric(df_v15_display[col_pct], errors="coerce") * 100.0
+                str_lit.dataframe(df_v15_display.round(3), use_container_width=True, hide_index=True)
+                df_v15_download = df_v15_test.copy()
+                for col_pct in ["P(X) calibrata WF", "P(NG) calibrata WF", "P(1) lambda corretta WF", "P(X) lambda corretta WF", "P(2) lambda corretta WF", "P(NG) lambda corretta WF"]:
+                    if col_pct in df_v15_download.columns:
+                        df_v15_download[col_pct] = pd.to_numeric(df_v15_download[col_pct], errors="coerce") * 100.0
+                str_lit.download_button("📥 Scarica confronto diagnostico V16 CSV", df_v15_download.to_csv(index=False).encode("utf-8-sig"), "audit_diagnostica_v16_walk_forward.csv", "text/csv")
+
+        # V12: confronto con baseline empirica walk-forward; il modello operativo resta invariato.
+        str_lit.markdown("#### 🔎 V15 — Audit esteso, campione comune e stabilità temporale")
+        str_lit.caption(
+            "Mantiene i controlli precedenti e amplia il campione storico a più competizioni. Verifica il campione comune Poisson/baseline, la causalità "
+            "della baseline e la stabilità per competizione e anno. La baseline usa solo risultati "
+            "precedenti della stessa competizione con smoothing Laplace. Nessuna modifica alle previsioni operative."
+        )
+        max_delta_ng = pd.to_numeric(df_audit["Delta controllo No Goal (pp)"], errors="coerce").abs().max()
+        etichette_ok = int(pd.to_numeric(df_audit["Controllo etichetta No Goal"], errors="coerce").fillna(0).sum())
+        somma_1x2_max_err = (pd.to_numeric(df_audit["Somma P(1X2) (%)"], errors="coerce") - 100).abs().max()
+        k1, k2, k3, k4 = str_lit.columns(4)
+        k1.metric("Partite controllate", f"{len(df_audit)}")
+        k2.metric("Etichette No Goal coerenti", f"{etichette_ok}/{len(df_audit)}")
+        k3.metric("Max differenza formula NG", f"{max_delta_ng:.4f} pp")
+        k4.metric("Max errore somma 1X2", f"{somma_1x2_max_err:.6f} pp")
+        if etichette_ok == len(df_audit) and somma_1x2_max_err < 0.01:
+            str_lit.success("Controlli di coerenza superati: etichette No Goal e somma 1X2 corrette nel campione.")
         else:
-            st.info('Previsione cartellini non disponibile: nel campione storico mancano colonne o osservazioni sufficienti.')
-    except Exception as _extra_err:
-        st.warning(f'Previsioni aggiuntive non calcolate: {type(_extra_err).__name__}: {_extra_err}')
+            str_lit.error("Attenzione: almeno un controllo di coerenza non è superato. Verificare le righe dettagliate.")
+        with str_lit.expander("Dettaglio tecnico per partita", expanded=False):
+            cols_check = ["Data", "Casa", "Trasferta", "Gol casa reali", "Gol trasferta reali", "P(No Goal) %", "P(No Goal) formula esatta (%)", "Delta controllo No Goal (pp)", "No Goal reale", "Controllo etichetta No Goal", "Somma P(1X2) (%)", "Storico pre-partita"]
+            str_lit.dataframe(df_audit[cols_check].round(4), use_container_width=True, hide_index=True)
+        n = len(df_audit)
+        freq_x_reale = (df_audit["Esito reale"] == "X").mean() * 100
+        prob_x_media = df_audit["P(X) %"].mean()
+        freq_x_prevista = df_audit["X prevista come segno"].mean() * 100
+        freq_ng_reale = df_audit["No Goal reale"].mean() * 100
+        prob_ng_media = df_audit["P(No Goal) %"].mean()
+        freq_ng_favorito = df_audit["No Goal favorito"].mean() * 100
+
+        a1, a2, a3 = str_lit.columns(3)
+        a1.metric("Partite valutate", f"{n}", "solo walk-forward")
+        a2.metric("Pareggi reali", f"{freq_x_reale:.1f}%", f"P(X) media {prob_x_media:.1f}% · scarto {prob_x_media-freq_x_reale:+.1f} pp")
+        a3.metric("Segno X più probabile", f"{freq_x_prevista:.1f}%", "frequenza delle previsioni X")
+
+        b1, b2, b3 = str_lit.columns(3)
+        b1.metric("No Goal reali", f"{freq_ng_reale:.1f}%")
+        b2.metric("P(No Goal) media", f"{prob_ng_media:.1f}%", f"scarto {prob_ng_media-freq_ng_reale:+.1f} pp")
+        b3.metric("No Goal favorito", f"{freq_ng_favorito:.1f}%", "partite in cui P(No Goal) > P(Goal)")
+
+        c1, c2, c3, c4 = str_lit.columns(4)
+        c1.metric("Brier 1X2", f"{df_audit['Brier 1X2'].mean():.4f}", "più basso è meglio")
+        c2.metric("Log Loss 1X2", f"{df_audit['Log Loss 1X2'].mean():.4f}", "più basso è meglio")
+        c3.metric("Brier Goal/No Goal", f"{df_audit['Brier Goal/No Goal'].mean():.4f}", "più basso è meglio")
+        c4.metric("Log Loss Goal/No Goal", f"{df_audit['Log Loss Goal/No Goal'].mean():.4f}", "più basso è meglio")
+
+        str_lit.markdown("#### 📈 Probabilità previste vs frequenze reali")
+        confronto = pd.DataFrame({
+            "Indicatore": ["Pareggio X", "No Goal"],
+            "Probabilità media modello (%)": [prob_x_media, prob_ng_media],
+            "Frequenza reale (%)": [freq_x_reale, freq_ng_reale],
+        })
+        fig_audit = px.bar(
+            confronto, x="Indicatore", y=["Probabilità media modello (%)", "Frequenza reale (%)"],
+            barmode="group", template="plotly_dark", title="Calibrazione empirica — modello contro risultati reali"
+        )
+        str_lit.plotly_chart(fig_audit, use_container_width=True)
+
+        # Diagnostica aggiuntiva: frequenza reale dentro fasce di probabilità.
+        str_lit.markdown("#### 🔬 Calibrazione per fasce di probabilità")
+        fasce = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100.000001]
+        etichette = ["0–10%", "10–20%", "20–30%", "30–40%", "40–50%", "50–60%", "60–70%", "70–80%", "80–90%", "90–100%"]
+
+        df_x_bin = df_audit[["P(X) %", "Esito reale"]].copy()
+        df_x_bin["X reale"] = (df_x_bin["Esito reale"] == "X").astype(int)
+        df_x_bin["Fascia probabilità"] = pd.cut(df_x_bin["P(X) %"].clip(0, 100), bins=fasce, labels=etichette, right=True, include_lowest=True)
+        cal_x = df_x_bin.groupby("Fascia probabilità", observed=False).agg(
+            Partite=("X reale", "size"), **{"Probabilità media (%)": ("P(X) %", "mean"), "Frequenza reale (%)": ("X reale", lambda x: 100*x.mean())}
+        ).reset_index()
+        cal_x = cal_x[cal_x["Partite"] > 0].copy()
+        cal_x["Scarto (pp)"] = cal_x["Probabilità media (%)"] - cal_x["Frequenza reale (%)"]
+        str_lit.caption("Pareggio X: la frequenza reale in tabella è la quota di pareggi osservati dentro ciascuna fascia P(X).")
+        str_lit.dataframe(cal_x.round(2), use_container_width=True, hide_index=True)
+
+
+        df_ng_bin = df_audit[["P(No Goal) %", "No Goal reale"]].copy()
+        df_ng_bin["Fascia probabilità"] = pd.cut(df_ng_bin["P(No Goal) %"].clip(0, 100), bins=fasce, labels=etichette, right=True, include_lowest=True)
+        cal_ng = df_ng_bin.groupby("Fascia probabilità", observed=False).agg(
+            Partite=("No Goal reale", "size"), **{"Probabilità media (%)": ("P(No Goal) %", "mean"), "Frequenza reale (%)": ("No Goal reale", lambda x: 100*x.mean())}
+        ).reset_index()
+        cal_ng = cal_ng[cal_ng["Partite"] > 0].copy()
+        cal_ng["Scarto (pp)"] = cal_ng["Probabilità media (%)"] - cal_ng["Frequenza reale (%)"]
+        str_lit.caption("Goal / No Goal: frequenza reale = partite in cui almeno una delle due squadre non ha segnato.")
+        str_lit.dataframe(cal_ng.round(2), use_container_width=True, hide_index=True)
+
+        str_lit.markdown("#### 🧭 Perché il segno X viene scelto poco? ")
+        posizione_x = df_audit["Posizione X"].value_counts().reindex([1, 2, 3], fill_value=0)
+        x1, x2, x3 = str_lit.columns(3)
+        x1.metric("X al 1° posto", f"{posizione_x.loc[1]}", f"{posizione_x.loc[1]/n*100:.1f}% delle partite")
+        x2.metric("X al 2° posto", f"{posizione_x.loc[2]}", f"{posizione_x.loc[2]/n*100:.1f}% delle partite")
+        x3.metric("X al 3° posto", f"{posizione_x.loc[3]}", f"{posizione_x.loc[3]/n*100:.1f}% delle partite")
+
+        # V10: quanto la probabilità X si avvicina o supera la migliore tra 1 e 2.
+        str_lit.markdown("#### 🧩 Quanto è competitiva la X rispetto a 1 e 2?")
+        str_lit.caption(
+            "Scarto = P(X) meno la maggiore tra P(1) e P(2). Valore negativo: una vittoria è favorita; "
+            "zero o positivo: la X è almeno pari alla migliore vittoria. Nessuna probabilità viene cambiata."
+        )
+        df_x_gap = df_audit.copy()
+        df_x_gap["Esito X reale (0/1)"] = (df_x_gap["Esito reale"] == "X").astype(int)
+        df_x_gap["Fascia scarto X-vittoria"] = pd.cut(
+            df_x_gap["Scarto P(X) - migliore vittoria (pp)"],
+            bins=[-float("inf"), -15, -10, -5, 0, float("inf")],
+            labels=["X indietro >15 pp", "X indietro 10–15 pp", "X indietro 5–10 pp", "X indietro 0–5 pp", "X pari o superiore"],
+            right=False,
+        )
+        riepilogo_x_gap = df_x_gap.groupby("Fascia scarto X-vittoria", observed=False).agg(
+            Partite=("Esito X reale (0/1)", "size"),
+            **{
+                "Scarto medio X-vittoria (pp)": ("Scarto P(X) - migliore vittoria (pp)", "mean"),
+                "P(X) media (%)": ("P(X) %", "mean"),
+                "Pareggi reali (%)": ("Esito X reale (0/1)", lambda x: 100 * x.mean()),
+                "X al 1° posto (%)": ("X prevista come segno", lambda x: 100 * x.mean()),
+            },
+        ).reset_index()
+        str_lit.dataframe(riepilogo_x_gap.round(2), use_container_width=True, hide_index=True)
+
+        str_lit.markdown("#### 🎯 Risultato esatto più probabile — controllo descrittivo")
+        str_lit.caption(
+            "Il punteggio esatto top è il singolo risultato con probabilità maggiore nella matrice 0–10. "
+            "Non è una previsione aggiuntiva né una modifica al segno 1X2."
+        )
+        df_score_audit = df_audit.copy()
+        df_score_audit["Risultato esatto reale"] = (
+            pd.to_numeric(df_score_audit["Gol casa reali"], errors="coerce").astype("Int64").astype(str)
+            + "-" + pd.to_numeric(df_score_audit["Gol trasferta reali"], errors="coerce").astype("Int64").astype(str)
+        )
+        df_score_audit["Score top corretto"] = (
+            df_score_audit["Risultato esatto più probabile"].astype(str)
+            == df_score_audit["Risultato esatto reale"].astype(str)
+        )
+        n_score = int(df_score_audit["Score top corretto"].notna().sum())
+        score_hit_rate = 100 * df_score_audit["Score top corretto"].mean() if n_score else 0.0
+        score_top_prob_mean = pd.to_numeric(df_score_audit["Probabilità risultato esatto top (%)"], errors="coerce").mean()
+        score_top_rate = 100 * df_score_audit["Punteggio esatto top è pareggio"].mean()
+        mask_top_draw = df_score_audit["Punteggio esatto top è pareggio"].eq(1)
+        score_top_draw_n = int(mask_top_draw.sum())
+        score_top_draw_real = df_score_audit.loc[mask_top_draw, "Esito reale"].eq("X").mean() * 100 if score_top_draw_n else 0.0
+        z1, z2, z3, z4 = str_lit.columns(4)
+        z1.metric("Partite nel controllo score", f"{n_score:,}".replace(",", "."))
+        z2.metric("Score esatto top indovinato", f"{score_hit_rate:.2f}%")
+        z3.metric("Probabilità media score top", f"{score_top_prob_mean:.2f}%" if pd.notna(score_top_prob_mean) else "N/D")
+        z4.metric("Score top in parità", f"{score_top_rate:.1f}%")
+        str_lit.caption(
+            f"Tra le {score_top_draw_n:,} partite in cui lo score top era X-X, "
+            f"i pareggi reali sono stati il {score_top_draw_real:.1f}%. "
+            "Dato descrittivo: non modifica il segno 1X2 né il modello operativo."
+        )
+
+        str_lit.markdown("##### Distribuzione degli score top e riscontro reale")
+        df_score_dist = df_score_audit.groupby("Risultato esatto più probabile", dropna=False).agg(
+            Partite=("Risultato esatto più probabile", "size"),
+            **{
+                "Probabilità media score top (%)": ("Probabilità risultato esatto top (%)", "mean"),
+                "Score esatto corretto (n)": ("Score top corretto", "sum"),
+                "Tasso corretto (%)": ("Score top corretto", lambda x: 100 * x.mean()),
+            },
+        ).reset_index().sort_values(["Partite", "Risultato esatto più probabile"], ascending=[False, True])
+        str_lit.dataframe(df_score_dist.round(2), use_container_width=True, hide_index=True)
+        str_lit.download_button("📥 Scarica audit score esatto per score top CSV", df_score_dist.to_csv(index=False).encode("utf-8-sig"), "v1973_audit_score_esatto_per_score.csv", "text/csv")
+
+        str_lit.markdown("##### Risultato esatto top: confronto per competizione")
+        score_comp_rows = []
+        for comp_score, gg in df_score_audit.groupby("Competizione", dropna=False):
+            score_comp_rows.append({
+                "Competizione": comp_score,
+                "Partite": int(len(gg)),
+                "Score top corretto (%)": 100 * gg["Score top corretto"].mean(),
+                "Probabilità media score top (%)": pd.to_numeric(gg["Probabilità risultato esatto top (%)"], errors="coerce").mean(),
+                "Score top in parità (%)": 100 * gg["Punteggio esatto top è pareggio"].mean(),
+                "Pareggio reale quando score top X-X (%)": 100 * gg.loc[gg["Punteggio esatto top è pareggio"].eq(1), "Esito reale"].eq("X").mean() if gg["Punteggio esatto top è pareggio"].eq(1).any() else np.nan,
+            })
+        df_score_comp = pd.DataFrame(score_comp_rows).sort_values("Competizione")
+        str_lit.dataframe(df_score_comp.round(2), use_container_width=True, hide_index=True)
+        str_lit.download_button("📥 Scarica audit score esatto per competizione CSV", df_score_comp.to_csv(index=False).encode("utf-8-sig"), "v1973_audit_score_esatto_per_competizione.csv", "text/csv")
+
+        # V19.7.4: calibrazione descrittiva dello score esatto top per competizione.
+        # Solo diagnostica; non modifica probabilità, lambda, segno 1X2 o ranking Combo.
+        str_lit.markdown("##### V19.7.4 — Calibrazione score esatto per competizione")
+        str_lit.caption(
+            "Per ogni competizione e punteggio esatto più probabile, confronta la probabilità media assegnata "
+            "con la frequenza con cui quel punteggio si è verificato davvero. Delta = tasso corretto meno "
+            "probabilità media (in punti percentuali). Campioni piccoli vanno interpretati con cautela. "
+            "Questa analisi riguarda solo le partite in cui quel punteggio era lo score top."
+        )
+        df_score_cal = df_score_audit.copy()
+        df_score_cal["Probabilità score top numerica (%)"] = pd.to_numeric(
+            df_score_cal["Probabilità risultato esatto top (%)"], errors="coerce"
+        )
+        score_cal_rows = []
+        for (comp_cal, score_cal), gg_cal in df_score_cal.groupby(
+            ["Competizione", "Risultato esatto più probabile"], dropna=False
+        ):
+            n_cal = int(gg_cal["Score top corretto"].notna().sum())
+            p_cal = gg_cal["Probabilità score top numerica (%)"].mean()
+            hit_cal = 100 * gg_cal["Score top corretto"].mean() if n_cal else np.nan
+            score_cal_rows.append({
+                "Competizione": comp_cal,
+                "Score top": score_cal,
+                "Partite": n_cal,
+                "Probabilità media (%)": p_cal,
+                "Tasso corretto reale (%)": hit_cal,
+                "Delta reale - previsto (pp)": hit_cal - p_cal if pd.notna(hit_cal) and pd.notna(p_cal) else np.nan,
+                "Affidabilità campione": "Limitato (<30)" if n_cal < 30 else "Almeno 30",
+            })
+        df_score_calibration = pd.DataFrame(score_cal_rows).sort_values(
+            ["Competizione", "Partite", "Score top"], ascending=[True, False, True]
+        )
+        str_lit.dataframe(df_score_calibration.round(2), use_container_width=True, hide_index=True)
+        str_lit.download_button(
+            "📥 Scarica calibrazione score per competizione CSV",
+            df_score_calibration.to_csv(index=False).encode("utf-8-sig"),
+            "v1974_calibrazione_score_per_competizione.csv", "text/csv"
+        )
+
+        str_lit.markdown("##### Focus 0-0 — confronto per competizione")
+        df_zero_zero = df_score_cal[df_score_cal["Risultato esatto più probabile"].astype(str).eq("0-0")].copy()
+        if not df_zero_zero.empty:
+            zero_rows = []
+            for comp_zero, gg_zero in df_zero_zero.groupby("Competizione", dropna=False):
+                n_zero = int(gg_zero["Score top corretto"].notna().sum())
+                p_zero = gg_zero["Probabilità score top numerica (%)"].mean()
+                hit_zero = 100 * gg_zero["Score top corretto"].mean() if n_zero else np.nan
+                zero_rows.append({
+                    "Competizione": comp_zero,
+                    "Partite con score top 0-0": n_zero,
+                    "Probabilità media 0-0 (%)": p_zero,
+                    "0-0 realmente verificato (%)": hit_zero,
+                    "Delta reale - previsto (pp)": hit_zero - p_zero if pd.notna(hit_zero) and pd.notna(p_zero) else np.nan,
+                    "Affidabilità campione": "Limitato (<30)" if n_zero < 30 else "Almeno 30",
+                })
+            n_zero_all = int(df_zero_zero["Score top corretto"].notna().sum())
+            p_zero_all = df_zero_zero["Probabilità score top numerica (%)"].mean()
+            hit_zero_all = 100 * df_zero_zero["Score top corretto"].mean() if n_zero_all else np.nan
+            zero_rows.append({
+                "Competizione": "TOTALE",
+                "Partite con score top 0-0": n_zero_all,
+                "Probabilità media 0-0 (%)": p_zero_all,
+                "0-0 realmente verificato (%)": hit_zero_all,
+                "Delta reale - previsto (pp)": hit_zero_all - p_zero_all if pd.notna(hit_zero_all) and pd.notna(p_zero_all) else np.nan,
+                "Affidabilità campione": "Almeno 30" if n_zero_all >= 30 else "Limitato (<30)",
+            })
+            df_zero_zero_comp = pd.DataFrame(zero_rows)
+            str_lit.dataframe(df_zero_zero_comp.round(2), use_container_width=True, hide_index=True)
+            str_lit.download_button(
+                "📥 Scarica focus 0-0 per competizione CSV",
+                df_zero_zero_comp.to_csv(index=False).encode("utf-8-sig"),
+                "v1974_focus_0_0_per_competizione.csv", "text/csv"
+            )
+        else:
+            str_lit.info("Nessuna partita disponibile con 0-0 come risultato esatto più probabile.")
+
+        # V19.7.5: calibrazione dello 0-0 su tutte le partite valutate.
+        # Questa sezione è diagnostica: non modifica lambda, matrici o previsioni operative.
+        str_lit.markdown("##### V19.7.5 — Calibrazione dello 0-0 su tutte le partite valutate")
+        str_lit.caption(
+            "A differenza del focus precedente, qui entrano tutte le partite con probabilità 0-0 disponibile, "
+            "anche quando 0-0 NON è lo score esatto più probabile. Le fasce confrontano probabilità media e frequenza reale. "
+            "Brier Score e Log Loss sono calcolati come evento binario: 0-0 sì/no. Nessuna modifica al modello operativo."
+        )
+        df_cal00 = df_score_audit.copy()
+        df_cal00["P(0-0) %"] = pd.to_numeric(df_cal00.get("P(0-0) %"), errors="coerce")
+        df_cal00["0-0 reale"] = pd.to_numeric(df_cal00.get("0-0 reale"), errors="coerce")
+        df_cal00 = df_cal00.dropna(subset=["P(0-0) %", "0-0 reale"]).copy()
+        if not df_cal00.empty:
+            p00 = (df_cal00["P(0-0) %"] / 100.0).clip(1e-12, 1 - 1e-12)
+            y00 = df_cal00["0-0 reale"].astype(int)
+            df_cal00["Brier 0-0"] = (p00 - y00) ** 2
+            df_cal00["Log Loss 0-0"] = -(y00 * np.log(p00) + (1 - y00) * np.log(1 - p00))
+            n00 = len(df_cal00)
+            p00_mean = float(df_cal00["P(0-0) %"].mean())
+            y00_rate = float(100 * df_cal00["0-0 reale"].mean())
+            m1, m2, m3, m4 = str_lit.columns(4)
+            m1.metric("Partite valutate", f"{n00:,}".replace(",", "."))
+            m2.metric("P(0-0) media", f"{p00_mean:.2f}%")
+            m3.metric("0-0 realmente verificati", f"{y00_rate:.2f}%")
+            m4.metric("Delta reale − previsto", f"{y00_rate-p00_mean:+.2f} pp")
+            m5, m6 = str_lit.columns(2)
+            m5.metric("Brier Score 0-0", f"{df_cal00['Brier 0-0'].mean():.5f}")
+            m6.metric("Log Loss 0-0", f"{df_cal00['Log Loss 0-0'].mean():.5f}")
+
+            bins00 = [0, 5, 10, 15, 20, 25, 30, 40, 50, 100.000001]
+            labels00 = ["0–5%", "5–10%", "10–15%", "15–20%", "20–25%", "25–30%", "30–40%", "40–50%", "50%+"]
+            df_cal00["Fascia P(0-0)"] = pd.cut(
+                df_cal00["P(0-0) %"].clip(0, 100), bins=bins00, labels=labels00,
+                right=False, include_lowest=True
+            )
+            df_cal00_fasce = df_cal00.groupby("Fascia P(0-0)", observed=False).agg(
+                Partite=("0-0 reale", "size"),
+                **{
+                    "P(0-0) media (%)": ("P(0-0) %", "mean"),
+                    "0-0 reale (%)": ("0-0 reale", lambda x: 100*x.mean()),
+                    "Brier Score": ("Brier 0-0", "mean"),
+                    "Log Loss": ("Log Loss 0-0", "mean"),
+                }
+            ).reset_index()
+            df_cal00_fasce["Delta reale - previsto (pp)"] = df_cal00_fasce["0-0 reale (%)"] - df_cal00_fasce["P(0-0) media (%)"]
+            df_cal00_fasce["Affidabilità campione"] = np.where(df_cal00_fasce["Partite"] < 30, "Limitato (<30)", "Almeno 30")
+            str_lit.markdown("###### Calibrazione per fasce di probabilità 0-0")
+            str_lit.dataframe(df_cal00_fasce.round(3), use_container_width=True, hide_index=True)
+            str_lit.download_button(
+                "📥 Scarica calibrazione 0-0 per fasce CSV",
+                df_cal00_fasce.to_csv(index=False).encode("utf-8-sig"),
+                "v1975_calibrazione_0_0_per_fasce.csv", "text/csv"
+            )
+
+            comp00_rows = []
+            for comp00, gg00 in df_cal00.groupby("Competizione", dropna=False):
+                pp = (gg00["P(0-0) %"] / 100.0).clip(1e-12, 1 - 1e-12)
+                yy = gg00["0-0 reale"].astype(int)
+                comp00_rows.append({
+                    "Competizione": comp00,
+                    "Partite": int(len(gg00)),
+                    "P(0-0) media (%)": gg00["P(0-0) %"].mean(),
+                    "0-0 reale (%)": 100 * yy.mean(),
+                    "Delta reale - previsto (pp)": 100 * yy.mean() - gg00["P(0-0) %"].mean(),
+                    "Brier Score": float(((pp - yy) ** 2).mean()),
+                    "Log Loss": float((-(yy * np.log(pp) + (1 - yy) * np.log(1 - pp))).mean()),
+                    "Affidabilità campione": "Limitato (<30)" if len(gg00) < 30 else "Almeno 30",
+                })
+            comp00_df = pd.DataFrame(comp00_rows).sort_values("Competizione")
+            comp00_df = pd.concat([comp00_df, pd.DataFrame([{
+                "Competizione": "TOTALE",
+                "Partite": int(len(df_cal00)),
+                "P(0-0) media (%)": df_cal00["P(0-0) %"].mean(),
+                "0-0 reale (%)": 100 * df_cal00["0-0 reale"].mean(),
+                "Delta reale - previsto (pp)": 100 * df_cal00["0-0 reale"].mean() - df_cal00["P(0-0) %"].mean(),
+                "Brier Score": df_cal00["Brier 0-0"].mean(),
+                "Log Loss": df_cal00["Log Loss 0-0"].mean(),
+                "Affidabilità campione": "Almeno 30" if len(df_cal00) >= 30 else "Limitato (<30)",
+            }])], ignore_index=True)
+            str_lit.markdown("###### Calibrazione 0-0 per competizione — tutte le partite")
+            str_lit.dataframe(comp00_df.round(4), use_container_width=True, hide_index=True)
+            str_lit.download_button(
+                "📥 Scarica calibrazione 0-0 per competizione CSV",
+                comp00_df.to_csv(index=False).encode("utf-8-sig"),
+                "v1975_calibrazione_0_0_per_competizione.csv", "text/csv"
+            )
+        else:
+            str_lit.warning("La probabilità esatta 0-0 non è disponibile nel campione corrente; impossibile calcolare la calibrazione complessiva.")
+
+        # V19.8: confronto appaiato della probabilità esatta 0-0 RAW vs WF.
+        # WF qui significa matrice Poisson ricalcolata con lambda corrette esclusivamente
+        # usando risultati precedenti della stessa competizione; non è Platt sul solo evento 0-0.
+        str_lit.markdown("##### V19.8 — Confronto statistico 0-0: RAW vs Walk-Forward")
+        str_lit.caption(
+            "Confronto sulle stesse partite con P(0-0) RAW, P(0-0) WF ed esito reale disponibili. "
+            "La probabilità WF deriva dalla matrice Poisson con lambda corrette walk-forward, "
+            "stimate solo su partite precedenti della stessa competizione (fino a 300 righe, minimo 100). "
+            "Non è una calibrazione Platt specifica dello 0-0. Brier Score e Log Loss più bassi sono migliori; "
+            "Delta WF − RAW negativo favorisce WF. Solo Audit: nessun effetto sulle previsioni operative."
+        )
+        df_00_wf = df_v15_test.copy() if isinstance(df_v15_test, pd.DataFrame) else pd.DataFrame()
+        cols00_need = ["P(0-0) %", "P(0-0) lambda corretta WF", "0-0 reale", "Data", "Competizione"]
+        if not df_00_wf.empty and all(c in df_00_wf.columns for c in cols00_need):
+            for c in ["P(0-0) %", "P(0-0) lambda corretta WF", "0-0 reale"]:
+                df_00_wf[c] = pd.to_numeric(df_00_wf[c], errors="coerce")
+            df_00_wf["Data"] = pd.to_datetime(df_00_wf["Data"], errors="coerce", utc=True)
+            df_00_wf["P(0-0) RAW"] = df_00_wf["P(0-0) %"] / 100.0
+            # L'esito binario è 0-0 sì/no; il target viene da gol reali, se disponibili.
+            if "Gol casa reali" in df_00_wf.columns and "Gol trasferta reali" in df_00_wf.columns:
+                gh00 = pd.to_numeric(df_00_wf["Gol casa reali"], errors="coerce")
+                ga00 = pd.to_numeric(df_00_wf["Gol trasferta reali"], errors="coerce")
+                target_valido00 = gh00.notna() & ga00.notna()
+                df_00_wf.loc[target_valido00, "0-0 reale"] = ((gh00[target_valido00] == 0) & (ga00[target_valido00] == 0)).astype(int)
+            df_00_wf["Anno test"] = df_00_wf["Data"].dt.year
+            raw_ok00 = np.isfinite(df_00_wf["P(0-0) RAW"].to_numpy(dtype=float))
+            wf_ok00 = np.isfinite(df_00_wf["P(0-0) lambda corretta WF"].to_numpy(dtype=float))
+            y_ok00 = np.isfinite(df_00_wf["0-0 reale"].to_numpy(dtype=float))
+            date_ok00 = df_00_wf["Data"].notna().to_numpy()
+            comp_ok00 = df_00_wf["Competizione"].notna().to_numpy()
+            paired_mask00 = raw_ok00 & wf_ok00 & y_ok00 & date_ok00 & comp_ok00
+            z00 = df_00_wf.loc[paired_mask00].copy()
+            n_tot00 = len(df_00_wf)
+            n_raw_miss00 = int((~raw_ok00).sum())
+            n_wf_miss00 = int((~wf_ok00).sum())
+            n_y_miss00 = int((~y_ok00).sum())
+            n_train_short00 = int((pd.to_numeric(df_00_wf.get("Training usato V15", pd.Series(0, index=df_00_wf.index)), errors="coerce").fillna(0) < 100).sum())
+            a1, a2, a3, a4 = str_lit.columns(4)
+            a1.metric("Righe audit disponibili", f"{n_tot00:,}".replace(",", "."))
+            a2.metric("Partite appaiate RAW/WF", f"{len(z00):,}".replace(",", "."))
+            a3.metric("WF non disponibile", f"{n_wf_miss00:,}".replace(",", "."))
+            a4.metric("Training sotto 100", f"{n_train_short00:,}".replace(",", "."))
+            str_lit.caption(
+                f"Esclusioni diagnostiche (conteggi potenzialmente sovrapposti): RAW mancante {n_raw_miss00}; "
+                f"WF mancante {n_wf_miss00}; esito 0-0 mancante {n_y_miss00}. "
+                "Le partite senza almeno 100 osservazioni precedenti della stessa competizione non ricevono una correzione WF."
+            )
+            if not z00.empty:
+                y00w = z00["0-0 reale"].to_numpy(dtype=float)
+                p00raw = np.clip(z00["P(0-0) RAW"].to_numpy(dtype=float), 1e-12, 1-1e-12)
+                p00wf = np.clip(z00["P(0-0) lambda corretta WF"].to_numpy(dtype=float), 1e-12, 1-1e-12)
+                b00raw, ll00raw = _calcola_metriche_binaria(p00raw, y00w)
+                b00wf, ll00wf = _calcola_metriche_binaria(p00wf, y00w)
+                tot00 = pd.DataFrame([{
+                    "Gruppo": "TOTALE", "Partite appaiate": len(z00),
+                    "P(0-0) RAW media (%)": 100*float(np.mean(p00raw)),
+                    "P(0-0) WF media (%)": 100*float(np.mean(p00wf)),
+                    "0-0 reale (%)": 100*float(np.mean(y00w)),
+                    "Brier 0-0 RAW": b00raw, "Brier 0-0 WF": b00wf, "Delta Brier WF - RAW": b00wf-b00raw,
+                    "LogLoss 0-0 RAW": ll00raw, "LogLoss 0-0 WF": ll00wf, "Delta LogLoss WF - RAW": ll00wf-ll00raw,
+                }])
+                str_lit.markdown("###### Confronto complessivo 0-0 RAW vs WF")
+                str_lit.dataframe(tot00.round(5), use_container_width=True, hide_index=True)
+
+                def _riepilogo_00_wf(gruppi, nome):
+                    righe00 = []
+                    for chiave00, grp00 in z00.groupby(gruppi, dropna=False):
+                        if not isinstance(chiave00, tuple):
+                            chiave00 = (chiave00,)
+                        yy00 = grp00["0-0 reale"].to_numpy(dtype=float)
+                        rr00 = np.clip(grp00["P(0-0) RAW"].to_numpy(dtype=float), 1e-12, 1-1e-12)
+                        ww00 = np.clip(grp00["P(0-0) lambda corretta WF"].to_numpy(dtype=float), 1e-12, 1-1e-12)
+                        br00, lr00 = _calcola_metriche_binaria(rr00, yy00)
+                        bw00, lw00 = _calcola_metriche_binaria(ww00, yy00)
+                        righe00.append({
+                            nome: " / ".join(str(v) for v in chiave00), "Partite appaiate": int(len(grp00)),
+                            "P(0-0) RAW media (%)": 100*float(np.mean(rr00)), "P(0-0) WF media (%)": 100*float(np.mean(ww00)),
+                            "0-0 reale (%)": 100*float(np.mean(yy00)), "Brier 0-0 RAW": br00, "Brier 0-0 WF": bw00,
+                            "Delta Brier WF - RAW": bw00-br00, "LogLoss 0-0 RAW": lr00, "LogLoss 0-0 WF": lw00,
+                            "Delta LogLoss WF - RAW": lw00-lr00,
+                        })
+                    return pd.DataFrame(righe00)
+
+                comp00_wf = _riepilogo_00_wf(["Competizione"], "Competizione")
+                anno00_wf = _riepilogo_00_wf(["Anno test"], "Anno")
+                str_lit.markdown("###### Confronto 0-0 per competizione")
+                str_lit.dataframe(comp00_wf.round(5), use_container_width=True, hide_index=True)
+                str_lit.markdown("###### Confronto 0-0 per anno")
+                str_lit.dataframe(anno00_wf.round(5), use_container_width=True, hide_index=True)
+                # V19.9: bootstrap appaiato sulle differenze di loss partita per partita.
+                # Le stesse partite vengono ricampionate per RAW e WF: si preserva
+                # l'appaiamento e si stima l'IC percentile al 95% della differenza media.
+                str_lit.markdown("##### V19.9 — Bootstrap appaiato: incertezza del vantaggio WF")
+                str_lit.caption(
+                    "Ricampionamento appaiato delle partite (RAW e WF sempre insieme), 2.000 repliche, "
+                    "seed fisso 20261030. Per ogni replica si ricalcola la differenza media WF − RAW. "
+                    "IC percentile 95%: se resta interamente sotto zero, il risultato favorisce WF; "
+                    "se comprende zero, il vantaggio non è conclusivo. È un bootstrap sulle partite, "
+                    "non corregge da solo eventuali dipendenze temporali tra match della stessa squadra/stagione."
+                )
+                _rng_boot00 = np.random.default_rng(20261030)
+                _B_BOOT00 = 2000
+
+                def _bootstrap_appaiato_00(grp_boot00):
+                    yyb = grp_boot00["0-0 reale"].to_numpy(dtype=float)
+                    rb = np.clip(grp_boot00["P(0-0) RAW"].to_numpy(dtype=float), 1e-12, 1-1e-12)
+                    wb = np.clip(grp_boot00["P(0-0) lambda corretta WF"].to_numpy(dtype=float), 1e-12, 1-1e-12)
+                    nb = len(yyb)
+                    if nb == 0:
+                        return {"Bootstrap repliche": 0, "IC95 Delta Brier inf": np.nan,
+                                "IC95 Delta Brier sup": np.nan, "P(Delta Brier < 0) bootstrap (%)": np.nan,
+                                "IC95 Delta LogLoss inf": np.nan, "IC95 Delta LogLoss sup": np.nan,
+                                "P(Delta LogLoss < 0) bootstrap (%)": np.nan}
+                    loss_br = (wb - yyb) ** 2 - (rb - yyb) ** 2
+                    loss_ll = -(yyb*np.log(wb) + (1-yyb)*np.log(1-wb)) + (yyb*np.log(rb) + (1-yyb)*np.log(1-rb))
+                    boot_br = np.empty(_B_BOOT00, dtype=float)
+                    boot_ll = np.empty(_B_BOOT00, dtype=float)
+                    # Blocchi limitano l'uso di memoria anche su campioni molto grandi.
+                    for start_boot in range(0, _B_BOOT00, 100):
+                        stop_boot = min(start_boot + 100, _B_BOOT00)
+                        idx_boot = _rng_boot00.integers(0, nb, size=(stop_boot-start_boot, nb))
+                        boot_br[start_boot:stop_boot] = loss_br[idx_boot].mean(axis=1)
+                        boot_ll[start_boot:stop_boot] = loss_ll[idx_boot].mean(axis=1)
+                    return {
+                        "Bootstrap repliche": _B_BOOT00,
+                        "IC95 Delta Brier inf": float(np.quantile(boot_br, 0.025)),
+                        "IC95 Delta Brier sup": float(np.quantile(boot_br, 0.975)),
+                        "P(Delta Brier < 0) bootstrap (%)": 100.0*float(np.mean(boot_br < 0)),
+                        "IC95 Delta LogLoss inf": float(np.quantile(boot_ll, 0.025)),
+                        "IC95 Delta LogLoss sup": float(np.quantile(boot_ll, 0.975)),
+                        "P(Delta LogLoss < 0) bootstrap (%)": 100.0*float(np.mean(boot_ll < 0)),
+                    }
+
+                bootstrap_rows00 = []
+                gruppi_boot00 = [("TOTALE", "TOTALE", z00)]
+                gruppi_boot00 += [("COMPETIZIONE", str(k), g.copy()) for k, g in z00.groupby("Competizione", dropna=False)]
+                gruppi_boot00 += [("ANNO", str(k), g.copy()) for k, g in z00.groupby("Anno test", dropna=False)]
+                for tipo_boot00, nome_boot00, gruppo_boot00 in gruppi_boot00:
+                    esito_boot00 = _bootstrap_appaiato_00(gruppo_boot00)
+                    bootstrap_rows00.append({"Tipo": tipo_boot00, "Gruppo": nome_boot00,
+                                             "Partite appaiate": int(len(gruppo_boot00)), **esito_boot00})
+                bootstrap00 = pd.DataFrame(bootstrap_rows00)
+                str_lit.dataframe(bootstrap00.round(6), use_container_width=True, hide_index=True)
+                str_lit.caption(
+                    "Lettura: un IC95% interamente negativo indica evidenza bootstrap a favore di WF; "
+                    "un intervallo che attraversa zero indica che il vantaggio osservato resta incerto. "
+                    "La percentuale bootstrap sotto zero è descrittiva e non va interpretata come probabilità "
+                    "che WF sia migliore in futuro. I gruppi con pochi casi sono particolarmente instabili."
+                )
+                csv00 = pd.concat([tot00.assign(Tipo="TOTALE"), comp00_wf.assign(Tipo="COMPETIZIONE"), anno00_wf.assign(Tipo="ANNO")], ignore_index=True, sort=False)
+                csv00_boot = bootstrap00.rename(columns={"Gruppo": "Competizione/Anno"})
+                str_lit.download_button(
+                    "📥 Scarica confronto 0-0 RAW vs WF + Bootstrap CSV",
+                    pd.concat([csv00, csv00_boot], ignore_index=True, sort=False).to_csv(index=False).encode("utf-8-sig"),
+                    "v199_confronto_0_0_RAW_vs_WF_bootstrap.csv", "text/csv"
+                )
+            else:
+                str_lit.warning("Nessuna partita con probabilità 0-0 RAW e WF ed esito reale validi: confronto non calcolabile.")
+        else:
+            str_lit.info("Confronto 0-0 RAW vs WF non disponibile: mancano colonne necessarie nel test walk-forward.")
+
+        cols_score = ["Data", "Competizione", "Casa", "Trasferta", "P(1) %", "P(X) %", "P(2) %", "Scarto P(X) - migliore vittoria (pp)", "Segno previsto", "Risultato esatto più probabile", "Probabilità risultato esatto top (%)", "Risultato esatto reale", "Score top corretto", "Esito reale"]
+        with str_lit.expander("Dettaglio diagnostico X e punteggio esatto", expanded=False):
+            str_lit.dataframe(df_score_audit[cols_score].sort_values("Scarto P(X) - migliore vittoria (pp)", ascending=False).round(3), use_container_width=True, hide_index=True)
+            str_lit.download_button("📥 Scarica dettaglio partite score esatto CSV", df_score_audit[cols_score].to_csv(index=False).encode("utf-8-sig"), "v1973_dettaglio_score_esatto.csv", "text/csv")
+
+        # V4: diagnostica della X per equilibrio tra probabilità di vittoria casa/trasferta.
+        # Solo analisi: non modifica probabilità operative, lambda o pronostici.
+        str_lit.markdown("#### ⚖️ Diagnostica X in base all'equilibrio tra P(1) e P(2)")
+        str_lit.caption(
+            "Le partite sono raggruppate in base alla differenza assoluta tra P(1) e P(2). "
+            "È una diagnostica retrospettiva: non modifica il modello."
+        )
+        df_eq = df_audit.copy()
+        df_eq["Differenza P(1)-P(2) (pp)"] = (df_eq["P(1) %"] - df_eq["P(2) %"]).abs()
+        df_eq["X reale (0/1)"] = (df_eq["Esito reale"] == "X").astype(int)
+        df_eq["P(X) (0-1)"] = (df_eq["P(X) %"] / 100.0).clip(0.0, 1.0)
+        df_eq["Brier X"] = (df_eq["P(X) (0-1)"] - df_eq["X reale (0/1)"]) ** 2
+        df_eq["Gruppo equilibrio"] = pd.cut(
+            df_eq["Differenza P(1)-P(2) (pp)"],
+            bins=[-0.000001, 10, 25, float("inf")],
+            labels=["Equilibrate (≤10 pp)", "Favorita moderata (>10–25 pp)", "Favorita netta (>25 pp)"],
+            right=True,
+            include_lowest=True,
+        )
+        riepilogo_eq = df_eq.groupby("Gruppo equilibrio", observed=False).agg(
+            Partite=("X reale (0/1)", "size"),
+            **{
+                "Differenza media P(1)-P(2) (pp)": ("Differenza P(1)-P(2) (pp)", "mean"),
+                "P(X) media (%)": ("P(X) %", "mean"),
+                "Pareggi reali (%)": ("X reale (0/1)", lambda x: 100 * x.mean()),
+                "Brier X": ("Brier X", "mean"),
+            },
+        ).reset_index()
+        riepilogo_eq["Scarto P(X) - pareggi reali (pp)"] = (
+            riepilogo_eq["P(X) media (%)"] - riepilogo_eq["Pareggi reali (%)"]
+        )
+        riepilogo_eq["X al 1° posto (%)"] = riepilogo_eq["Gruppo equilibrio"].map(
+            df_eq.groupby("Gruppo equilibrio", observed=False)["Posizione X"].apply(lambda x: 100 * (x == 1).mean())
+        )
+        str_lit.dataframe(riepilogo_eq.round(2), use_container_width=True, hide_index=True)
+        str_lit.caption(
+            "Brier X = errore quadratico tra P(X) e l'esito pareggio (0/1); più basso è meglio. "
+            "I gruppi con poche partite vanno interpretati con cautela."
+        )
+
+        # V6: diagnostica No Goal per fasce di lambda totale attesa, con dettagli aggiuntivi.
+        # Solo analisi retrospettiva: non cambia le probabilità o i pronostici operativi.
+        str_lit.markdown("#### 🥅 Diagnostica No Goal per gol attesi")
+        str_lit.caption(
+            "Raggruppa le partite in base alla somma Lambda casa + Lambda trasferta. "
+            "Serve a capire se la sovrastima No Goal si concentra in partite con pochi, medi o molti gol attesi; "
+            "non applica correzioni al modello."
+        )
+        colonne_lambda = {"Lambda casa", "Lambda trasferta", "P(No Goal) %", "No Goal reale", "Brier Goal/No Goal"}
+        if colonne_lambda.issubset(df_audit.columns):
+            df_ng_tipo = df_audit.copy()
+            df_ng_tipo["Gol attesi totali (lambda) "] = (
+                pd.to_numeric(df_ng_tipo["Lambda casa"], errors="coerce")
+                + pd.to_numeric(df_ng_tipo["Lambda trasferta"], errors="coerce")
+            )
+            df_ng_tipo["P(No Goal) (0-1)"] = (pd.to_numeric(df_ng_tipo["P(No Goal) %"], errors="coerce") / 100).clip(0, 1)
+            df_ng_tipo["No Goal reale (0/1)"] = pd.to_numeric(df_ng_tipo["No Goal reale"], errors="coerce")
+            df_ng_tipo["Gruppo gol attesi"] = pd.cut(
+                df_ng_tipo["Gol attesi totali (lambda) "],
+                bins=[-float("inf"), 2.0, 2.8, float("inf")],
+                labels=["Bassi (≤2.0)", "Medi (>2.0–2.8)", "Alti (>2.8)"],
+                right=True,
+                include_lowest=True,
+            )
+            df_ng_tipo = df_ng_tipo.dropna(subset=["Gruppo gol attesi", "No Goal reale (0/1)", "P(No Goal) (0-1)"])
+            if not df_ng_tipo.empty:
+                df_ng_tipo["No Goal favorito (0/1)"] = (
+                    pd.to_numeric(df_ng_tipo["P(No Goal) %"], errors="coerce") > 50.0
+                ).astype(int)
+                riepilogo_ng_tipo = df_ng_tipo.groupby("Gruppo gol attesi", observed=False).agg(
+                    Partite=("No Goal reale (0/1)", "size"),
+                    **{
+                        "Lambda casa media": ("Lambda casa", "mean"),
+                        "Lambda trasferta media": ("Lambda trasferta", "mean"),
+                        "Lambda totale media": ("Gol attesi totali (lambda) ", "mean"),
+                        "P(No Goal) media (%)": ("P(No Goal) %", "mean"),
+                        "No Goal reali (%)": ("No Goal reale (0/1)", lambda x: 100 * x.mean()),
+                        "No Goal favorito (%)": ("No Goal favorito (0/1)", lambda x: 100 * x.mean()),
+                        "Brier No Goal": ("Brier Goal/No Goal", "mean"),
+                    },
+                ).reset_index()
+                riepilogo_ng_tipo["Scarto (pp)"] = (
+                    riepilogo_ng_tipo["P(No Goal) media (%)"] - riepilogo_ng_tipo["No Goal reali (%)"]
+                )
+                riepilogo_ng_tipo = riepilogo_ng_tipo[[
+                    "Gruppo gol attesi", "Partite", "Lambda casa media", "Lambda trasferta media",
+                    "Lambda totale media", "P(No Goal) media (%)", "No Goal reali (%)",
+                    "No Goal favorito (%)", "Scarto (pp)", "Brier No Goal"
+                ]]
+                str_lit.dataframe(riepilogo_ng_tipo.round(2), use_container_width=True, hide_index=True)
+                str_lit.caption(
+                    "Brier No Goal è riportato dal calcolo walk-forward già presente nell'audit. "
+                    "Le fasce con poche partite sono descrittive e non bastano da sole a giustificare una modifica."
+                )
+            else:
+                str_lit.info("Non ci sono righe valide sufficienti per la diagnostica No Goal per lambda.")
+        else:
+            str_lit.warning("Diagnostica No Goal per lambda non disponibile: mancano una o più colonne attese nell'audit.")
+
+        # V11: separa l'errore di stima dei gol attesi dalla sola probabilità No Goal.
+        # Diagnostica retrospettiva; non modifica lambda, matrice o previsioni operative.
+        str_lit.markdown("#### 🧪 V11 — Gol attesi vs gol reali")
+        str_lit.caption(
+            "Confronta le lambda pre-partita con i gol effettivamente segnati, sia per la squadra di casa "
+            "sia per quella in trasferta. La frequenza reale di zero gol viene confrontata con exp(-lambda). "
+            "È un controllo diagnostico, non una correzione del modello."
+        )
+        df_lam = df_audit.copy()
+        for col in ["Lambda casa", "Lambda trasferta", "Gol casa reali", "Gol trasferta reali"]:
+            df_lam[col] = pd.to_numeric(df_lam[col], errors="coerce")
+        df_lam = df_lam.dropna(subset=["Lambda casa", "Lambda trasferta", "Gol casa reali", "Gol trasferta reali"])
+        if not df_lam.empty:
+            # Tabella riepilogativa complessiva: atteso vs osservato.
+            riepilogo_lam = pd.DataFrame([
+                {
+                    "Lato": "Casa",
+                    "Partite": len(df_lam),
+                    "Lambda media": df_lam["Lambda casa"].mean(),
+                    "Gol reali medi": df_lam["Gol casa reali"].mean(),
+                    "Errore medio (reali - attesi)": (df_lam["Gol casa reali"] - df_lam["Lambda casa"]).mean(),
+                    "Zero gol attesi (%)": 100 * np.exp(-df_lam["Lambda casa"]).mean(),
+                    "Zero gol reali (%)": 100 * (df_lam["Gol casa reali"] == 0).mean(),
+                },
+                {
+                    "Lato": "Trasferta",
+                    "Partite": len(df_lam),
+                    "Lambda media": df_lam["Lambda trasferta"].mean(),
+                    "Gol reali medi": df_lam["Gol trasferta reali"].mean(),
+                    "Errore medio (reali - attesi)": (df_lam["Gol trasferta reali"] - df_lam["Lambda trasferta"]).mean(),
+                    "Zero gol attesi (%)": 100 * np.exp(-df_lam["Lambda trasferta"]).mean(),
+                    "Zero gol reali (%)": 100 * (df_lam["Gol trasferta reali"] == 0).mean(),
+                },
+            ])
+            str_lit.dataframe(riepilogo_lam.round(3), use_container_width=True, hide_index=True)
+
+            # Raggruppamento per lambda, così si vede se gli errori si concentrano sui valori bassi.
+            for lato, col_lam, col_gol in [
+                ("Casa", "Lambda casa", "Gol casa reali"),
+                ("Trasferta", "Lambda trasferta", "Gol trasferta reali"),
+            ]:
+                d = df_lam[[col_lam, col_gol]].copy()
+                d["Fascia lambda"] = pd.cut(
+                    d[col_lam], bins=[-float("inf"), 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, float("inf")],
+                    labels=["≤0.75", "0.75–1.00", "1.00–1.25", "1.25–1.50", "1.50–1.75", "1.75–2.00", ">2.00"],
+                    right=True, include_lowest=True,
+                )
+                d["Zero gol reale (0/1)"] = (d[col_gol] == 0).astype(int)
+                d = d.dropna(subset=["Fascia lambda"])
+                riepilogo_lato = d.groupby("Fascia lambda", observed=False).agg(
+                    Partite=(col_gol, "size"),
+                    **{
+                        "Lambda media": (col_lam, "mean"),
+                        "Gol reali medi": (col_gol, "mean"),
+                        "Zero gol attesi (%)": (col_lam, lambda x: 100 * np.exp(-x).mean()),
+                        "Zero gol reali (%)": ("Zero gol reale (0/1)", lambda x: 100 * x.mean()),
+                    },
+                ).reset_index()
+                riepilogo_lato["Errore medio (reali - attesi)"] = riepilogo_lato["Gol reali medi"] - riepilogo_lato["Lambda media"]
+                with str_lit.expander(f"Dettaglio lambda — {lato}", expanded=False):
+                    str_lit.dataframe(riepilogo_lato.round(3), use_container_width=True, hide_index=True)
+
+        # Calibrazione X per competizione: utile per distinguere un problema globale da uno localizzato.
+        str_lit.markdown("#### 🏟️ V14 — Pareggio X per competizione")
+        if "Competizione" in df_audit.columns:
+            # Il nome competizione viene riportato nella riga walk-forward.
+            riepilogo_comp = df_audit.copy()
+            riepilogo_comp["X reale (0/1)"] = (riepilogo_comp["Esito reale"] == "X").astype(int)
+            riepilogo_comp = riepilogo_comp.groupby("Competizione", dropna=False).agg(
+                Partite=("Esito reale", "size"),
+                **{
+                    "P(X) media (%)": ("P(X) %", "mean"),
+                    "Pareggi reali (%)": ("X reale (0/1)", lambda x: 100 * x.mean()),
+                    "X prevista 1° (%)": ("X prevista come segno", lambda x: 100 * x.mean()),
+                },
+            ).reset_index()
+            riepilogo_comp["Scarto P(X) - pareggi reali (pp)"] = riepilogo_comp["P(X) media (%)"] - riepilogo_comp["Pareggi reali (%)"]
+            str_lit.dataframe(riepilogo_comp.round(2), use_container_width=True, hide_index=True)
+            str_lit.caption("Le competizioni con poche osservazioni sono indicative soltanto; non modificare il modello sulla base di un campione piccolo.")
+
+        scarto_x = prob_x_media - freq_x_reale
+        scarto_ng = prob_ng_media - freq_ng_reale
+        if n < 100:
+            str_lit.warning(f"Campione ancora limitato ({n} partite): considera questi risultati preliminari, non una prova definitiva di calibrazione.")
+        if abs(scarto_x) >= 7:
+            str_lit.info("Pareggi X: lo scarto tra probabilità media e frequenza reale è ampio. Prima di modificare il modello, confrontare anche le fasce di probabilità e le singole competizioni.")
+        else:
+            str_lit.success("Pareggi X: sul campione disponibile lo scarto aggregato non supera 7 punti percentuali. Controllare comunque il dettaglio per fascia e campionato.")
+        if abs(scarto_ng) >= 7:
+            str_lit.info("No Goal: lo scarto tra probabilità media e frequenza reale è ampio. Non applicare correzioni fisse; verificare prima la calibrazione per fasce di probabilità.")
+        else:
+            str_lit.success("No Goal: sul campione disponibile lo scarto aggregato non supera 7 punti percentuali. Controllare comunque il dettaglio per fascia e campionato.")
+
+        # V12: confronto aggregato con baseline naïve, sugli stessi identici eventi walk-forward.
+        str_lit.markdown("#### 📏 V15 — Poisson contro baseline: confronto sullo stesso campione")
+        metriche_confronto = [
+            ("1X2 — Brier", "Brier 1X2", "Brier 1X2 baseline"),
+            ("1X2 — Log Loss", "Log Loss 1X2", "Log Loss 1X2 baseline"),
+            ("Goal/No Goal — Brier", "Brier Goal/No Goal", "Brier Goal/No Goal baseline"),
+            ("Goal/No Goal — Log Loss", "Log Loss Goal/No Goal", "Log Loss Goal/No Goal baseline"),
+        ]
+        righe_confronto = []
+        for nome, col_modello, col_base in metriche_confronto:
+            if col_modello in df_audit.columns and col_base in df_audit.columns:
+                val_modello = pd.to_numeric(df_audit[col_modello], errors="coerce").mean()
+                val_base = pd.to_numeric(df_audit[col_base], errors="coerce").mean()
+                righe_confronto.append({
+                    "Metrica": nome,
+                    "Poisson": val_modello,
+                    "Baseline storica": val_base,
+                    "Delta Poisson - baseline": val_modello - val_base,
+                    "Migliore": "Poisson" if val_modello < val_base else ("Baseline" if val_base < val_modello else "Pari"),
+                })
+        if righe_confronto:
+            str_lit.dataframe(pd.DataFrame(righe_confronto).round(5), use_container_width=True, hide_index=True)
+            str_lit.caption(
+                "Per Brier e Log Loss valori più bassi sono migliori. La baseline usa soltanto risultati "
+                "precedenti della stessa competizione, con smoothing Laplace; il confronto non implica "
+                "che la baseline sia un modello predittivo avanzato."
+            )
+        else:
+            str_lit.info("Confronto baseline non disponibile: mancano le colonne necessarie.")
+
+        # V13: controlli espliciti di campione comune e causalità della baseline.
+        str_lit.markdown("#### 🧪 Verifica del campione e della causalità")
+        n_comune = int(df_audit[["Brier 1X2", "Brier 1X2 baseline", "Log Loss 1X2", "Log Loss 1X2 baseline",
+                                 "Brier Goal/No Goal", "Brier Goal/No Goal baseline",
+                                 "Log Loss Goal/No Goal", "Log Loss Goal/No Goal baseline"]].notna().all(axis=1).sum())
+        causalita_ok = int(pd.to_numeric(df_audit.get("Controllo causalità baseline", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        k1, k2, k3 = str_lit.columns(3)
+        k1.metric("Partite con metriche complete comuni", f"{n_comune}/{len(df_audit)}")
+        k2.metric("Baseline senza dati futuri", f"{causalita_ok}/{len(df_audit)}")
+        k3.metric("Campionati nel campione", f"{df_audit['Competizione'].nunique()}")
+        if n_comune == len(df_audit) and causalita_ok == len(df_audit):
+            str_lit.success("Campione comune confermato: Poisson e baseline sono valutati sulle stesse partite; la baseline usa solo date precedenti.")
+        else:
+            str_lit.warning("Campione incompleto o controllo temporale non superato: interpretare il confronto con cautela.")
+        str_lit.info(
+            "Nota importante: il walk-forward può valutare soltanto le partite storiche effettivamente presenti in matches_raw. "
+            "Se la fonte carica solo una stagione o un sottoinsieme di risultati, questa versione non inventa partite mancanti: "
+            "il numero mostrato sopra è il campione realmente disponibile."
+        )
+
+        # V13: confronto separato per competizione, evitando di nascondere differenze tra leghe.
+        str_lit.markdown("#### 🏆 Risultati per competizione")
+        colonne_metriche = ["Brier 1X2", "Brier 1X2 baseline", "Log Loss 1X2", "Log Loss 1X2 baseline",
+                            "Brier Goal/No Goal", "Brier Goal/No Goal baseline",
+                            "Log Loss Goal/No Goal", "Log Loss Goal/No Goal baseline"]
+        df_comp = df_audit.dropna(subset=colonne_metriche).groupby("Competizione", dropna=False).agg(
+            Partite=("Esito reale", "size"),
+            **{"P(X) media (%)": ("P(X) %", "mean"), "Pareggi reali (%)": ("Esito reale", lambda x: 100 * (x == "X").mean()),
+               "No Goal medio (%)": ("P(No Goal) %", "mean"), "No Goal reali (%)": ("No Goal reale", lambda x: 100 * x.mean()),
+               "Brier 1X2 Poisson": ("Brier 1X2", "mean"), "Brier 1X2 baseline": ("Brier 1X2 baseline", "mean"),
+               "Brier NG Poisson": ("Brier Goal/No Goal", "mean"), "Brier NG baseline": ("Brier Goal/No Goal baseline", "mean")}
+        ).reset_index()
+        if not df_comp.empty:
+            str_lit.dataframe(df_comp.round(4), use_container_width=True, hide_index=True)
+        else:
+            str_lit.caption("Non ci sono dati sufficienti per il dettaglio per competizione.")
+
+        # V13: stabilità temporale descrittiva per anno; campioni piccoli sono segnalati.
+        str_lit.markdown("#### 📆 Stabilità temporale per anno")
+        df_anno = df_audit.dropna(subset=colonne_metriche).groupby("Anno", dropna=False).agg(
+            Partite=("Esito reale", "size"),
+            **{"Pareggi reali (%)": ("Esito reale", lambda x: 100 * (x == "X").mean()),
+               "P(X) media (%)": ("P(X) %", "mean"), "No Goal reali (%)": ("No Goal reale", lambda x: 100 * x.mean()),
+               "P(No Goal) media (%)": ("P(No Goal) %", "mean"),
+               "Brier 1X2 Poisson": ("Brier 1X2", "mean"), "Brier 1X2 baseline": ("Brier 1X2 baseline", "mean"),
+               "Brier NG Poisson": ("Brier Goal/No Goal", "mean"), "Brier NG baseline": ("Brier Goal/No Goal baseline", "mean")}
+        ).reset_index()
+        if not df_anno.empty:
+            str_lit.dataframe(df_anno.round(4), use_container_width=True, hide_index=True)
+            if (df_anno["Partite"] < 100).any():
+                str_lit.caption("Attenzione: gli anni con meno di 100 partite sono indicativi e non consentono conclusioni robuste.")
+        else:
+            str_lit.caption("Non ci sono dati sufficienti per il dettaglio temporale.")
+
+        with str_lit.expander("🔎 Dettaglio partite usate nell'audit"):
+            str_lit.dataframe(df_audit, use_container_width=True, hide_index=True)
+            str_lit.download_button(
+                "📥 Scarica audit walk-forward CSV",
+                df_audit.to_csv(index=False).encode("utf-8-sig"),
+                "audit_walk_forward_x_nogoal.csv", "text/csv"
+            )
+
